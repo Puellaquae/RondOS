@@ -1,0 +1,10 @@
+[build]
+target = "i686-pc-windows-msvc"
+
+[target.'cfg(target_env="msvc")']
+rustflags = [
+    "-C", "link-arg=/entry:main",
+    "-C", "link-arg=/base:0xc0020000",
+    "-C", "link-arg=/LARGEADDRESSAWARE",
+    "-C", "link-arg=/DRIVER",
+]
