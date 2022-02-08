@@ -65,10 +65,18 @@ waits:
     mov cx, LOADER_DISK_BLOCK_COUNT * 256
 
 read_data:
-    mov ax, LOADER_LOAD_ADDR >> 4
+    mov ax, ((LOADER_LOAD_ADDR >> 4) - 0x1000)
     mov es, ax
     mov di, 0
 read_loop:
+    test di, di
+    jz inces
+    jmp continue_read
+inces:
+    mov ax, es
+    add ax, 0x1000
+    mov es, ax
+continue_read:
     in ax, dx
     stosw
     loop read_loop
@@ -168,12 +176,22 @@ protect_entry:
 
     mov dword [LOADER_LOAD_ADDR + kernel_size], LOADER_END
 
+enable_sse:
+    mov eax, cr0
+    and ax, 0xFFFB
+    or ax, 0x2
+    mov cr0, eax
+    mov eax, cr4
+    or ax, 3 << 9
+    mov cr4, eax
+
     jmp (KERNEL_ENTRY)
     hlt
 
 str_jump_in:  dd "Jump In", 0x0d, 0x0a, 0
 str_boot_start: db "Booting", 0x0d, 0x0a, 0
 str_load_loader: db "Load Self To 0x20000", 0x0d, 0x0a, 0
+current_loader_addr: dq 0
 
 align 8
 

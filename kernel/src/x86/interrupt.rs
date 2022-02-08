@@ -1,8 +1,8 @@
 use core::fmt;
-
+use bitflags::bitflags;
 use bit_field::BitField;
 
-use crate::{x86::{lidt, DescriptorTablePointer, PrivilegeLevel, SegmentSelector, EFlags}, loader::SEGMENT_KERNEL_CODE};
+use crate::{x86::reg::{lidt, DescriptorTablePointer, PrivilegeLevel, SegmentSelector, EFlags}, loader::SEGMENT_KERNEL_CODE};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -30,19 +30,23 @@ pub enum Interrupts {
 
 #[repr(C)]
 pub struct ExceptionStackFrame {
+    pub error_code: u32,
     pub instruction_pointer: u32,
     pub code_segment: SegmentSelector,
     pub cpu_flags: EFlags,
-    // stack_pointer: u32,
-    // stack_segment: SegmentSelector,
+    pub stack_pointer: u32,
+    pub stack_segment: SegmentSelector,
 }
 
 impl fmt::Debug for ExceptionStackFrame {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut s = f.debug_struct("ExceptionStackFrame");
+        s.field("error_code", &self.error_code);
         s.field("eip", &format_args!("0x{:x}", self.instruction_pointer));
         s.field("cs", &self.code_segment);
         s.field("eflags", &self.cpu_flags);
+        s.field("esp", &format_args!("0x{:x}", self.stack_pointer));
+        s.field("ss", &self.stack_segment);
         s.finish()
     }
 }
@@ -54,9 +58,31 @@ macro_rules! handler {
         extern "C" fn wrapper() -> ! {
             unsafe {
                 core::arch::asm!(
-                    "mov edi, esp",
-                    "push edi",
+                    "push 0",
+                    "push esp",
                     "call {}",
+                    "add esp, 8",
+                    "iretd",
+                    sym $name,
+                    options(noreturn)
+                );
+            }
+        }
+        wrapper
+    }}
+}
+
+#[macro_export]
+macro_rules! handler_with_code {
+    ($name: ident) => {{
+        #[naked]
+        extern "C" fn wrapper() -> ! {
+            unsafe {
+                core::arch::asm!(
+                    "push esp",
+                    "call {}",
+                    "add esp, 8",
+                    "iretd",
                     sym $name,
                     options(noreturn)
                 );
@@ -73,7 +99,6 @@ impl Idt {
     pub fn new() -> Idt {
         Idt([Entry::missing(); 256])
     }
-
     
     pub fn set_handler(&mut self, entry: Interrupts, handler: HandlerFunc) -> &mut EntryOptions {
         self.0[entry as u8 as usize] = Entry::new(SegmentSelector(SEGMENT_KERNEL_CODE), handler);
@@ -169,5 +194,15 @@ impl EntryOptions {
     pub fn set_stack_index(&mut self, index: u16) -> &mut Self {
         self.0.set_bits(0..3, index);
         self
+    }
+}
+
+bitflags! {
+    pub struct PageFaultErrorCode: u32 {
+        const PROTECTION_VIOLATION = 1 << 0;
+        const CAUSED_BY_WRITE = 1 << 1;
+        const USER_MODE = 1 << 2;
+        const MALFORMED_TABLE = 1 << 3;
+        const INSTRUCTION_FETCH = 1 << 4;
     }
 }

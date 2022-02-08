@@ -17,3 +17,5 @@ with open('kernel.bin', 'wb+') as f:
             f.write(b"\0" * (vaddr - curaddr))
         f.write(data)
         curaddr += size
+
+print("Kernel Restructed")
