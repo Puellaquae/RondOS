@@ -3,7 +3,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
     assert!(!dest.is_null());
     assert!(!src.is_null());
     for i in 0..n {
-        *dest.offset(i as isize) = *src.offset(i as isize);
+        *dest.add(i) = *src.add(i)
     }
     dest
 }
@@ -12,7 +12,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
 pub unsafe extern "C" fn memset(s: *mut u8, c: u8, n: usize) -> *mut u8 {
     assert!(!s.is_null());
     for i in 0..n {
-        *s.offset(i as isize) = c;
+        *s.add(i) = c;
     }
     s
 }

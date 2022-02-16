@@ -100,12 +100,12 @@ impl Idt {
         Idt([Entry::missing(); 256])
     }
     
-    pub fn set_handler(&mut self, entry: Interrupts, handler: HandlerFunc) -> &mut EntryOptions {
-        self.0[entry as u8 as usize] = Entry::new(SegmentSelector(SEGMENT_KERNEL_CODE), handler);
+    pub fn set_handler(&mut self, entry: u8, handler: HandlerFunc) -> &mut EntryOptions {
+        self.0[entry as usize] = Entry::new(SegmentSelector(SEGMENT_KERNEL_CODE), handler);
         &mut self.0[entry as u8 as usize].options
     }
 
-    pub fn load(&'static self) {
+    pub fn load(&self) {
         use core::mem::size_of;
 
         let ptr = DescriptorTablePointer {
@@ -130,7 +130,7 @@ pub struct Entry {
 
 impl Entry {
     fn new(gdt_selector: SegmentSelector, handler: HandlerFunc) -> Self {
-        let pointer = handler as u64;
+        let pointer = handler as usize;
         Entry {
             gdt_selector,
             pointer_low: pointer as u16,

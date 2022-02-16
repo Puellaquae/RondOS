@@ -112,6 +112,12 @@ pub fn outb(port: u16, data: u8) {
     }
 }
 
+pub fn outw(port: u16, data: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") data);
+    }
+}
+
 pub fn get_cs() -> u16 {
     let cs: u16;
     unsafe {

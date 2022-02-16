@@ -1,6 +1,5 @@
 pub fn get_kernel_size() -> u32 {
-    let size = unsafe { *(0xc0020200 as *const u32) };
-    size
+    unsafe { *(0xc0020200 as *const u32) }
 }
 
 pub const KERNEL_VADDR_BASE: u32 = 0xc0000000;
