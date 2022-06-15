@@ -18,3 +18,10 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Xmake cache
+.xmake/
+build/
+
+# MacOS Cache
+.DS_Store

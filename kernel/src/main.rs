@@ -12,7 +12,7 @@ mod platform;
 mod vga_buffer;
 mod x86;
 
-use os::RondOs;
+use os::OS;
 
 #[lang = "panic_impl"]
 #[panic_handler]
@@ -23,25 +23,17 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[no_mangle]
 pub extern "C" fn main() -> ! {
-    let mut os = RondOs::new();
-    println!("Hello World! From ReOS");
-    kernel_info();
-    println!("Init the interrupts");
-    os.intr_init();
     unsafe {
-        asm!("int 3");
-        *(0xdeadbeaf as *mut u32) = 42;
-    }
+        let os = OS.init().get_mut();
+        os.intr_init();
+        os.timer_init();
+    };
 
-    println!("Init the timer");
-    os.timer_init();
-
-    println!("Enable interrput");
     unsafe {
         asm!("sti");
     }
 
-    loop { }
+    loop {}
 }
 
 fn kernel_info() {

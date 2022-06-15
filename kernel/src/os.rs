@@ -9,6 +9,23 @@ use crate::{
 
 const TIMER_FREQ: u32 = 200;
 
+pub static mut OS: Os = Os(None);
+pub struct Os(Option<RondOs>);
+
+impl Os {
+    pub fn init(&mut self) -> &mut Self{
+        *self = Os(Some(RondOs::new()));
+        self
+    }
+
+    pub fn get(&self) -> &RondOs {
+        self.0.as_ref().unwrap()
+    }
+
+    pub fn get_mut(&mut self) -> &mut RondOs {
+        self.0.as_mut().unwrap()
+    }
+}
 pub struct RondOs {
     pub idt: Idt,
 }
@@ -59,9 +76,8 @@ extern "C" fn double_handler(f: &ExceptionStackFrame) {
     println!("{:#?}", f);
 }
 
-static mut TICKS: u64 = 0;
-
 extern "C" fn timer_handler(_f: &ExceptionStackFrame) {
+    static mut TICKS: u64 = 0;
     unsafe {
         TICKS += 1;
     }
