@@ -118,6 +118,23 @@ pub fn outw(port: u16, data: u16) {
     }
 }
 
+pub fn inb(port: u16) -> u8 {
+    let mut data: u8;
+    unsafe {
+        asm!("in al, dx", in("dx") port, out("al") data);
+    }
+    data
+}
+
+pub fn inw(port: u16) -> u16 {
+    let mut data: u16;
+    unsafe {
+        asm!("in ax, dx", in("dx") port, out("ax") data);
+    }
+    data
+}
+
+
 pub fn get_cs() -> u16 {
     let cs: u16;
     unsafe {

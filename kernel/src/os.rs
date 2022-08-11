@@ -3,8 +3,8 @@ use crate::{
     x86::{
         interrupt::{ExceptionStackFrame, Idt, Interrupts, PageFaultErrorCode},
         pic::{end_of_interrupt, pic_init, pit_configure_channel},
-        reg::get_cr2,
-    },
+        reg::{get_cr2, inb, outb},
+    }, keyboard,
 };
 
 const TIMER_FREQ: u32 = 200;
@@ -13,7 +13,7 @@ pub static mut OS: Os = Os(None);
 pub struct Os(Option<RondOs>);
 
 impl Os {
-    pub fn init(&mut self) -> &mut Self{
+    pub fn init(&mut self) -> &mut Self {
         *self = Os(Some(RondOs::new()));
         self
     }
@@ -57,6 +57,10 @@ impl RondOs {
         pit_configure_channel(0, 2, TIMER_FREQ);
         self.idt.set_handler(0x20, handler!(timer_handler));
     }
+
+    pub fn keyboard_init(&mut self) {
+        self.idt.set_handler(0x21, handler!(keyboard_handler));
+    }
 }
 
 extern "C" fn breakpoint_handler(f: &ExceptionStackFrame) {
@@ -82,7 +86,20 @@ extern "C" fn timer_handler(_f: &ExceptionStackFrame) {
         TICKS += 1;
     }
     if unsafe { TICKS % (TIMER_FREQ as u64) == 0 } {
-        print!(".");
+        // print!(".");
     }
+    end_of_interrupt(0x20);
+}
+
+extern "C" fn keyboard_handler(_f: &ExceptionStackFrame) {
+    let scancode = inb(0x60);
+    if let Some(ch) = keyboard::scancode_to_char(scancode) {
+        print!("{}", ch);
+    }
+    let mut p61 = inb(0x61);
+    p61 |= 0x80;
+    outb(0x61, p61);
+    p61 &= 0x7f;
+    outb(0x61, p61);
     end_of_interrupt(0x20);
 }

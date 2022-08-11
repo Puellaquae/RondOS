@@ -11,6 +11,7 @@ mod os;
 mod platform;
 mod vga_buffer;
 mod x86;
+mod keyboard;
 
 use os::OS;
 
@@ -27,7 +28,8 @@ pub extern "C" fn main() -> ! {
         let os = OS.init().get_mut();
         os.intr_init();
         os.timer_init();
-    };
+        os.keyboard_init();
+    }
 
     unsafe {
         asm!("sti");
