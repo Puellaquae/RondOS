@@ -81,6 +81,16 @@ impl Writer {
                 self.column_position += 1;
             }
         }
+        self.update_cursor();
+    }
+
+    fn update_cursor(&self) {
+        use crate::x86::reg::outb;
+        let pos = (BUFFER_HEIGHT - 1) * BUFFER_WIDTH + self.column_position;
+        outb(0x3d4, 0x0f);
+        outb(0x3d5, (pos & 0xff) as u8);
+        outb(0x3d4, 0x0e);
+        outb(0x3d5, ((pos >> 8) & 0xff) as u8);
     }
 
     fn new_line(&mut self) {
