@@ -20,19 +20,17 @@ try {
 finally {
     Set-Location ..
 }
-if (Test-Path kernel.exe) {
-    Remove-Item kernel.exe
+if (Test-Path kernel.bin) {
+    Remove-Item kernel.bin
     Write-Host "Removed Old Kernel"
 }
 if ($release) {
-    Move-Item kernel/target/i686-pc-windows-msvc/release/kernel.exe kernel.exe
+    Copy-Item kernel/target/i686-unknown-none/release/kernel kernel.bin
 }
 else {
-    Move-Item kernel/target/i686-pc-windows-msvc/debug/kernel.exe kernel.exe
+    Copy-Item kernel/target/i686-unknown-none/debug/kernel kernel.bin
 }
 Write-Host "Copied Kernel"
-python extract.py
-Write-Host([string]::Format("Restructed Kernel Size: {0}(0x{0:x}) Bytes", (Get-Item .\kernel.bin).Length))
 nasm -o loader.bin loader.s -l loader.lst
 Write-Host "Built Loader"
 Write-Host([string]::Format("Loader and Kernel Size: {0}(0x{0:x}) Bytes", (Get-Item .\loader.bin).Length))

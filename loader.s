@@ -162,7 +162,6 @@ set_pde:
     jmp dword SELECTOR_CODE_SEG: KERNEL_BASE + LOADER_LOAD_ADDR + protect_entry
 
 [BITS 32]
-%include "kernel.inc"
 
 protect_entry:
     mov ax, SELECTOR_DATA_SEG
@@ -184,8 +183,10 @@ enable_sse:
     mov eax, cr4
     or ax, 3 << 9
     mov cr4, eax
+    mov eax, [0x21018]
+    sub eax, KERNEL_BASE
 
-    jmp (KERNEL_ENTRY)
+    jmp eax
     hlt
 
 str_jump_in:  dd "Jump In", 0x0d, 0x0a, 0
