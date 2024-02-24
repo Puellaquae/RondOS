@@ -2,10 +2,12 @@ $errorActionPreference = "Stop"
 
 $release = $false
 $run = $false
+$useqemu = $false
 
 $args | ForEach-Object { 
     if ($_ -eq "release") { $release = $true }  
     if ($_ -eq "run") { $run = $true }  
+    if ($_ -eq "qemu") { $useqemu = $true }  
 }
 
 Set-Location kernel
@@ -32,10 +34,15 @@ else {
 }
 Write-Host "Copied Kernel"
 nasm -o loader.bin loader.s -l loader.lst
+nasm loader.s -f elf -g -o loader.elf  # for gdb
 Write-Host "Built Loader"
 Write-Host([string]::Format("Loader and Kernel Size: {0}(0x{0:x}) Bytes", (Get-Item .\loader.bin).Length))
 nasm -o disk.img disk.s -l disk.lst
 Write-Host "Built Disk"
 if ($run) {
-    ./bochsrc.bxrc
+    if ($useqemu) {
+        qemu-system-x86_64.exe -drive format=raw,media=disk,file=disk.img -serial stdio
+    } else {
+        ./bochsrc.bxrc
+    }
 }

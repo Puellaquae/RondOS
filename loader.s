@@ -9,7 +9,7 @@ PG_US    equ 0x00000004
 PG_PAGE  equ 0x00000001
 
 LOADER_LOAD_ADDR equ 0x20000
-LOADER_DISK_BLOCK_COUNT equ (LOADER_END + 511) / 512
+LOADER_DISK_BLOCK_COUNT equ (LOADER_END + 255) / 256
 
 PAGING_TABLE_ADDR equ 0xf000
 PAGING_PAGE_ADDR equ 0x10000
@@ -29,57 +29,74 @@ KERNEL_BASE equ 0xc0000000
     lea si, str_boot_start
     call puts
 
-hda_loader:
-    mov al, LOADER_DISK_BLOCK_COUNT
-    mov dx, 0x1f2
-    out dx, al
+    jmp bios_read
 
-    xor al, al
-    inc dx ; 0x1f3
-    out dx, al
-    
-    inc dx ; 0x1f4
-    out dx, al
-    
-    inc dx ; 0x1f5
-    out dx, al
-    
-    inc dx ; 0x1f6
-    mov al, 0b11100000
-    out dx, al
-    
-    inc dx ; 0x1f7
-    mov al, 0x20
-    out dx, al
+; hda loader can't work in qemu
+; hda_loader:
+;     mov dx, 0x1f6
+;     mov al, 0b11100000
+;     out dx, al
+; 
+;     mov al, LOADER_DISK_BLOCK_COUNT
+;     mov dx, 0x1f2
+;     out dx, al
+; 
+;     xor al, al
+;     mov dx, 0x1f3
+;     out dx, al
+;     
+;     mov dx, 0x1f4
+;     out dx, al
+;     
+;     mov dx, 0x1f5
+;     out dx, al
+;     
+;     mov dx, 0x1f7
+;     mov al, 0x20
+;     out dx, al
+; 
+; waits:
+;     in al, dx
+;     test al, 0x08
+;     jz waits
+; 
+; read_data:
+;     mov dx, 0x1f0
+;     mov cx, LOADER_DISK_BLOCK_COUNT * 256
+;     mov ax, (LOADER_LOAD_ADDR >> 4)
+;     mov es, ax
+;     mov di, 0
+;     rep insw
 
-waits:
-    in al, dx
-    and al, 0x88
-    cmp al, 0x08
-    jnz waits
+DAPACK:
+    db 0x10
+    db 0
+blkcnt: dw LOADER_DISK_BLOCK_COUNT      ; int 13 resets this to # of blocks actually read/written
+db_add: dw 0x0000  ; memory buffer destination address (0:7c00)
+        dw 0x2000  ; in memory page zero
+d_lba: dd 0 ; put the lba to read in this spot
+       dd 0 ; more storage bytes only for big lba's ( > 4 bytes )
 
-    lea si, str_load_loader
+bios_read:
+	mov si, DAPACK		; address of "disk address packet"
+	mov ah, 0x42		; AL is unused
+	mov dl, 0x80		; drive number 0 (OR the drive # with 0x80)
+	int 0x13
+	jc check_fail
+
+check_read:
+    mov ax, 0x2000
+    mov es, ax
+    mov si, 0x1000
+    mov eax, [es: si]
+    and eax, 0xffffff00
+    cmp eax, 0x464c4500
+    je jmp_rest
+check_fail:
+    lea si, str_load_fail
     call puts
-
-    mov dx, 0x1f0
-    mov cx, LOADER_DISK_BLOCK_COUNT * 256
-
-read_data:
-    mov ax, ((LOADER_LOAD_ADDR >> 4) - 0x1000)
-    mov es, ax
-    mov di, 0
-read_loop:
-    test di, di
-    jz inces
-    jmp continue_read
-inces:
-    mov ax, es
-    add ax, 0x1000
-    mov es, ax
-continue_read:
-    in ax, dx
-    stosw
-    loop read_loop
+fail_loop:
+    jmp fail_loop
 
 jmp_rest:
     jmp (LOADER_LOAD_ADDR >> 4):next_part
@@ -113,6 +130,24 @@ a20gate:
     in al, 0x92
     or al, 0000_0010B
     out 0x92, al
+
+    xor ebx, ebx
+    mov dword [memlayoutlen], 0
+    mov di, memlayoutbuf
+detectmem:
+    mov eax, 0xe820
+    mov ecx, 20
+    mov edx, 0x0534D4150
+    int 0x15
+    jc detectmemfail
+    inc dword [memlayoutlen]
+    add di, 20
+    test ebx, ebx
+    jz detectmemfin
+    jmp detectmem
+detectmemfail:
+    mov dword [memlayoutlen], 0xdead
+detectmemfin:
 
 ; from 0xf000(60KB) to 0x10000(64KB) store the page table, total 1024 entries
 ; in low 64 MB direct to physical addr, in high 3GB, base 3GB map to base 0
@@ -185,14 +220,13 @@ enable_sse:
     mov cr4, eax
     mov eax, [0x21018]
     sub eax, KERNEL_BASE
-
     jmp eax
     hlt
 
 str_jump_in:  dd "Jump In", 0x0d, 0x0a, 0
 str_boot_start: db "Booting", 0x0d, 0x0a, 0
-str_load_loader: db "Load Self To 0x20000", 0x0d, 0x0a, 0
-current_loader_addr: dq 0
+str_load_loader: db "Load Disk", 0x0d, 0x0a, 0
+str_load_fail: db "Load Fail", 0x0d, 0x0a, 0
 
 align 8
 
@@ -213,9 +247,11 @@ gdtdesc:
 times 510-($-$$) db 0
 dw 0xaa55
 
-kernel_size: dw 0
+kernel_size: dw 0, 0
+memlayoutlen: dw 0, 0
+memlayoutbuf: dw 0, 0
 
-align 0x1000
+times 0x1000-($-$$) db 0
 
 incbin "kernel.bin"
 
