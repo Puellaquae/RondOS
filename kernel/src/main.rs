@@ -112,6 +112,9 @@ fn main() -> ! {
 
     serial_println!("RondOS> Serial Output Test!");
 
+    let pte_addr = cr3();
+    println!("Page Table Addr: 0x{:x}", pte_addr);
+
     loop {
         unsafe {
             asm!("hlt");
@@ -207,7 +210,7 @@ const PIC1_DATA: u16 = 0xa1;
 
 use x86::{inb, outb};
 
-use crate::io::serial_out;
+use crate::{io::serial_out, x86::cr3};
 
 pub fn pic_init() {
     outb(PIC0_DATA, 0xff);

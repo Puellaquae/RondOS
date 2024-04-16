@@ -80,6 +80,8 @@ pub struct VgaBuffer {
     cur_color: ColorCode,
 }
 
+const VGA_BUFFER_ADDR: u32 = 0xc00b8000;
+
 impl VgaBuffer {
     pub fn new() -> VgaBuffer {
         VgaBuffer {
@@ -93,14 +95,14 @@ impl VgaBuffer {
             ascii_character: b' ',
             color_code: self.cur_color,
         };
-        let buf = unsafe { &mut *(0xb8000 as *mut Buffer) };
+        let buf = unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) };
         for col in 0..BUFFER_WIDTH {
             buf.chars[row][col].write(blank);
         }
     }
 
     fn new_line(&mut self) {
-        let buf = unsafe { &mut *(0xb8000 as *mut Buffer) };
+        let buf = unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) };
         for row in 1..BUFFER_HEIGHT {
             buf.chars.copy_within(row..=row, row - 1);
         }
@@ -109,7 +111,7 @@ impl VgaBuffer {
     }
 
     fn putc(&mut self, c: u8) {
-        let buf = unsafe { &mut *(0xb8000 as *mut Buffer) };
+        let buf = unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) };
         match c {
             b'\n' => self.new_line(),
             b'\r' => {
@@ -139,7 +141,7 @@ impl VgaBuffer {
             ascii_character: b' ',
             color_code: self.cur_color,
         };
-        let buf = unsafe { &mut *(0xb8000 as *mut Buffer) };
+        let buf = unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) };
         buf.chars.fill([Voliate { val: blank }; BUFFER_WIDTH])
     }
 }
@@ -177,8 +179,6 @@ pub fn _vga_print(args: fmt::Arguments) {
     vga_out().write_fmt(args).unwrap();
 }
 
-use bitflags::bitflags;
-
 macro_rules! wait_for {
     ($cond:expr) => {
         while !$cond {
@@ -187,26 +187,22 @@ macro_rules! wait_for {
     };
 }
 
-bitflags! {
-    /// Interrupt enable flags
-    struct IntEnFlags: u8 {
-        const RECEIVED = 1;
-        const SENT = 1 << 1;
-        const ERRORED = 1 << 2;
-        const STATUS_CHANGE = 1 << 3;
-        // 4 to 7 are unused
-    }
-}
+/// Interrupt enable flags
+struct IntEnFlags(pub u8);
 
-bitflags! {
-    /// Line status flags
-    struct LineStsFlags: u8 {
-        const INPUT_FULL = 1;
-        // 1 to 4 unknown
-        const OUTPUT_EMPTY = 1 << 5;
-        // 6 and 7 unknown
-    }
-}
+const RECEIVED: u8 = 1;
+const SENT: u8 = 1 << 1;
+const ERRORED: u8 = 1 << 2;
+const STATUS_CHANGE: u8 = 1 << 3;
+// 4 to 7 are unused
+
+/// Line status flags
+struct LineStsFlags(pub u8);
+
+const INPUT_FULL: u8 = 1;
+// 1 to 4 unknown
+const OUTPUT_EMPTY: u8 = 1 << 5;
+// 6 and 7 unknown
 
 #[derive(Debug)]
 pub struct SerialPort(u16 /* base port */);
@@ -300,7 +296,7 @@ impl SerialPort {
     }
 
     fn line_sts(&mut self) -> LineStsFlags {
-        unsafe { LineStsFlags::from_bits_truncate(inb(self.port_line_sts())) }
+        unsafe { LineStsFlags(inb(self.port_line_sts())) }
     }
 
     /// Sends a byte on the serial port.
@@ -308,15 +304,15 @@ impl SerialPort {
         unsafe {
             match data {
                 8 | 0x7F => {
-                    wait_for!(self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY));
+                    wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
                     outb(self.port_data(), 8);
-                    wait_for!(self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY));
+                    wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
                     outb(self.port_data(), b' ');
-                    wait_for!(self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY));
+                    wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
                     outb(self.port_data(), 8);
                 }
                 _ => {
-                    wait_for!(self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY));
+                    wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
                     outb(self.port_data(), data);
                 }
             }
@@ -326,7 +322,7 @@ impl SerialPort {
     /// Sends a raw byte on the serial port, intended for binary data.
     pub fn send_raw(&mut self, data: u8) {
         unsafe {
-            wait_for!(self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY));
+            wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
             outb(self.port_data(), data);
         }
     }
@@ -334,7 +330,7 @@ impl SerialPort {
     /// Receives a byte on the serial port.
     pub fn receive(&mut self) -> u8 {
         unsafe {
-            wait_for!(self.line_sts().contains(LineStsFlags::INPUT_FULL));
+            wait_for!(self.line_sts().0 & INPUT_FULL == INPUT_FULL);
             inb(self.port_data())
         }
     }

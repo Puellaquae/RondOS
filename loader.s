@@ -164,6 +164,8 @@ build_pde:
     mov cx, 0x10
     xor di, di
 write_pde:
+    ; we still need map virtual addr direct to physical addr
+    ; otherwise rip will cause page fault after enable page
     mov [es:di], eax
     mov [es:di + (KERNEL_BASE >> 20)], eax
     add di, 4
@@ -208,7 +210,7 @@ protect_entry:
 
     add esp, KERNEL_BASE
 
-    mov dword [LOADER_LOAD_ADDR + kernel_size], LOADER_END
+    mov dword [KERNEL_BASE + LOADER_LOAD_ADDR + kernel_size], LOADER_END
 
 enable_sse:
     mov eax, cr0
@@ -218,8 +220,8 @@ enable_sse:
     mov eax, cr4
     or ax, 3 << 9
     mov cr4, eax
-    mov eax, [0x21018]
-    sub eax, KERNEL_BASE
+    mov eax, [KERNEL_BASE + 0x21018]
+    ; sub eax, KERNEL_BASE
     jmp eax
     hlt
 

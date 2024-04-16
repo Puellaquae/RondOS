@@ -13,3 +13,11 @@ pub fn outb(port: u16, data: u8) {
         asm!("out dx, al", in("dx") port, in("al") data);
     }
 }
+
+pub fn cr3() -> u32 {
+    let mut addr: u32;
+    unsafe {
+        asm!("mov eax, cr3", out("eax") addr);
+    }
+    return addr;
+}
