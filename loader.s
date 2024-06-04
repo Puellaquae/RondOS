@@ -9,7 +9,9 @@ PG_US    equ 0x00000004
 PG_PAGE  equ 0x00000001
 
 LOADER_LOAD_ADDR equ 0x20000
-LOADER_DISK_BLOCK_COUNT equ (LOADER_END + 255) / 256
+; one LBA block size is 512Bytes
+LOADER_DISK_BLOCK_COUNT equ (LOADER_END + 511) / 512 
+LOADER_DISK_TIME equ (LOADER_DISK_BLOCK_COUNT + 127) / 128
 
 PAGING_TABLE_ADDR equ 0xf000
 PAGING_PAGE_ADDR equ 0x10000
@@ -28,6 +30,11 @@ KERNEL_BASE equ 0xc0000000
     mov sp, 0x7c00
     lea si, str_boot_start
     call puts
+
+a20gate:
+    in al, 0x92
+    or al, 0000_0010B
+    out 0x92, al
 
     jmp bios_read
 
@@ -68,21 +75,29 @@ KERNEL_BASE equ 0xc0000000
 ;     mov di, 0
 ;     rep insw
 
-DAPACK:
-    db 0x10
-    db 0
-blkcnt: dw LOADER_DISK_BLOCK_COUNT      ; int 13 resets this to # of blocks actually read/written
-db_add: dw 0x0000  ; memory buffer destination address (0:7c00)
-        dw 0x2000  ; in memory page zero
-d_lba: dd 0 ; put the lba to read in this spot
-       dd 0 ; more storage bytes only for big lba's ( > 4 bytes )
+load_disk_cnt: dw LOADER_DISK_TIME
+align 2 ; DAPACK's db_addr require align 2
+
+DAPACK: db 0x10, 0
+blkcnt: dw 127           ; int 13 resets this to # of blocks actually read/written
+db_addr_addr: dw 0x0000  ; memory buffer destination address (0:7c00)
+db_addr_seg: dw 0x2000   ; in memory page zero
+d_lba: dd 0, 0           ; put the lba to read in this spot
 
 bios_read:
-	mov si, DAPACK		; address of "disk address packet"
-	mov ah, 0x42		; AL is unused
-	mov dl, 0x80		; drive number 0 (OR the drive # with 0x80)
-	int 0x13
-	jc check_fail
+    mov si, DAPACK ; address of "disk address packet"
+    mov ah, 0x42   ; AL is unused
+    mov dl, 0x80   ; drive number 0 (OR the drive # with 0x80)
+    int 0x13
+    jc check_fail
+    mov ax, [load_disk_cnt]
+    dec ax
+    mov [load_disk_cnt], ax
+    test ax, ax
+    jz check_read
+    add word [db_addr_seg], 0x07f0
+    add dword [d_lba], 127
+    jmp bios_read
 
 check_read:
     mov ax, 0x2000
@@ -91,6 +106,12 @@ check_read:
     mov eax, [es: si]
     and eax, 0xffffff00
     cmp eax, 0x464c4500
+    jne check_fail
+    mov ax, ((END_CHECK_ADDR & 0xf0000) >> 4) + 0x2000
+    mov es, ax
+    mov si, END_CHECK_ADDR & 0xffff
+    mov eax, [es: si]
+    cmp eax, 0x2233aabb
     je jmp_rest
 check_fail:
     lea si, str_load_fail
@@ -125,11 +146,6 @@ next_part:
     mov gs, ax
     lea si, str_jump_in
     call puts
-
-a20gate:
-    in al, 0x92
-    or al, 0000_0010B
-    out 0x92, al
 
     xor ebx, ebx
     mov dword [memlayoutlen], 0
@@ -234,17 +250,17 @@ align 8
 
 gdt:
 gdt_null:
-	dq 0x0000000000000000	; Null segment.  Not used by CPU.
+    dq 0x0000000000000000    ; Null segment.  Not used by CPU.
 SELECTOR_NULL equ gdt_null - gdt
 gdt_kcseg:
-	dq 0x00cf9a000000ffff	; System code, base 0, limit 4 GB.
+    dq 0x00cf9a000000ffff    ; System code, base 0, limit 4 GB.
 SELECTOR_CODE_SEG equ gdt_kcseg - gdt
 gdt_kdseg:
-	dq 0x00cf92000000ffff   ; System data, base 0, limit 4 GB.
+    dq 0x00cf92000000ffff   ; System data, base 0, limit 4 GB.
 SELECTOR_DATA_SEG equ gdt_kdseg - gdt
 gdtdesc:
-	dw	gdtdesc - gdt - 1	; Size of the GDT, minus 1 byte.
-	dd	gdt	+ LOADER_LOAD_ADDR  ; Address of the GDT.
+    dw gdtdesc - gdt - 1      ; Size of the GDT, minus 1 byte.
+    dd gdt + LOADER_LOAD_ADDR ; Address of the GDT.
 
 times 510-($-$$) db 0
 dw 0xaa55
@@ -258,3 +274,6 @@ times 0x1000-($-$$) db 0
 incbin "kernel.bin"
 
 LOADER_END equ $ - $$
+
+END_CHECK_ADDR equ $ - $$
+END_CHECK: dd 0x2233aabb ; used for check whether full kernel has been loaded

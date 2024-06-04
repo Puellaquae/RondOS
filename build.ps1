@@ -32,7 +32,7 @@ if ($release) {
 else {
     Copy-Item kernel/target/i686-unknown-none/debug/kernel kernel.bin
 }
-Write-Host "Copied Kernel"
+Write-Host([string]::Format("Kernel Size: {0}(0x{0:x}) Bytes", (Get-Item .\kernel.bin).Length))
 nasm -o loader.bin loader.s -l loader.lst
 nasm loader.s -f elf -g -o loader.elf  # for gdb
 Write-Host "Built Loader"

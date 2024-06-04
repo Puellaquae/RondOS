@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub fn get_kernel_size() -> u32 {
     unsafe { *(0xc0020200 as *const u32) }
 }

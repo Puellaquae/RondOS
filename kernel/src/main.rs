@@ -3,42 +3,23 @@
 #![feature(abi_x86_interrupt)]
 
 use core::arch::asm;
-use core::mem::size_of;
 
+mod arch;
 mod io;
 mod loader;
-mod x86;
+mod utils;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum Interrupts {
-    DivideError = 0,
-    DebugException = 1,
-    Interrupt = 2,
-    BreakpointException = 3,
-    OverflowException = 4,
-    BoundRangeExceededException = 5,
-    InvalidOpcodeException = 6,
-    DeviceNotAvailableException = 7,
-    DoubleFaultException = 8,
-    CoprocessorSegmentOverrun = 9,
-    InvaildTSSException = 10,
-    SegmentNotPresent = 11,
-    StackFaultException = 12,
-    GeneralProtectionException = 13,
-    PageFaultException = 14,
-    FPUFloatingPointException = 16,
-    AlignmentCheckException = 17,
-    MachineCheckException = 18,
-    SIMDFloatingPointException = 19,
-}
+use arch::x86::{
+    self,
+    intr::{ExceptionStackFrame, INTR_TABLE},
+};
 
 static mut TICKS: u64 = 0;
 const TIMER_FREQ: u32 = 200;
 
 #[export_name = "_start"]
 fn main() -> ! {
-    serial_out().init();
+    serial_println!("RondOS> HELLO RondOS");
 
     println!("HELLO RondOS");
     println!("Kernel Size {} KiB", loader::get_kernel_size() / 1024);
@@ -50,70 +31,34 @@ fn main() -> ! {
 
     println!("Init Interrupt Table");
 
-    let mut idts = [InterruptEntry {
-        pointer_low: 0,
-        gdt_selector: 0,
-        options: 0b0000111000000000,
-        pointer_middle: 0,
-    }; 256];
+    INTR_TABLE
+        .get_mut()
+        .breakpoint
+        .set_handle_fn(breakpoint_handler);
+    INTR_TABLE
+        .get_mut()
+        .page_fault
+        .set_handle_fn(page_fault_handler);
+    INTR_TABLE
+        .get_mut()
+        .double_fault
+        .set_handle_fn(double_fault_handler);
+    INTR_TABLE
+        .get_mut()
+        .segment_not_present
+        .set_handle_fn(segment_not_present_handler);
+    INTR_TABLE.get_mut()[0x20].set_handle_fn(timer_handler);
+    INTR_TABLE.get_mut()[0x21].set_handle_fn(keyboard_handler);
 
-    idts[Interrupts::BreakpointException as usize] = InterruptEntry {
-        pointer_low: (breakpoint_handler as usize) as u16,
-        gdt_selector: loader::SEGMENT_KERNEL_CODE,
-        options: 0b1000111000000000,
-        pointer_middle: ((breakpoint_handler as usize) >> 16) as u16,
-    };
-
-    idts[Interrupts::PageFaultException as usize] = InterruptEntry {
-        pointer_low: (page_fault_handler as usize) as u16,
-        gdt_selector: loader::SEGMENT_KERNEL_CODE,
-        options: 0b1000111000000000,
-        pointer_middle: ((page_fault_handler as usize) >> 16) as u16,
-    };
-
-    idts[Interrupts::DoubleFaultException as usize] = InterruptEntry {
-        pointer_low: (double_fault_handler as usize) as u16,
-        gdt_selector: loader::SEGMENT_KERNEL_CODE,
-        options: 0b1000111000000000,
-        pointer_middle: ((double_fault_handler as usize) >> 16) as u16,
-    };
-
-    idts[Interrupts::SegmentNotPresent as usize] = InterruptEntry {
-        pointer_low: (segment_not_present_handler as usize) as u16,
-        gdt_selector: loader::SEGMENT_KERNEL_CODE,
-        options: 0b1000111000000000,
-        pointer_middle: ((segment_not_present_handler as usize) >> 16) as u16,
-    };
-
-    idts[0x20] = InterruptEntry {
-        pointer_low: (timer_handler as usize) as u16,
-        gdt_selector: loader::SEGMENT_KERNEL_CODE,
-        options: 0b1000111000000000,
-        pointer_middle: ((timer_handler as usize) >> 16) as u16,
-    };
-
-    idts[0x21] = InterruptEntry {
-        pointer_low: (keyboard_handler as usize) as u16,
-        gdt_selector: loader::SEGMENT_KERNEL_CODE,
-        options: 0b1000111000000000,
-        pointer_middle: ((keyboard_handler as usize) >> 16) as u16,
-    };
-
-    let pidt = DescriptorTablePointer {
-        base: idts.as_ptr() as u32,
-        limit: (size_of::<[InterruptEntry; 256]>() - 1) as u16,
-    };
-
-    lidt(&pidt);
+    INTR_TABLE.get_mut().update();
+    println!("Enable Interrupt");
 
     unsafe {
         asm!("sti");
     }
 
-    serial_println!("RondOS> Serial Output Test!");
-
-    let pte_addr = cr3();
-    println!("Page Table Addr: 0x{:x}", pte_addr);
+    // let pte_addr = cr3();
+    // println!("Page Table Addr: 0x{:x}", pte_addr);
 
     loop {
         unsafe {
@@ -126,8 +71,9 @@ extern "x86-interrupt" fn breakpoint_handler(f: ExceptionStackFrame) {
     println!("BREAKPOINT: {:?}", f);
 }
 
-extern "x86-interrupt" fn double_fault_handler(f: ExceptionStackFrame, _error_code: u32) {
+extern "x86-interrupt" fn double_fault_handler(f: ExceptionStackFrame, _error_code: u32) -> ! {
     println!("DOUBLE FAULT {:?}", f);
+    panic!()
 }
 
 extern "x86-interrupt" fn page_fault_handler(f: ExceptionStackFrame, error_code: u32) {
@@ -145,7 +91,7 @@ extern "x86-interrupt" fn segment_not_present_handler(f: ExceptionStackFrame, er
     println!("SEGMENT NOT PRESENT {} {:?}", error_code, f)
 }
 
-extern "x86-interrupt" fn keyboard_handler(_f: &ExceptionStackFrame) {
+extern "x86-interrupt" fn keyboard_handler(_f: ExceptionStackFrame) {
     let scancode = inb(0x60);
     if let Some(ch) = scancode_to_char(scancode) {
         print!("{}", ch);
@@ -154,42 +100,9 @@ extern "x86-interrupt" fn keyboard_handler(_f: &ExceptionStackFrame) {
 }
 
 #[panic_handler]
-pub fn panic(_info: &::core::panic::PanicInfo) -> ! {
+pub fn panic(info: &::core::panic::PanicInfo) -> ! {
+    serial_println!("{:?}", info);
     loop {}
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct InterruptEntry {
-    pointer_low: u16,
-    gdt_selector: u16,
-    options: u16,
-    pointer_middle: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct DescriptorTablePointer {
-    /// Size of the DT.
-    pub limit: u16,
-    /// Pointer to the memory region containing the DT.
-    pub base: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct ExceptionStackFrame {
-    pub instruction_pointer: u32,
-    pub code_segment: u16,
-    pub cpu_flags: u32,
-    pub stack_pointer: u32,
-    pub stack_segment: u16,
-}
-
-pub fn lidt(idt: &DescriptorTablePointer) {
-    unsafe {
-        asm!("lidt [{}]", in(reg) idt, options(readonly, nostack, preserves_flags));
-    }
 }
 
 /// Programmable Interrupt Controller (PIC) registers.
@@ -209,8 +122,6 @@ const PIC1_CTRL: u16 = 0xa0;
 const PIC1_DATA: u16 = 0xa1;
 
 use x86::{inb, outb};
-
-use crate::{io::serial_out, x86::cr3};
 
 pub fn pic_init() {
     outb(PIC0_DATA, 0xff);
@@ -317,6 +228,7 @@ pub fn end_of_interrupt(pic: u16) {
 }
 
 pub fn scancode_to_char(code: u8) -> Option<char> {
+    // println!("scancode {}", code);
     match code {
         0x00 => {
             panic!("Error Scancode 0x00")
