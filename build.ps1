@@ -10,6 +10,17 @@ $args | ForEach-Object {
     if ($_ -eq "qemu") { $useqemu = $true }  
 }
 
+if ($release) {
+    if (Test-Path kernel/target/i686-unknown-none/release/kernel) {
+        Remove-Item kernel/target/i686-unknown-none/release/kernel
+    }
+}
+else {
+    if (Test-Path kernel/target/i686-unknown-none/debug/kernel) {
+        Remove-Item kernel/target/i686-unknown-none/debug/kernel
+    }
+}
+
 Set-Location kernel
 try {
     if ($release) {
