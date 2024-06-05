@@ -210,11 +210,6 @@ impl Default for VgaBuffer {
 
 static VGA_BUFFER: Singleton<VgaBuffer> = Singleton::UNINIT;
 
-// static mut BACK_VGA: VgaBuffer = VgaBuffer {
-//     col_pos: 0usize,
-//     cur_color: ColorCode(0x0f),
-// };
-
 #[doc(hidden)]
 pub fn _vga_print(args: fmt::Arguments) {
     use core::fmt::Write;

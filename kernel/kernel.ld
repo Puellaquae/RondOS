@@ -9,5 +9,4 @@ SECTIONS
   .data : { *(.data*) }
   .rodata : { *(.rodata*) }
   .bss : { *(.bss) }
-  /DISCARD/ : { *(.eh_frame) *(.comment) *(.debug*) }
 }

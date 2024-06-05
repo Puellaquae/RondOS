@@ -95,8 +95,8 @@ bios_read:
     mov [load_disk_cnt], ax
     test ax, ax
     jz check_read
-    add word [db_addr_seg], 0x07f0
-    add dword [d_lba], 127
+    add word [db_addr_seg], 0x1000
+    add dword [d_lba], 128
     jmp bios_read
 
 check_read:
