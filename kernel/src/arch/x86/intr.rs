@@ -576,3 +576,7 @@ pub struct ExceptionStackFrame {
     pub stack_pointer: u32,
     pub stack_segment: u16,
 }
+
+pub fn end_of_interrupt() {
+    x86::outb(0x20, 0x20);
+}

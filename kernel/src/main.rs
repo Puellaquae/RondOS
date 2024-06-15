@@ -2,18 +2,21 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 use core::arch::asm;
 
 mod arch;
 mod io;
 mod loader;
 mod mm;
+mod thread;
 mod utils;
 
+use alloc::boxed::Box;
 use arch::x86::{
     self, inb,
-    intr::{ExceptionStackFrame, INTR_TABLE},
-    outb,
+    intr::{end_of_interrupt, ExceptionStackFrame, INTR_TABLE},
     pic::{pic_init, pit_configure_channel},
 };
 
@@ -59,7 +62,15 @@ fn main() -> ! {
         asm!("sti");
     }
 
-    println!("esp page: {:x}", mm::pg_round_down(x86::esp() as usize));
+    for m in loader::get_memlayout() {
+        println!("{:?}", m);
+    }
+
+    let tp = mm::pg_round_down(x86::esp() as usize);
+    println!("esp page: {:x}", tp);
+
+    let a = Box::new(42);
+    println!("{} at {:p}", a, a);
 
     loop {
         unsafe {
@@ -105,10 +116,6 @@ pub fn panic(info: &::core::panic::PanicInfo) -> ! {
     println!("{:?}", info);
     serial_println!("{:?}", info);
     loop {}
-}
-
-pub fn end_of_interrupt() {
-    outb(0x20, 0x20);
 }
 
 pub fn scancode_to_char(code: u8) -> Option<char> {

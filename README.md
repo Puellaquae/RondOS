@@ -4,11 +4,9 @@
 
 ## 编译运行
 
-我是用 Windows 做的开发，汇编器是 nasm ，内核的编译到 i686-pc-windows-msvc，拿 PowerShell 和 python 写了编译脚本，系统在 Bochs 上跑。
+需要安装 nasm，nightly 版的 rust，虚拟机可以选择 bochs 或者 qemu。
 
-需要安装 nasm，nightly 版的 rust，msvc，python，python 的库 pefile，bochs。
-
-运行 build.ps1 脚本进行编译，参数 `run` 可在编译后启动 Bochs，参数 `release` 可让内核以 release 版本编译。
+运行 build.ps1 脚本进行编译，参数 `run` 可在编译后启动 Bochs，参数 `release` 可让内核以 release 版本编译（debug 版本体积太大可能无法运行），参数 `qemu` 使用 Qemu 进行模拟。
 
 ## 参考资料
 

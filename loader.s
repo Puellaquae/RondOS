@@ -27,7 +27,7 @@ KERNEL_BASE equ 0xc0000000
     mov ss, ax
     mov fs, ax
     mov gs, ax
-    mov sp, 0x7c00
+    mov esp, 0xf000
     lea si, str_boot_start
     call puts
 
@@ -165,6 +165,29 @@ detectmemfail:
     mov dword [memlayoutlen], 0xdead
 detectmemfin:
 
+
+; 0x7c00
+; bootloader code ↓
+; ...
+; stack ↑
+; 0xf000 (60KB)
+; page directory table (1024 items, each item 4Byte)
+; but we only map low 64MB(16 items), 0..16th item and 768..784th item
+; 0x10000 (64KB)
+; page entry table (16 * 1024 items)
+; flat map from 0 to 16 * 1024 * 4Byte (64MB)
+; 0x20000 (128KB)
+; kernel code
+; 0x9f000 (636KB)
+; 0xb8000
+; vga
+; ...
+; 0x100000 (1MB)
+; 30 MB free mem
+
+; ptr [ dir:10bits ][ entry:10bits ][ offset:12bits ]
+; ([([0xf000 + dir * 4Byte] & 0xfffff000) + entry * 4Byte] & 0xfffff000) + offset
+
 ; from 0xf000(60KB) to 0x10000(64KB) store the page table, total 1024 entries
 ; in low 64 MB direct to physical addr, in high 3GB, base 3GB map to base 0
 pde_mem_clear:
@@ -177,7 +200,7 @@ pde_mem_clear:
 
 build_pde:
     mov eax, PAGING_PAGE_ADDR | PG_TABLE | PG_RW | PG_US
-    mov cx, 0x10
+    mov cx, 0x40
     xor di, di
 write_pde:
     ; we still need map virtual addr direct to physical addr

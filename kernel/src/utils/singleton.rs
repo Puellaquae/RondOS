@@ -48,11 +48,10 @@ impl<T: Default> Singleton<T> {
                 Err(_) => {}
             }
 
-            unsafe { (*self.data.get()).as_mut_ptr().write(T::default()) };
+            unsafe { (*self.data.get()).as_mut_ptr().write_volatile(T::default()) };
             self.inited.store(SINGLE_INITED, Ordering::Release);
-
-            break;
         }
+        assert_eq!(self.inited.load(Ordering::Acquire), SINGLE_INITED);
     }
 
     fn get(&self) -> &T {
