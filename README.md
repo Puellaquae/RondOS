@@ -1,4 +1,4 @@
-# RondOS 我儘のロンドＳ
+# RondOS
 
 自制的一个简易 x86 操作系统，内核使用 Rust 开发，用汇编编写了一个简单的 bootloader。
 

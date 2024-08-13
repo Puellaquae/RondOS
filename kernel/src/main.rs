@@ -7,6 +7,7 @@ extern crate alloc;
 use core::arch::asm;
 
 mod arch;
+mod driver;
 mod io;
 mod loader;
 mod mm;
@@ -71,6 +72,14 @@ fn main() -> ! {
 
     let a = Box::new(42);
     println!("{} at {:p}", a, a);
+
+    driver::vga::set_320x200x256g();
+    for y in 0..200 {
+        for x in 0..320 {
+            driver::vga::write_pixel8x(x, y, if (x + y) % 2 == 0 { 1 } else { 2 });
+        }
+    }
+    // driver::vga::set_80x25t();
 
     loop {
         unsafe {

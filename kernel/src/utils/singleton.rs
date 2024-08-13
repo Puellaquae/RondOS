@@ -6,6 +6,8 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
+use crate::arch::x86;
+
 const SINGLE_UNINIT: u8 = 0;
 const SINGLE_INITING: u8 = 1;
 const SINGLE_INITED: u8 = 2;
@@ -24,6 +26,7 @@ impl<T: Default> Singleton<T> {
     };
 
     fn init(&self) {
+        x86::cli();
         loop {
             let stat = self.inited.compare_exchange(
                 SINGLE_UNINIT,
@@ -40,17 +43,14 @@ impl<T: Default> Singleton<T> {
                     continue;
                 }
                 Err(SINGLE_INITING) => {
-                    while self.inited.load(Ordering::Acquire) == SINGLE_INITING {
-                        spin_loop()
-                    }
-                    continue;
+                    unreachable!("os run single core, no way into twice")
                 }
                 Err(_) => {}
             }
-
             unsafe { (*self.data.get()).as_mut_ptr().write_volatile(T::default()) };
             self.inited.store(SINGLE_INITED, Ordering::Release);
         }
+        x86::sti();
         assert_eq!(self.inited.load(Ordering::Acquire), SINGLE_INITED);
     }
 

@@ -44,9 +44,9 @@ pub fn sti() {
     }
 }
 
-pub fn cti() {
+pub fn cli() {
     unsafe {
-        asm!("cti")
+        asm!("cli")
     }
 }
 
