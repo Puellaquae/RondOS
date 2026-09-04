@@ -2,18 +2,14 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 
-extern crate alloc;
-
 use core::arch::asm;
 
 mod arch;
 mod io;
 mod loader;
 mod mm;
-mod thread;
 mod utils;
 
-use alloc::boxed::Box;
 use arch::x86::{
     self, inb,
     intr::{end_of_interrupt, ExceptionStackFrame, INTR_TABLE},
@@ -28,7 +24,6 @@ fn main() -> ! {
     serial_println!("RondOS> HELLO RondOS");
 
     println!("HELLO RondOS");
-    println!("Kernel Size {} KiB", loader::get_kernel_size() / 1024);
     println!(
         "Available Memory Size {} KiB",
         mm::available_mem_size() / 1024
@@ -68,9 +63,6 @@ fn main() -> ! {
 
     let tp = mm::pg_round_down(x86::esp() as usize);
     println!("esp page: {:x}", tp);
-
-    let a = Box::new(42);
-    println!("{} at {:p}", a, a);
 
     loop {
         unsafe {

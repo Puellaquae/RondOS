@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use core::{alloc::GlobalAlloc, fmt::Debug, ptr::addr_of};
+use core::fmt::Debug;
+use core::ptr::addr_of;
 
 use page::PAGE_ALLOC;
 
@@ -67,26 +68,17 @@ pub fn available_mem_size() -> u64 {
 }
 
 pub fn pg_round_down(addr: usize) -> usize {
-    // round 4KiB
     addr & (!((1 << 12) - 1))
 }
 
-pub struct Allocator {}
-
-unsafe impl GlobalAlloc for Allocator {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        let reqsize = layout.size();
-        PAGE_ALLOC
-            .get_mut()
-            .get_page((reqsize + 4095) / 4096)
-            .unwrap()
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
-        let reqsize = layout.size();
-        PAGE_ALLOC.get_mut().free_page(ptr, (reqsize + 4095) / 4096)
-    }
+pub fn pg_round_up(addr: usize) -> usize {
+    (addr + 4095) & (!((1 << 12) - 1))
 }
 
-#[global_allocator]
-static ALLOCATOR: Allocator = Allocator {};
+pub fn total_pages() -> usize {
+    (available_mem_size() as usize) / 4096
+}
+
+pub fn page_alloc() -> &'static mut page::PageAllocator {
+    PAGE_ALLOC.get_mut()
+}

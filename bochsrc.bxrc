@@ -1,5 +1,0 @@
-memory: host=32, guest=32
-boot: disk
-ata0: enabled=true, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
-ata0-master: type=disk, path="disk.img", mode=flat
-ata0-slave: type=none

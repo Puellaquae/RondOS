@@ -1,12 +1,14 @@
 ENTRY(_start)
 
-. = 0xc0022000;
-
 SECTIONS
 {
+  . = 0x00022000;                       /* physical load address */
 
   .text : { *(.text*) }
-  .data : { *(.data*) }
+  . = ALIGN(0x1000);
   .rodata : { *(.rodata*) }
-  .bss : { *(.bss) }
+  . = ALIGN(0x1000);
+  .data : { *(.data*) }
+  . = ALIGN(0x1000);
+  .bss : { *(.bss*) }
 }

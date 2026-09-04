@@ -7,10 +7,9 @@
     "max-atomic-width": 32,
     "os": "none",
     "position-independent-executables": false,
-    "target-pointer-width": "32",
-    "target-c-int-width": "32",
+    "target-pointer-width": 32,
     "panic-strategy": "abort",
-    "features": "-mmx,-sse,+soft-float",
+    "features": "-mmx,-sse",
     "disable-redzone": true,
     "linker-flavor": "ld.lld",
     "linker": "rust-lld"
