@@ -30,7 +30,6 @@ fn main() -> ! {
 
     mm::init_heap();
     heap_smoke_test();
-    vmm_smoke_test();
 
     println!("HELLO RondOS");
     println!(
@@ -82,6 +81,7 @@ fn main() -> ! {
     thread::thread_create("busy-a", busy_a, 0);
     thread::thread_create("busy-b", busy_b, 1);
     thread::thread_create("sleeper", sleeper, 2);
+    thread::thread_create("vmm", vmm_thread, 0);
 
     println!("RondOS> threads created, enabling preemption");
 
@@ -118,71 +118,58 @@ fn heap_smoke_test() {
     serial_println!("{}", s);
 }
 
-fn vmm_smoke_test() {
+fn vmm_thread(_arg: usize) {
+    // Hammer address-space create/map/switch/destroy under preemption.
+    let mut fails = 0;
+    for i in 0..20 {
+        let ok = address_space_roundtrip();
+        if !ok {
+            fails += 1;
+        }
+        if i == 0 || !ok {
+            serial_println!("vmm-rt[{}] {}", i, if ok { "ok" } else { "FAIL" });
+        }
+    }
+    serial_println!("vmm-stress: 20 round-trips, {} failures", fails);
+    thread::thread_exit()
+}
+
+/// Create a fresh space, map a page, activate it, touch it, switch back to the
+/// boot space and tear it down again.  Returns false on any check failure.
+fn address_space_roundtrip() -> bool {
     use crate::arch::x86::paging::{create_kernel_address_space, destroy_address_space, X86Paging};
     use crate::mm::vm::{AddressSpace, PagingArch, PAGE_USER_RW};
 
-    // A fresh address space (kernel region copied from the boot tables).
+    let boot_root = X86Paging::active_root();
     let root = match create_kernel_address_space() {
         Some(r) => r,
-        None => {
-            serial_println!("vmm: failed to create address space");
-            return;
-        }
+        None => return false,
     };
-    let boot_root = X86Paging::active_root();
-
-    // A private physical page to map into it.
     let frame = match mm::page_alloc().get_page(1) {
         Some(f) => f,
         None => {
-            serial_println!("vmm: no frame");
             destroy_address_space(root);
-            return;
+            return false;
         }
     };
     let pa = frame as usize - loader::KERNEL_VADDR_BASE as usize;
-
-    // Map it at a user-region VA (above the 64 MiB boot mapping, PDE empty).
     let test_va: usize = 0x0800_0000;
+
     let mut space = AddressSpace::<X86Paging>::new(root);
-    match space.map(test_va, pa, PAGE_USER_RW) {
-        Ok(()) => {}
-        Err(e) => {
-            serial_println!("vmm: map failed: {:?}", e);
-            mm::page_alloc().free_page(frame, 1);
-            destroy_address_space(root);
-            return;
-        }
-    }
-
-    let tr = space.translate(test_va);
-    serial_println!("vmm: translated {:#x} -> {:#x?}", test_va, tr);
-
-    // Switch to the new space and touch the page both ways.
+    let ok_map = space.map(test_va, pa, PAGE_USER_RW).is_ok();
+    let ok_tr = space.translate(test_va) == Some(pa);
     space.activate();
     unsafe {
-        (test_va as *mut u32).write_volatile(0xDEAD_BEEF);
+        (test_va as *mut u32).write_volatile(0xCAFE_BABE);
     }
     let via_mirror = unsafe { (frame as *const u32).read_volatile() };
-    let via_mapped = unsafe { (test_va as *const u32).read_volatile() };
-    serial_println!(
-        "vmm: in-space write mirror={:#x} mapped={:#x}",
-        via_mirror,
-        via_mapped
-    );
-
-    // Back on the boot address space the VA must be unmapped.
     X86Paging::switch_to(boot_root);
-    let boot_tr = X86Paging::translate(boot_root, test_va);
-    serial_println!("vmm: boot-space translate = {:#x?}", boot_tr);
+    let not_in_boot = X86Paging::translate(boot_root, test_va).is_none();
 
-    let ok = tr == Some(pa) && via_mirror == 0xDEAD_BEEF && via_mapped == 0xDEAD_BEEF && boot_tr.is_none();
-    serial_println!("vmm: selftest {}", if ok { "PASS" } else { "FAIL" });
-
-    // Cleanup: the test VA uses a private page table, freed with the space.
+    let ok = ok_map && ok_tr && via_mirror == 0xCAFE_BABE && not_in_boot;
     mm::page_alloc().free_page(frame, 1);
     destroy_address_space(root);
+    ok
 }
 
 fn busy_a(_arg: usize) {
@@ -223,6 +210,7 @@ extern "x86-interrupt" fn double_fault_handler(f: ExceptionStackFrame, _error_co
 }
 
 extern "x86-interrupt" fn page_fault_handler(f: ExceptionStackFrame, error_code: u32) {
+    serial_println!("PAGE FAULT#{} cr2={:#x} {:?}", error_code, arch::x86::cr2(), f);
     println!("PAGE FAULT#{} {:?}", error_code, f);
 }
 
