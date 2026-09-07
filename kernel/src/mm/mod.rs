@@ -9,6 +9,7 @@ use crate::loader;
 
 pub mod heap;
 pub mod page;
+pub mod vm;
 
 pub use heap::{heap_free_bytes, init_heap};
 
