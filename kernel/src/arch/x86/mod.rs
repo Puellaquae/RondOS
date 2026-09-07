@@ -31,6 +31,14 @@ pub fn cr3() -> u32 {
     return addr;
 }
 
+pub fn cr2() -> u32 {
+    let mut addr: u32;
+    unsafe {
+        asm!("mov eax, cr2", out("eax") addr);
+    }
+    return addr;
+}
+
 pub fn esp() -> u32 {
     let mut addr: u32;
     unsafe {

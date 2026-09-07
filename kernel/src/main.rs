@@ -21,6 +21,13 @@ const TIMER_FREQ: u32 = 200;
 fn main() -> ! {
     serial_println!("RondOS> HELLO RondOS");
 
+    // Install exception handlers before the MM/VMM smoke tests so faults are
+    // reported instead of cascading into a triple fault (no IDT yet otherwise).
+    INTR_TABLE.get_mut().page_fault.set_handle_fn(page_fault_handler);
+    INTR_TABLE.get_mut().double_fault.set_handle_fn(double_fault_handler);
+    INTR_TABLE.get_mut().general_protection_fault.set_handle_fn(gp_handler);
+    INTR_TABLE.get_mut().update();
+
     mm::init_heap();
     heap_smoke_test();
     vmm_smoke_test();
@@ -221,6 +228,11 @@ extern "x86-interrupt" fn page_fault_handler(f: ExceptionStackFrame, error_code:
 
 extern "x86-interrupt" fn segment_not_present_handler(f: ExceptionStackFrame, error_code: u32) {
     println!("SEGMENT NOT PRESENT {} {:?}", error_code, f)
+}
+
+extern "x86-interrupt" fn gp_handler(f: ExceptionStackFrame, error_code: u32) {
+    serial_println!("GP {} cr2={:#x} {:?}", error_code, arch::x86::cr2(), f);
+    println!("GP {} {:?}", error_code, f);
 }
 
 extern "x86-interrupt" fn keyboard_handler(_f: ExceptionStackFrame) {

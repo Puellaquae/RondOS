@@ -5,9 +5,10 @@
 //! themselves into an address-sorted list stored in their own payload area,
 //! so adjacent frees can be merged back together.
 //!
-//! The heap lives in a static `.bss` region today.  Once the VMM can map
-//! additional frames, `grow` will be wired to extend the heap dynamically
-//! instead of running out of this fixed pool.
+//! The heap is not a fixed `.bss` pool: it owns a reserved *virtual* region
+//! and lazily maps physical frames into it (via the VMM, see
+//! [`crate::arch::map_kernel_frame`]) whenever the free list runs out.  This
+//! keeps the kernel image small and lets the heap grow on demand.
 
 #![allow(dead_code)]
 
@@ -17,13 +18,14 @@ use core::ptr::{self, NonNull};
 use crate::arch::InterruptGuard;
 use crate::utils::spinlock::SpinLock;
 
-/// Size of the fixed kernel heap region, in bytes.
-///
-/// The kernel still lives below 1 MiB (the loader copies it in real mode), so
-/// the whole image -- text + data + this BSS region -- must stay under the
-/// EBDA at ~0x9fc00.  Once the VMM maps frames above 1 MiB, the heap will be
-/// moved out of `.bss` and grown dynamically instead.
-pub const HEAP_SIZE: usize = 256 * 1024;
+/// Reserved virtual range for the kernel heap.  Above the bootloader's
+/// 64 MiB identity/mirror window (0xc000_0000 .. 0xc040_0000), so pages are
+/// mapped here explicitly without splitting the mirrored huge pages.
+pub const HEAP_START_VA: usize = 0xc400_0000;
+pub const HEAP_LIMIT_VA: usize = 0xc500_0000;
+
+/// Frames mapped per heap growth step (64 KiB).
+const GROW_PAGES: usize = 16;
 
 /// All allocation payloads are 8-byte aligned; block headers are 8 bytes.
 const ALIGN: usize = 8;
@@ -31,11 +33,6 @@ const HEADER: usize = 8;
 
 /// A free block is at least this large so it can store size + next pointer.
 const MIN_BLOCK: usize = 16;
-
-#[repr(align(16))]
-struct HeapBuf([u8; HEAP_SIZE]);
-
-static mut HEAP_SPACE: HeapBuf = HeapBuf([0; HEAP_SIZE]);
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -67,42 +64,30 @@ impl FreeBlock {
 }
 
 pub struct Heap {
-    start: usize,
-    end: usize,
+    /// Next virtual address at which new heap pages will be mapped.
+    next_va: usize,
+    /// One past the last virtual address the heap may use.
+    limit_va: usize,
     free_head: Option<NonNull<FreeBlock>>,
 }
 
 impl Heap {
     pub const fn empty() -> Heap {
         Heap {
-            start: 0,
-            end: 0,
+            next_va: 0,
+            limit_va: 0,
             free_head: None,
         }
     }
 
-    /// Add `[start, end)` as a free region.  The region must be 8-byte
-    /// aligned and not overlap existing regions.
-    ///
-    /// # Safety
-    /// `start`/`end` must point to memory that is unused and stays mapped for
-    /// the lifetime of the heap.
-    pub unsafe fn init(&mut self, start: usize, end: usize) {
-        debug_assert!(start % ALIGN == 0 && end % ALIGN == 0);
-        debug_assert!(start < end);
-        self.start = start;
-        self.end = end;
-        self.add_region(start, end);
-    }
-
-    /// Add the free region `[start, end)` to the allocator, coalescing it with
-    /// any adjacent free blocks.  Used for heap growth.
-    ///
-    /// # Safety
-    /// See [`Heap::init`].
-    pub unsafe fn grow(&mut self, start: usize, end: usize) {
-        self.add_region(start, end);
-        self.end = self.end.max(end);
+    /// Configure the heap's virtual region.  No memory is mapped yet; pages
+    /// are mapped on demand when the free list runs out.
+    pub fn configure(&mut self, start_va: usize, limit_va: usize) {
+        debug_assert!(start_va % 4096 == 0 && limit_va % 4096 == 0);
+        debug_assert!(start_va < limit_va);
+        self.next_va = start_va;
+        self.limit_va = limit_va;
+        self.free_head = None;
     }
 
     unsafe fn add_region(&mut self, start: usize, end: usize) {
@@ -113,6 +98,34 @@ impl Heap {
         (*block.as_ptr()).size = size;
         (*block.as_ptr()).next = None;
         self.push_block(block);
+    }
+
+    /// Map another chunk of frames at `next_va` and add them to the free list.
+    /// Returns false when the virtual budget is exhausted.
+    fn grow(&mut self) -> bool {
+        if self.next_va >= self.limit_va {
+            return false;
+        }
+        let avail_pages = (self.limit_va - self.next_va) / 4096;
+        let pages = GROW_PAGES.min(avail_pages);
+        if pages == 0 {
+            return false;
+        }
+
+        let start = self.next_va;
+        let mut mapped = 0;
+        while mapped < pages && crate::arch::map_kernel_frame(start + mapped * 4096) {
+            mapped += 1;
+        }
+        if mapped == 0 {
+            return false;
+        }
+
+        self.next_va = start + mapped * 4096;
+        unsafe {
+            self.add_region(start, self.next_va);
+        }
+        true
     }
 
     unsafe fn push_block(&mut self, block: NonNull<FreeBlock>) {
@@ -211,13 +224,16 @@ impl Heap {
         // Total block size: header + payload rounded up to our alignment.
         let need = align_up(size + HEADER, ALIGN).max(MIN_BLOCK);
 
-        let block = match self.pop_first_fit(need) {
-            Some(b) => b,
-            None => return ptr::null_mut(), // out of memory
-        };
-        // pop_first_fit records the exact block size (split tail off, or keeps
-        // the whole block) so dealloc can hand the full block back.
-        (block.as_ptr() as usize + HEADER) as *mut u8
+        loop {
+            if let Some(b) = self.pop_first_fit(need) {
+                // pop_first_fit records the exact block size (split tail off,
+                // or keeps the whole block) so dealloc can hand it all back.
+                return (b.as_ptr() as usize + HEADER) as *mut u8;
+            }
+            if !self.grow() {
+                return ptr::null_mut(); // out of memory
+            }
+        }
     }
 
     /// # Safety
@@ -277,16 +293,13 @@ unsafe impl GlobalAlloc for KernelHeap {
 
 static HEAP: SpinLock<Heap> = SpinLock::new(Heap::empty());
 
-/// Initialize the kernel heap from its static region.  Must be called once,
-/// before any allocation.
+/// Initialize the kernel heap's virtual region.  Must be called once, before
+/// any allocation; frames are mapped lazily on first use.
 pub fn init_heap() {
-    unsafe {
-        let addr = ptr::addr_of_mut!(HEAP_SPACE) as usize;
-        HEAP.with(|heap| heap.init(addr, addr + HEAP_SIZE));
-    }
+    HEAP.with(|heap| heap.configure(HEAP_START_VA, HEAP_LIMIT_VA));
 }
 
-/// Free heap bytes (diagnostics).
+/// Free bytes currently on the heap free list (diagnostics).
 pub fn heap_free_bytes() -> usize {
     HEAP.with(|heap| heap.free_bytes())
 }

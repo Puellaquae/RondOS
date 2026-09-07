@@ -29,7 +29,7 @@ use core::arch::asm;
 
 use crate::loader::KERNEL_VADDR_BASE;
 use crate::mm::page_alloc;
-use crate::mm::vm::{MapError, PageFlags, PagingArch, PAGE_SIZE};
+use crate::mm::vm::{MapError, PageFlags, PagingArch, PAGE_KERNEL_RW, PAGE_SIZE};
 
 const PTE_PRESENT: u32 = 1 << 0;
 const PTE_WRITABLE: u32 = 1 << 1;
@@ -112,6 +112,11 @@ impl PagingArch for X86Paging {
             let pd = phys_to_kernel(root);
             let mut pde = ld(pd + pdi * 4);
 
+            // True when the target slot comes straight from a just-split huge
+            // page.  Splitting reproduces the huge page in a page table, so
+            // the slot is a synthetic copy: we must be allowed to replace it.
+            let mut from_split = false;
+
             if pde & PTE_PRESENT == 0 {
                 // Need a new page table.  Its PDE gets the requested access so
                 // that user pages are reachable from ring 3 later on.
@@ -121,12 +126,13 @@ impl PagingArch for X86Paging {
             } else if pde & PDE_PSE != 0 {
                 // The 4 MiB region is a huge page; split it into a page table.
                 split_huge(pd, pdi, pde)?;
+                from_split = true;
                 pde = ld(pd + pdi * 4);
             }
 
             let pt_va = phys_to_kernel((pde & PTE_PHYS_MASK) as usize);
             let old = ld(pt_va + pti * 4);
-            if old & PTE_PRESENT != 0 && (old & PTE_PHYS_MASK) as usize != pa {
+            if !from_split && old & PTE_PRESENT != 0 && (old & PTE_PHYS_MASK) as usize != pa {
                 return Err(MapError::AlreadyMapped);
             }
 
@@ -229,17 +235,37 @@ pub fn create_kernel_address_space() -> Option<usize> {
     }
 }
 
-/// Destroy an address space created by [`create_kernel_address_space`]:
-/// frees its page tables but leaves shared kernel region PDEs (which point at
-/// the kernel's own 4 MiB pages) untouched.
+/// Allocate one physical frame and map it at kernel virtual address `va` in
+/// the *active* address space.  Used by the kernel heap to grow into its
+/// reserved virtual region.  Returns true on success.
+pub fn map_kernel_frame(va: usize) -> bool {
+    if va & 0xfff != 0 {
+        return false;
+    }
+    let pa = match alloc_zero_frame() {
+        Some(pa) => pa,
+        None => return false,
+    };
+    if X86Paging::map(X86Paging::active_root(), va, pa, PAGE_KERNEL_RW).is_err() {
+        free_frame(pa);
+        return false;
+    }
+    true
+}
+
+/// Destroy an address space created by [`create_kernel_address_space`].
+///
+/// Only page tables in the user half (PDE index < 768) are reclaimed.  Kernel
+/// region entries (identity + mirror + heap, PDE >= 768 or huge pages) are
+/// shared with the kernel address space and must stay alive.
 pub fn destroy_address_space(root: usize) {
     unsafe {
         let pd = phys_to_kernel(root);
-        for pdi in 0..PDE_COUNT {
+        for pdi in 0..768 {
             let pde = ld(pd + pdi * 4);
             if pde & PTE_PRESENT != 0 && pde & PDE_PSE == 0 {
-                // Not a huge page: it is a private page table (shared kernel
-                // regions are huge 4 MiB pages, so they are skipped above).
+                // A private 4 KiB page table (kernel regions are huge 4 MiB
+                // pages or live at PDE >= 768 and are skipped above).
                 free_frame((pde & PTE_PHYS_MASK) as usize);
             }
         }
