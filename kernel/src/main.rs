@@ -2,21 +2,17 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 
-use core::arch::asm;
-
 mod arch;
 mod io;
 mod loader;
 mod mm;
+mod thread;
 mod utils;
 
-use arch::x86::{
-    self, inb,
-    intr::{end_of_interrupt, ExceptionStackFrame, INTR_TABLE},
-    pic::{pic_init, pit_configure_channel},
-};
+use arch::x86::{self, inb};
+use arch::x86::intr::{end_of_interrupt, ExceptionStackFrame, INTR_TABLE};
+use arch::x86::pic::{pic_init, pit_configure_channel};
 
-static mut TICKS: u64 = 0;
 const TIMER_FREQ: u32 = 200;
 
 #[export_name = "_start"]
@@ -48,14 +44,20 @@ fn main() -> ! {
         .get_mut()
         .segment_not_present
         .set_handle_fn(segment_not_present_handler);
-    INTR_TABLE.get_mut()[0x20].set_handle_fn(timer_handler);
     INTR_TABLE.get_mut()[0x21].set_handle_fn(keyboard_handler);
 
-    INTR_TABLE.get_mut().update();
+    // Bootstrap the thread subsystem. This must happen before interrupts are
+    // enabled: `thread::init` registers the boot flow as the "main" thread and
+    // allocates the idle thread's stack.
+    thread::init();
 
-    unsafe {
-        asm!("sti");
-    }
+    // Vector 0x20 (PIT timer) drives the preemptive scheduler. It is routed to
+    // an assembly stub rather than an `x86-interrupt` handler so that the full
+    // interrupted register state is saved in a fixed layout.
+    INTR_TABLE.get_mut()[0x20]
+        .set_handle_addr(thread::irq0_stub as unsafe extern "C" fn() as usize);
+
+    INTR_TABLE.get_mut().update();
 
     for m in loader::get_memlayout() {
         println!("{:?}", m);
@@ -64,11 +66,47 @@ fn main() -> ! {
     let tp = mm::pg_round_down(x86::esp() as usize);
     println!("esp page: {:x}", tp);
 
+    thread::thread_create("busy-a", busy_a, 0);
+    thread::thread_create("busy-b", busy_b, 1);
+    thread::thread_create("sleeper", sleeper, 2);
+
+    println!("RondOS> threads created, enabling preemption");
+
+    x86::sti();
+
+    // The boot flow stays alive as an ordinary round-robin thread. `hlt` keeps
+    // it mostly idle; the timer tick preempts it like any other thread.
     loop {
-        unsafe {
-            asm!("hlt");
+        x86::hlt();
+    }
+}
+
+fn busy_a(_arg: usize) {
+    let mut n: u64 = 0;
+    loop {
+        n = n.wrapping_add(1);
+        if n % 10_000_000 == 0 {
+            serial_println!("a {} @t{}", n, thread::ticks());
         }
     }
+}
+
+fn busy_b(_arg: usize) {
+    let mut n: u64 = 0;
+    loop {
+        n = n.wrapping_add(1);
+        if n % 10_000_000 == 0 {
+            serial_println!("b {} @t{}", n, thread::ticks());
+        }
+    }
+}
+
+fn sleeper(_arg: usize) {
+    for i in 0..5 {
+        serial_println!("c {} @t{}", i, thread::ticks());
+        thread::sleep(500);
+    }
+    serial_println!("c done @t{}", thread::ticks());
 }
 
 extern "x86-interrupt" fn breakpoint_handler(f: ExceptionStackFrame) {
@@ -82,13 +120,6 @@ extern "x86-interrupt" fn double_fault_handler(f: ExceptionStackFrame, _error_co
 
 extern "x86-interrupt" fn page_fault_handler(f: ExceptionStackFrame, error_code: u32) {
     println!("PAGE FAULT#{} {:?}", error_code, f);
-}
-
-extern "x86-interrupt" fn timer_handler(_f: ExceptionStackFrame) {
-    unsafe {
-        TICKS += 1;
-    }
-    end_of_interrupt();
 }
 
 extern "x86-interrupt" fn segment_not_present_handler(f: ExceptionStackFrame, error_code: u32) {
