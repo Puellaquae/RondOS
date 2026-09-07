@@ -2,6 +2,8 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 mod arch;
 mod io;
 mod loader;
@@ -18,6 +20,9 @@ const TIMER_FREQ: u32 = 200;
 #[export_name = "_start"]
 fn main() -> ! {
     serial_println!("RondOS> HELLO RondOS");
+
+    mm::init_heap();
+    heap_smoke_test();
 
     println!("HELLO RondOS");
     println!(
@@ -79,6 +84,30 @@ fn main() -> ! {
     loop {
         x86::hlt();
     }
+}
+
+fn heap_smoke_test() {
+    use alloc::boxed::Box;
+    use alloc::format;
+    use alloc::vec::Vec;
+
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..16 {
+        v.push(i as u64 * 3);
+    }
+    let mut b = Box::new(7u32);
+    *b += 1;
+    serial_println!(
+        "heap: v.len={} v[5]={} box={} free={}KiB",
+        v.len(),
+        v[5],
+        *b,
+        mm::heap_free_bytes() / 1024
+    );
+    drop(v);
+    drop(b);
+    let s = format!("freed -> free={}KiB", mm::heap_free_bytes() / 1024);
+    serial_println!("{}", s);
 }
 
 fn busy_a(_arg: usize) {

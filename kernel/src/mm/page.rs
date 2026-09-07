@@ -1,10 +1,20 @@
 #![allow(dead_code)]
 
+use crate::loader::KERNEL_VADDR_BASE;
 use crate::utils::{singleton::Singleton, BitAccess};
 use core::fmt::Debug;
 use super::available_mem_size;
 
 pub static PAGE_ALLOC: Singleton<PageAllocator> = Singleton::UNINIT;
+
+/// End of the kernel image, defined by the linker script.
+extern "C" {
+    static _kernel_end: u8;
+}
+
+/// Low memory mapped 1:1 / mirrored at KERNEL_BASE by the bootloader is the
+/// first 64 MiB; the page pool must stay inside it.
+const MAPPED_END: usize = 0x0400_0000;
 
 // 4KB page
 pub struct PageAllocator {
@@ -14,15 +24,29 @@ pub struct PageAllocator {
 
 impl Default for PageAllocator {
     fn default() -> Self {
-        let memsize = available_mem_size() as usize;
-        let pagecnt = memsize / 4096;
-        let bitmap_size = (pagecnt + 7) / 8;
-        let bitmap_pages = (bitmap_size + 4095) / 4096;
-        let avl_pages = pagecnt - bitmap_pages;
-        let data_ptr = 0xc0100000 as *mut u8;
-        Self {
-            bitmap: BitMap::new(data_ptr, avl_pages),
-            base_addr: 0xc0100000 + bitmap_pages * 4096,
+        unsafe {
+            let avail_end = (0x100000 + available_mem_size() as usize).min(MAPPED_END);
+            // The page pool starts after the kernel image, but never inside the
+            // low 1 MiB (conventional memory holds BIOS data / the loader).
+            let kernel_end = (((&raw const _kernel_end) as usize + 0xfff) & !0xfff).max(0x100000);
+            assert!(
+                kernel_end < avail_end,
+                "kernel image (end {kernel_end:#x}) exceeds the mapped window {avail_end:#x}"
+            );
+
+            let memsz = avail_end - kernel_end;
+            let pagecnt = memsz / 4096;
+            let bitmap_size = (pagecnt + 7) / 8;
+            let bitmap_pages = (bitmap_size + 4095) / 4096;
+            // Pages handed out to callers live after the bitmap.
+            let win_pages = pagecnt - bitmap_pages.min(pagecnt);
+
+            let data_ptr = (KERNEL_VADDR_BASE as usize + kernel_end) as *mut u8;
+            let base_addr = KERNEL_VADDR_BASE as usize + kernel_end + bitmap_pages * 4096;
+            Self {
+                bitmap: BitMap::new(data_ptr, win_pages),
+                base_addr,
+            }
         }
     }
 }

@@ -3,6 +3,7 @@
 use core::ops::{Bound, Range, RangeBounds};
 
 pub mod singleton;
+pub mod spinlock;
 
 pub trait BitAccess {
     const BIT_LENGTH: usize;

@@ -7,7 +7,10 @@ use page::PAGE_ALLOC;
 
 use crate::loader;
 
+pub mod heap;
 pub mod page;
+
+pub use heap::{heap_free_bytes, init_heap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

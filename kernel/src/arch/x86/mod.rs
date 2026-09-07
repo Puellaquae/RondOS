@@ -5,6 +5,7 @@ use core::{arch::asm, fmt};
 use crate::utils::BitAccess;
 
 pub mod intr;
+pub mod intrctl;
 pub mod pic;
 
 pub fn inb(port: u16) -> u8 {
