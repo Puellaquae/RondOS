@@ -5,7 +5,7 @@
 ; calls happen here.
 
 %define KERNEL_BASE     0xc0000000
-%define STAGING_ADDR    0x00010000                 ; kernel ELF staged here
+%define STAGING_ADDR    0x00050000                 ; kernel ELF staged here (high conventional RAM)
 %define PDE_TABLE_ADDR  0x0000f000                 ; 4 KiB page-directory
 
 CR0_PE equ 0x00000001

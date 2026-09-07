@@ -23,6 +23,20 @@ pub fn outb(port: u16, data: u8) {
     }
 }
 
+pub fn inw(port: u16) -> u16 {
+    let mut data: u16;
+    unsafe {
+        asm!("in ax, dx", in("dx") port, out("ax") data);
+    }
+    data
+}
+
+pub fn outw(port: u16, data: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") data);
+    }
+}
+
 pub fn cr3() -> u32 {
     let mut addr: u32;
     unsafe {

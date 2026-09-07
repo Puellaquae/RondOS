@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod arch;
+mod disk;
 mod io;
 mod loader;
 mod mm;
@@ -30,6 +31,7 @@ fn main() -> ! {
 
     mm::init_heap();
     heap_smoke_test();
+    disk_smoke();
 
     println!("HELLO RondOS");
     println!(
@@ -116,6 +118,54 @@ fn heap_smoke_test() {
     drop(b);
     let s = format!("freed -> free={}KiB", mm::heap_free_bytes() / 1024);
     serial_println!("{}", s);
+}
+
+fn disk_smoke() {
+    if !disk::init() {
+        serial_println!("disk: no drive found");
+        return;
+    }
+    let sectors = disk::sector_count().unwrap_or(0);
+    serial_println!("disk: {} sectors ({} KiB)", sectors, sectors * disk::SECTOR_SIZE as u64 / 1024);
+
+    // Sector 0 is our own stage1 MBR: check the 0x55aa boot signature.
+    let mut s0 = [0u8; disk::SECTOR_SIZE];
+    match disk::read_sectors(0, &mut s0) {
+        Ok(()) => {
+            let sig = (s0[510] as u16) | ((s0[511] as u16) << 8);
+            serial_println!("disk: sector0 boot sig {:#x}", sig);
+        }
+        Err(e) => serial_println!("disk: read sector0 failed {:?}", e),
+    }
+
+    // Kernel ELF starts at LBA 33 (1 MBR + 32 stage2 sectors); expect "ELF".
+    let mut elf = [0u8; disk::SECTOR_SIZE];
+    let eok = disk::read_sectors(33, &mut elf);
+    serial_println!(
+        "disk: kernel magic {:02x} {:02x} {:02x} {:02x} (read {:?})",
+        elf[0],
+        elf[1],
+        elf[2],
+        elf[3],
+        eok.is_ok()
+    );
+
+    // Round-trip write/read on the last sector (far away from the boot code).
+    let last = sectors - 1;
+    let mut wbuf = [0u8; disk::SECTOR_SIZE];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let mut rbuf = [0u8; disk::SECTOR_SIZE];
+    let wok = disk::write_sectors(last, &wbuf);
+    let rok = disk::read_sectors(last, &mut rbuf);
+    let match_ = rbuf == wbuf;
+    serial_println!(
+        "disk: write {:?} read {:?} match={}",
+        wok.is_ok(),
+        rok.is_ok(),
+        match_
+    );
 }
 
 fn vmm_thread(_arg: usize) {

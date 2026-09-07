@@ -11,8 +11,11 @@ STAGE2_LOAD_SEG equ 0x0100                                  ; load at 0x1000
 STAGE2_SECTORS  equ 32                                      ; 16 KiB
 STAGE2_ENTRY_OFF equ 4                                      ; skip "STG2" magic
 KERNEL_LBA_BASE equ (1 + STAGE2_SECTORS)                    ; 33
-STAGING_SEG     equ 0x1000                                  ; staging at 0x10000
-STAGING_SECTORS equ 128                                     ; 64 KiB / 512
+; Kernel ELF staging area.  High conventional memory (0x50000) is clear of the
+; kernel image (loaded at 0x22000, BSS to ~0x40000), so a large staging buffer
+; never overlaps the copy destination.
+STAGING_SEG     equ 0x5000                                  ; staging at 0x50000
+STAGING_SECTORS equ 256                                     ; 128 KiB / 512
 CHUNK_SECTORS   equ 16                                      ; 8 KiB per EDD call
 
 [bits 16]
