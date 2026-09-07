@@ -16,6 +16,11 @@ KERNEL_ELF_REL := $(KERNEL_DIR)/target/i686-unknown-none/release/kernel
 DISK_IMG   := disk.img
 DISK_SIZE_MIB := 2
 
+# Boot tar image: appended after the kernel at a fixed 512 KiB offset
+# (kernel must fit below it; see fs/mod.rs TAR_OFFSET_LBA = 1024).
+TAR_IMG    := files.tar
+TAR_OFFSET := 524288            # 512 KiB in bytes
+
 STAGE1_BIN := loader/stage1.bin
 STAGE2_BIN := loader/stage2.bin
 LOADER_BIN := loader.bin
@@ -51,12 +56,18 @@ loader: $(STAGE1_BIN) $(STAGE2_BIN)
 $(LOADER_BIN): $(STAGE1_BIN) $(STAGE2_BIN)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) > $@
 
+# ustar archive of files/ (short paths only; our kernel tar parser is simple).
+$(TAR_IMG): $(shell find files -type f)
+	tar --format=ustar -C files -cf $@ .
+
 # disk.img layout:
 #   sector 0                  : Stage1 (MBR)
 #   sectors 1..32             : Stage2 (16 KiB)
 #   sectors 33..              : Kernel ELF (as-is)
+#   kernel padded to 512 KiB  : (boot tar image starts at LBA 1024)
+#   tar archive               : read into ramfs at boot
 #   padding to DISK_SIZE_MIB
-$(DISK_IMG): $(LOADER_BIN) kernel
+$(DISK_IMG): $(LOADER_BIN) kernel $(TAR_IMG)
 	@echo "==> Building $@"
 	@rm -f $@
 	# Stage1 (must fit in 1 sector)
@@ -68,6 +79,12 @@ $(DISK_IMG): $(LOADER_BIN) kernel
 	truncate -s $$((33 * 512)) $@
 	# Kernel ELF (raw, as produced by rust-lld)
 	cat $(KERNEL_ELF_REAL) >> $@
+	# The kernel must stay below the tar offset.
+	@test $$(stat -c%s $(KERNEL_ELF_REAL)) -le $$(( $(TAR_OFFSET) - 33*512 )) \
+		|| (echo "kernel too large for tar offset"; exit 1)
+	# Pad to tar offset, append the boot tar image.
+	truncate -s $(TAR_OFFSET) $@
+	cat $(TAR_IMG) >> $@
 	# Pad to whole disk
 	truncate -s $$(( $(DISK_SIZE_MIB) * 1024 * 1024 )) $@
 	@echo "==> Built $@"
@@ -77,6 +94,6 @@ run: $(DISK_IMG)
 	$(QEMU) -drive format=raw,media=disk,file=$(DISK_IMG) -serial stdio -monitor none
 
 clean:
-	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(LOADER_BIN) $(DISK_IMG)
+	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(LOADER_BIN) $(DISK_IMG) $(TAR_IMG)
 	rm -f loader/*.lst kernel.bin
 	cd $(KERNEL_DIR) && $(CARGO) clean

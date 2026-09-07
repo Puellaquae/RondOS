@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod arch;
 mod disk;
+mod fs;
 mod io;
 mod loader;
 mod mm;
@@ -32,6 +33,7 @@ fn main() -> ! {
     mm::init_heap();
     heap_smoke_test();
     disk_smoke();
+    fs_smoke();
 
     println!("HELLO RondOS");
     println!(
@@ -166,6 +168,38 @@ fn disk_smoke() {
         rok.is_ok(),
         match_
     );
+}
+
+fn fs_smoke() {
+    fs::init();
+
+    match fs::load_tar_from_disk() {
+        Ok(n) => serial_println!("fs: tar imported {} entries", n),
+        Err(e) => {
+            serial_println!("fs: tar load failed {:?}", e);
+            return;
+        }
+    }
+
+    if let Some(entries) = fs::list("/") {
+        for (name, is_dir) in entries {
+            serial_println!(
+                "fs: /{}{}",
+                core::str::from_utf8(&name).unwrap_or("<name>"),
+                if is_dir { "/" } else { "" }
+            );
+        }
+    }
+
+    for probe in ["/hello.txt", "/docs/note.txt", "/nope.txt"] {
+        match fs::read_file(probe) {
+            Some(data) => {
+                let text = core::str::from_utf8(&data).unwrap_or("<binary>");
+                serial_println!("fs: read {} -> {}", probe, text.trim_end());
+            }
+            None => serial_println!("fs: {} not found", probe),
+        }
+    }
 }
 
 fn vmm_thread(_arg: usize) {

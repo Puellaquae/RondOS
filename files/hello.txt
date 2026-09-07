@@ -1,0 +1,2 @@
+Hello from ramfs!
+RondOS VFS is alive.

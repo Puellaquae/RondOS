@@ -1,6 +1,7 @@
 *.bin
 *.img
 *.lst
+*.tar
 *.exe
 *.elf
 kernel.inc
