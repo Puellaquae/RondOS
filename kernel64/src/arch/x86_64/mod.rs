@@ -9,7 +9,11 @@
 
 use core::arch::asm;
 
+pub mod gdt;
+pub mod intr;
 pub mod paging;
+pub mod percpu;
+pub mod tss;
 
 // ---------------------------------------------------------------- port I/O
 
@@ -106,6 +110,7 @@ pub const CR4_OSXMMEXCPT: u64 = 1 << 10;
 // ---------------------------------------------------------------- MSRs
 
 pub const MSR_EFER: u32 = 0xC000_0080;
+pub const MSR_GS_BASE: u32 = 0xC000_0101;
 pub const MSR_STAR: u32 = 0xC000_0081;
 pub const MSR_LSTAR: u32 = 0xC000_0082;
 pub const MSR_FMASK: u32 = 0xC000_0084;

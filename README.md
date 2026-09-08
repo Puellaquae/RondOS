@@ -14,11 +14,11 @@
 
 ## x86-64 迁移进度
 
-M0.1（`arch/x86_64` 骨架）与 M0.2（4 级分页后端 + NX + physmap）已完成：
+M0.1（`arch/x86_64` 骨架）、M0.2（4 级分页后端 + NX + physmap）与 M0.3（GDT/TSS/per-CPU/`swapgs`/IDT，ring3 能进出）已完成：
 
 ```bash
 make run64      # QEMU 里启动 x86-64 内核（串口输出）
-make test64     # 无头启动并检查 6 项冒烟测试
+make test64     # 无头启动并检查 7 项冒烟测试
 ```
 
 ## 依赖

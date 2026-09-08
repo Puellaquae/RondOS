@@ -1,0 +1,82 @@
+//! Task State Segment — M0.3.
+//!
+//! One static TSS for the single CPU.  Its job in long mode is narrow but
+//! essential:
+//!
+//! * `RSP0` is the stack the CPU switches to when ring3 enters ring0
+//!   (interrupt, exception or `int 0x80`).  The scheduler updates it on every
+//!   context switch so each thread gets its own kernel stack.
+//! * `IST1..7` give dedicated stacks for exceptions that must not run on a
+//!   possibly-corrupt stack (`#DF`, `#MC`, NMI).  Unused for now.
+//! * `iomap_base` is set past the limit, so **ring3 has no I/O port access at
+//!   all** — any `in`/`out` raises `#GP` (design §9).
+
+use core::cell::UnsafeCell;
+use core::mem::size_of;
+
+/// 64-bit TSS, 104 bytes (Intel SDM 7.7).
+#[repr(C, packed)]
+pub struct TaskStateSegment {
+    reserved0: u32,
+    pub rsp: [u64; 3],
+    reserved1: u64,
+    pub ist: [u64; 7],
+    reserved2: u64,
+    reserved3: u16,
+    pub iomap_base: u16,
+}
+
+impl TaskStateSegment {
+    const fn new() -> Self {
+        Self {
+            reserved0: 0,
+            rsp: [0; 3],
+            reserved1: 0,
+            ist: [0; 7],
+            reserved2: 0,
+            reserved3: 0,
+            iomap_base: 0,
+        }
+    }
+}
+
+#[repr(align(16))]
+struct TssCell(UnsafeCell<TaskStateSegment>);
+
+unsafe impl Sync for TssCell {}
+
+static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
+
+#[inline]
+fn tss() -> *mut TaskStateSegment {
+    TSS.0.get()
+}
+
+/// Physical/virtual address of the TSS, for the GDT descriptor.
+pub fn base() -> usize {
+    tss() as usize
+}
+
+pub fn init() {
+    unsafe {
+        (*tss()).iomap_base = size_of::<TaskStateSegment>() as u16;
+    }
+}
+
+/// Kernel stack top used when entering ring0 from ring3.
+pub fn set_rsp0(rsp0: u64) {
+    unsafe {
+        (*tss()).rsp[0] = rsp0;
+    }
+}
+
+pub fn rsp0() -> u64 {
+    unsafe { (*tss()).rsp[0] }
+}
+
+pub fn set_ist(index: usize, value: u64) {
+    assert!(index < 7);
+    unsafe {
+        (*tss()).ist[index] = value;
+    }
+}
