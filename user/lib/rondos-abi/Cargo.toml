@@ -1,0 +1,14 @@
+[package]
+name = "rondos-abi"
+version = "0.1.0"
+edition = "2021"
+description = "The frozen RondOS kernel/user ABI (syscall ids, Status, handles, layouts)"
+
+[features]
+default = []
+# Compiled into the kernel: only types and constants, no syscall stubs.
+kernel = []
+# Compiled into user programs: adds the `int 0x80` stubs.
+user = []
+
+[dependencies]

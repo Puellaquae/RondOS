@@ -20,10 +20,12 @@
 use core::array;
 use core::mem::size_of;
 
-use crate::arch::x86_64::gdt::{KERNEL_CODE, KERNEL_DATA};
-use crate::arch::x86_64::intr::{TrapFrame, VECTOR_TIMER};
+use crate::arch::x86_64::gdt::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
+use crate::arch::x86_64::intr::{self, TrapFrame, VECTOR_TIMER};
+use crate::arch::x86_64::paging::X86_64Paging;
 use crate::arch::x86_64::{hlt, percpu};
 use crate::mm;
+use crate::mm::vm::PagingArch;
 use crate::utils::singleton::Singleton;
 
 /// PIT is configured to 200 Hz, i.e. one tick every 5 ms.
@@ -49,11 +51,22 @@ pub enum ThreadState {
     Dying,
 }
 
+/// What a thread *is*.  User threads own a process address space that must be
+/// active while they run; kernel threads run on the kernel root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadKind {
+    Kernel,
+    User { pid: u32 },
+}
+
 pub struct Thread {
     used: bool,
     is_idle: bool,
     id: u32,
     name: &'static str,
+    kind: ThreadKind,
+    /// Page-table root to activate while this thread runs.
+    root: usize,
     state: ThreadState,
     entry: Option<fn(usize)>,
     arg: usize,
@@ -75,6 +88,8 @@ impl Thread {
             is_idle: false,
             id: 0,
             name: "",
+            kind: ThreadKind::Kernel,
+            root: 0,
             state: ThreadState::Ready,
             entry: None,
             arg: 0,
@@ -95,9 +110,6 @@ pub struct Scheduler {
     current: usize,
     idle: usize,
     ticks: u64,
-    /// Thread whose stack must be reclaimed on the next tick (it is still in
-    /// use by the interrupt that noticed it dying).
-    pending_reap: usize,
 }
 
 impl Default for Scheduler {
@@ -109,7 +121,6 @@ impl Default for Scheduler {
             current: MAIN_ID,
             idle: IDLE_ID,
             ticks: 0,
-            pending_reap: NONE as usize,
         }
     }
 }
@@ -141,10 +152,35 @@ impl Scheduler {
 
     fn reclaim(&mut self, idx: usize) {
         let (stack, pages) = (self.threads[idx].stack, self.threads[idx].stack_pages);
+        let kind = self.threads[idx].kind;
+        // A dead user thread takes its process down with it: free the user
+        // frames and the user-half page tables.  This is only safe because the
+        // scheduler already switched CR3 to the next thread's root.
+        if let ThreadKind::User { pid } = kind {
+            debug_assert_ne!(self.threads[self.current].root, self.threads[idx].root);
+            crate::proc::table().reap(pid);
+        }
         if pages != 0 && !stack.is_null() {
             mm::page_alloc().free_page(stack, pages);
         }
         self.threads[idx] = Thread::new();
+    }
+
+    /// Reclaim every thread that died before this tick.
+    ///
+    /// A single "pending" slot was not enough: two threads can die within one
+    /// tick (a process exits while another faults), and the second one would
+    /// silently leak its kernel stack and its whole process.  Scanning 64
+    /// entries per tick is free.
+    fn reap_dying(&mut self) {
+        for i in 0..MAX_THREADS {
+            if i != self.current
+                && self.threads[i].used
+                && self.threads[i].state == ThreadState::Dying
+            {
+                self.reclaim(i);
+            }
+        }
     }
 }
 
@@ -167,6 +203,27 @@ unsafe fn build_initial_frame(stack_top: usize, entry: usize) -> usize {
     // address for us).  `stack_top` is page aligned, so drop 8 bytes.
     f.rsp = (stack_top - 8) as u64;
     f.ss = KERNEL_DATA as u64;
+    base
+}
+
+/// Build the first frame of a **user** thread.  `iretq` lands in ring3 with
+/// `rdi = arg` (the `StartupBlock` pointer), `rflags.IF` set so the timer can
+/// preempt it, and the user stack top in `rsp`.
+unsafe fn build_user_frame(
+    kstack_top: usize,
+    entry: u64,
+    user_stack_top: u64,
+    arg: u64,
+) -> usize {
+    let base = kstack_top - size_of::<TrapFrame>();
+    core::ptr::write_bytes(base as *mut u8, 0, size_of::<TrapFrame>());
+    let f = &mut *(base as *mut TrapFrame);
+    f.rip = entry;
+    f.cs = USER_CODE as u64;
+    f.rflags = EFLAGS_IF;
+    f.rsp = user_stack_top;
+    f.ss = USER_DATA as u64;
+    f.rdi = arg;
     base
 }
 
@@ -198,6 +255,8 @@ pub fn init() {
     main_t.used = true;
     main_t.id = MAIN_ID as u32;
     main_t.name = "main";
+    main_t.kind = ThreadKind::Kernel;
+    main_t.root = X86_64Paging::active_root();
     main_t.state = ThreadState::Running;
     // The boot thread runs on the trampoline stack; keep it for now.
     main_t.kstack_top = (crate::arch::x86_64::read_rsp() & !0xf) as usize;
@@ -208,6 +267,8 @@ pub fn init() {
     idle_t.is_idle = true;
     idle_t.id = IDLE_ID as u32;
     idle_t.name = "idle";
+    idle_t.kind = ThreadKind::Kernel;
+    idle_t.root = X86_64Paging::active_root();
     idle_t.state = ThreadState::Running;
     idle_t.entry = Some(idle_loop);
     idle_t.stack = mm::page_alloc().get_page(STACK_PAGES).expect("no idle stack");
@@ -244,11 +305,14 @@ pub fn thread_create(name: &'static str, entry: fn(usize), arg: usize) -> Option
             let slot = create_slot(s)?;
             let stack = mm::page_alloc().get_page(STACK_PAGES)?;
             let top = stack as usize + STACK_PAGES * 4096;
+            let kernel_root = s.threads[MAIN_ID].root;
             let t = &mut s.threads[slot];
             *t = Thread::new();
             t.used = true;
             t.id = slot as u32;
             t.name = name;
+            t.kind = ThreadKind::Kernel;
+            t.root = kernel_root;
             t.state = ThreadState::Ready;
             t.entry = Some(entry);
             t.arg = arg;
@@ -264,19 +328,83 @@ pub fn thread_create(name: &'static str, entry: fn(usize), arg: usize) -> Option
     result
 }
 
+/// Create a user thread for `pid`, whose address space is `root`.
+///
+/// P0 keeps one thread per process: the caller (`proc`) records the tid so the
+/// process can be reaped when it dies.
+pub fn thread_create_user(
+    pid: u32,
+    root: usize,
+    name: &'static str,
+    entry: u64,
+    user_stack_top: u64,
+    arg: u64,
+) -> Option<u32> {
+    crate::arch::x86_64::cli();
+    let result = {
+        let s = sched();
+        (|| {
+            let slot = create_slot(s)?;
+            let stack = mm::page_alloc().get_page(STACK_PAGES)?;
+            let top = stack as usize + STACK_PAGES * 4096;
+            let t = &mut s.threads[slot];
+            *t = Thread::new();
+            t.used = true;
+            t.id = slot as u32;
+            t.name = name;
+            t.kind = ThreadKind::User { pid };
+            t.root = root;
+            t.state = ThreadState::Ready;
+            t.stack = stack;
+            t.stack_pages = STACK_PAGES;
+            t.kstack_top = top;
+            t.frame = unsafe { build_user_frame(top, entry, user_stack_top, arg) };
+            s.enqueue(slot);
+            Some(slot as u32)
+        })()
+    };
+    crate::arch::x86_64::sti();
+    result
+}
+
+/// The process of the running thread, when it is a user thread.
+pub fn current_pid() -> Option<u32> {
+    let s = sched();
+    match s.threads[s.current].kind {
+        ThreadKind::User { pid } => Some(pid),
+        ThreadKind::Kernel => None,
+    }
+}
+
+/// Page-table root of the running thread.
+pub fn current_root() -> usize {
+    let s = sched();
+    s.threads[s.current].root
+}
+
+/// Mark the running thread dying and ask the dispatcher for a reschedule.
+///
+/// Unlike [`thread_exit`] this is callable from *inside* an interrupt handler
+/// (a syscall or a fault): it does not raise `int 0x81`, it sets a flag that
+/// `isr_dispatch` checks before returning to the frame, so the dying frame is
+/// never resumed.
+pub fn kill_current() {
+    {
+        let s = sched();
+        s.threads[s.current].state = ThreadState::Dying;
+    }
+    intr::request_resched();
+}
+
 /// `fn(frame, vector) -> next_frame` installed as the scheduler hook.
 fn sched_entry(frame: usize, vector: usize) -> usize {
     if vector == VECTOR_TIMER {
         let s = sched();
         s.ticks += 1;
 
-        // Reclaim a thread that died on the previous tick: its stack is now
-        // free because this tick runs on a different stack.
-        if s.pending_reap != NONE as usize {
-            let idx = s.pending_reap;
-            s.reclaim(idx);
-            s.pending_reap = NONE as usize;
-        }
+        // Reclaim every thread that died before this tick: its stack is free
+        // because this tick runs on a different stack.
+        s.reap_dying();
 
         // Wake sleepers.
         for i in 0..MAX_THREADS {
@@ -332,8 +460,12 @@ pub fn schedule(cur_frame: usize) -> usize {
         s.threads[next].frame
     };
 
-    if cur_state == ThreadState::Dying && next != cur {
-        s.pending_reap = cur;
+    // Address spaces follow the thread: a user thread runs on its process
+    // root, a kernel thread on the kernel root (identical kernel half, so the
+    // switch never invalidates kernel mappings).
+    let next_root = s.threads[next].root;
+    if next_root != 0 && next_root != X86_64Paging::active_root() {
+        X86_64Paging::switch_to(next_root);
     }
 
     s.current = next;

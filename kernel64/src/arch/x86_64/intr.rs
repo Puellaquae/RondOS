@@ -25,7 +25,7 @@
 //! ```
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::gdt::{KERNEL_CODE, KERNEL_DATA};
 use super::DescriptorTablePointer;
@@ -318,6 +318,17 @@ core::arch::global_asm!(
     "call {dispatch}",
     // isr_dispatch returns the frame to resume (the scheduler may switch it).
     "mov rsp, rax",
+    // Returning to ring3 needs DPL3 data selectors in DS/ES: `iretq` restores
+    // CS/SS from the frame but *not* DS/ES, and a DPL0 data selector is not
+    // usable at CPL3.  CS lives at frame+0x90 (15 GPRs + vector + error + rip).
+    // This must run *before* the pops: `mov ax, ...` would otherwise clobber
+    // the syscall's return value in RAX.
+    "test byte ptr [rsp + 0x90], 3",
+    "jz 2f",
+    "mov ax, {udata}",
+    "mov ds, ax",
+    "mov es, ax",
+    "2:",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -337,6 +348,7 @@ core::arch::global_asm!(
     "iretq",
     dispatch = sym isr_dispatch,
     kdata = const KERNEL_DATA,
+    udata = const super::gdt::USER_DATA,
 );
 
 // ------------------------------------------------------------ dispatch
@@ -365,6 +377,19 @@ pub fn set_handler(vector: usize, handler: Handler) {
 
 pub fn set_sched_hook(hook: SchedHook) {
     SCHED_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Set by a handler that must not resume the interrupted frame (sys_exit, a
+/// killed process, a user fault).  `isr_dispatch` consumes it and hands the
+/// frame to the scheduler instead of returning it to `isr_common`.
+static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
+
+pub fn request_resched() {
+    NEED_RESCHED.store(true, Ordering::Release);
+}
+
+fn take_resched() -> bool {
+    NEED_RESCHED.swap(false, Ordering::AcqRel)
 }
 
 fn handler_for(vector: usize) -> Option<Handler> {
@@ -467,6 +492,13 @@ extern "C" fn isr_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     match handler_for(vector) {
         Some(h) => h(unsafe { &mut *frame }),
         None => unhandled(unsafe { &mut *frame }),
+    }
+
+    // A syscall may have decided that this frame must never be resumed.
+    if take_resched() {
+        if let Some(hook) = sched_hook() {
+            return hook(frame as usize, vector) as *mut TrapFrame;
+        }
     }
     frame
 }

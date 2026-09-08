@@ -20,6 +20,8 @@ mod arch;
 mod bootinfo;
 mod io;
 mod mm;
+mod proc;
+mod syscall;
 mod thread;
 mod utils;
 
@@ -31,12 +33,14 @@ use arch::x86_64::paging::{
     KERNEL_VIRT_BASE, PHYS_MAP_BASE,
 };
 use arch::x86_64::{cpuid, gdt, halt_loop, has_nx, intr, percpu, pic};
+use proc::ExitStatus;
 use mm::vm::{
     AddressSpace, CachePolicy, PagingArch, PAGE_KERNEL_RW, PAGE_KERNEL_RX, PAGE_USER_RW,
     PAGE_USER_RX,
 };
 
-static FAILURES: AtomicUsize = AtomicUsize::new(0);
+static REPORTS: AtomicUsize = AtomicUsize::new(0);
+static FAILS: AtomicUsize = AtomicUsize::new(0);
 static RING3_STEPS: AtomicU64 = AtomicU64::new(0);
 static SAVED_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 static CONTINUE_FN: AtomicUsize = AtomicUsize::new(0);
@@ -117,14 +121,12 @@ extern "C" fn kmain(boot: u64) -> ! {
     X86_64Paging::switch_to(root);
     serial_println!("paging: kernel-owned root {:#x}", root);
 
-    let mut failures = 0usize;
-    failures += !test_physmap() as usize;
-    failures += !test_huge_split() as usize;
-    failures += !test_address_space() as usize;
-    failures += !test_wx() as usize;
-    failures += !test_device_map() as usize;
-    failures += !test_allocator() as usize;
-    FAILURES.store(failures, Ordering::Relaxed);
+    test_physmap();
+    test_huge_split();
+    test_address_space();
+    test_wx();
+    test_device_map();
+    test_allocator();
 
     gdt::init();
     percpu::init();
@@ -250,6 +252,8 @@ unsafe extern "C" fn ring3_return() -> ! {
 }
 
 fn syscall_handler(f: &mut TrapFrame) {
+    // The M0 probe blobs used fake ids to drive the ring3 round-trip; keep
+    // them working, and route everything else through the real v1 dispatcher.
     match f.rax {
         RING3_SYSCALL => {
             serial_println!(
@@ -275,15 +279,21 @@ fn syscall_handler(f: &mut TrapFrame) {
                 0x2,
             );
         }
-        other => {
-            serial_println!("ring3: unknown syscall {:#x}", other);
-            f.set_result(1, 0);
-        }
+        _ => syscall::dispatch(f),
     }
 }
 
 fn gp_handler(f: &mut TrapFrame) {
     if f.from_user() {
+        if thread::current_pid().is_some() {
+            serial_println!("ring3: #GP at rip {:#x} err {:#x} — killing process", f.rip, f.error);
+            proc::exit_current(ExitStatus::Fault {
+                vector: 13,
+                rip: f.rip,
+                addr: 0,
+            });
+            return;
+        }
         serial_println!(
             "ring3: #GP at rip {:#x} err {:#x} — expected (cli has no IOPL), skipping 1 byte",
             f.rip,
@@ -300,8 +310,6 @@ fn gp_handler(f: &mut TrapFrame) {
 fn page_fault_handler(f: &mut TrapFrame) {
     let cr2 = arch::x86_64::cr2();
     if f.from_user() {
-        // User faults kill the "process": report and switch the frame back to
-        // ring0.  Real process teardown is P0 work (VMA reclaim).
         serial_println!(
             "ring3: #PF cr2 {:#x} err {:#x} at rip {:#x} — killing user context",
             cr2,
@@ -309,11 +317,21 @@ fn page_fault_handler(f: &mut TrapFrame) {
             f.rip
         );
         RING3_STEPS.fetch_or(STEP_PF, Ordering::Relaxed);
-        f.return_to_kernel(
-            ring3_return as *const () as usize as u64,
-            percpu::kernel_stack(),
-            0x2,
-        );
+        if thread::current_pid().is_some() {
+            // P0: a real process — tear it down and let the scheduler move on.
+            proc::exit_current(ExitStatus::Fault {
+                vector: 14,
+                rip: f.rip,
+                addr: cr2,
+            });
+        } else {
+            // M0 probe blob: no process, hand the frame back to the test.
+            f.return_to_kernel(
+                ring3_return as *const () as usize as u64,
+                percpu::kernel_stack(),
+                0x2,
+            );
+        }
     } else {
         serial_println!("kernel #PF cr2 {:#x} err {:#x}", cr2, f.error);
         f.dump("page fault");
@@ -354,7 +372,6 @@ extern "C" fn after_phase2() -> ! {
     let steps = RING3_STEPS.load(Ordering::Relaxed);
     let ok = steps & STEP_PF != 0;
     report("ring3-pagefault", ok);
-    FAILURES.fetch_add(!ok as usize, Ordering::Relaxed);
 
     // ------------------------------------------------------------ M0.4/M0.5
     pic::init();
@@ -392,14 +409,201 @@ extern "C" fn after_phase2() -> ! {
     let exited = s >= 3;
     report("thread-exit", exited);
 
-    let failures = FAILURES.load(Ordering::Relaxed) + !preempted as usize + !slept as usize;
+    // ------------------------------------------------------------------ P0
+    // Real user processes: an address space, a VMA list, a handle table, a
+    // ring3 thread that talks to the kernel through `int 0x80`, and a fault
+    // that takes down only its own process.
+    report("handle-table", proc::selftest_handles());
+
+    let free_before = mm::page_alloc().free_pages();
+    let hello = spawn_user(
+        "hello",
+        user_hello,
+        user_hello_end,
+        0x0000_6000_0000_0000,
+    );
+    let fault = spawn_user(
+        "fault",
+        user_fault,
+        user_fault_end,
+        0x0000_7000_0000_0000,
+    );
+    let (hello_pid, fault_pid) = match (hello, fault) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            report("user-spawn", false);
+            halt_loop()
+        }
+    };
+    report("user-spawn", true);
+
+    let hello_status = wait_for_exit(hello_pid, 4000);
+    let fault_status = wait_for_exit(fault_pid, 4000);
+
+    let hello_ok =
+        hello_status == Some(ExitStatus::Exited(0)) && syscall::logged_bytes() >= 12;
+    if !hello_ok {
+        serial_println!(
+            "user: hello status {:?}, sys_log accepted {} bytes",
+            hello_status,
+            syscall::logged_bytes()
+        );
+    }
+    report("user-process", hello_ok);
+
+    let fault_ok = matches!(fault_status, Some(ExitStatus::Fault { vector: 14, .. }));
+    if !fault_ok {
+        serial_println!("user: fault status {:?}", fault_status);
+    }
+    report("user-fault-isolation", fault_ok && proc::table().live() == 0);
+
+    // Every frame the two processes owned must be back in the allocator.
+    thread::sleep(50);
+    let free_after = mm::page_alloc().free_pages();
+    if free_after < free_before {
+        serial_println!("user: frames leaked: {} -> {}", free_before, free_after);
+    }
+    report("user-reclaim", free_after >= free_before);
+
     serial_println!("----------------------------------------------");
-    if failures == 0 {
-        serial_println!("smoke: ALL PASS (10/10)");
+    let total = REPORTS.load(Ordering::Relaxed);
+    let failed = FAILS.load(Ordering::Relaxed);
+    if failed == 0 {
+        serial_println!("smoke: ALL PASS ({}/{})", total, total);
     } else {
-        serial_println!("smoke: {} FAILURE(S)", failures);
+        serial_println!("smoke: {} FAILURE(S) of {}", failed, total);
     }
     halt_loop()
+}
+
+// ------------------------------------------------------- P0 user processes
+
+/// Offset/size of the user stack inside a process image (P0 placeholder for
+/// the ELF loader's segment layout).
+const USER_STACK_OFF: u64 = 0x0001_0000;
+const USER_STACK_LEN: u64 = 0x2000;
+
+fn spawn_user(
+    name: &'static str,
+    start: unsafe extern "C" fn(),
+    end: unsafe extern "C" fn(),
+    base: u64,
+) -> Option<u32> {
+    let len = end as usize - start as usize;
+    let code = unsafe { core::slice::from_raw_parts(start as *const u8, len) };
+    let pid = proc::table().create(0)?;
+    let root = {
+        let p = proc::table().get(pid)?;
+        p.map_blob(base, code, PAGE_USER_RX).ok()?;
+        p.map_anon(base + USER_STACK_OFF, USER_STACK_LEN, PAGE_USER_RW)
+            .ok()?;
+        p.root()
+    };
+    let stack_top = base + USER_STACK_OFF + USER_STACK_LEN - 16;
+    let tid = thread::thread_create_user(pid, root, name, base, stack_top, 0)?;
+    proc::table().attach_thread(pid, tid).ok()?;
+    serial_println!(
+        "user: '{}' pid {} tid {} code {:#x} stack {:#x}",
+        name,
+        pid,
+        tid,
+        base,
+        stack_top
+    );
+    Some(pid)
+}
+
+/// Poll until `pid` leaves `Running` (the outcome survives reaping).
+fn wait_for_exit(pid: u32, timeout_ms: u64) -> Option<ExitStatus> {
+    let deadline = thread::ticks() + (timeout_ms + thread::TICK_MS - 1) / thread::TICK_MS;
+    loop {
+        if let Some(st) = proc::table().status_of(pid) {
+            if st != ExitStatus::Running {
+                return Some(st);
+            }
+        }
+        if thread::ticks() >= deadline {
+            return None;
+        }
+        thread::sleep(5);
+    }
+}
+
+// Two tiny ring3 programs.  They are *not* the P1 ELF path: they exist so P0
+// can prove process lifetime, syscalls and fault containment end to end.
+
+core::arch::global_asm!(
+    ".global user_hello",
+    "user_hello:",
+    // sys_info into a stack buffer (proves copy_to_user + VMA write check).
+    "  lea rdi, [rsp - 128]",
+    "  mov dword ptr [rdi], 112",       // hdr.size = sizeof(Info)
+    "  mov dword ptr [rdi + 4], 1",     // hdr.version
+    "  mov rax, 0x00",                  // SyscallId::Info
+    "  int 0x80",
+    "  test rax, rax",
+    "  jnz 2f",                         // -> exit(1)
+    "  cmp dword ptr [rdi + 8], 1",     // abi_version
+    "  jne 3f",                         // -> exit(2)
+    // sys_clock_gettime(Monotonic) -> rdx = ns since boot
+    "  mov rax, 0x15",
+    "  xor edi, edi",
+    "  int 0x80",
+    "  test rax, rax",
+    "  jnz 4f",                         // -> exit(3)
+    "  test rdx, rdx",
+    "  jz 4f",
+    // sys_yield()
+    "  mov rax, 0x13",
+    "  int 0x80",
+    "  test rax, rax",
+    "  jnz 5f",                         // -> exit(4)
+    // sys_log(Error, msg, 12)
+    "  mov rax, 0x16",
+    "  xor edi, edi",
+    "  lea rsi, [rip + user_hello_msg]",
+    "  mov rdx, 12",
+    "  int 0x80",
+    "  cmp rdx, 12",                    // value, not status
+    "  jne 6f",                         // -> exit(5)
+    // sys_exit(0)
+    "  mov rax, 0x10",
+    "  xor edi, edi",
+    "  int 0x80",
+    "  ud2",
+    "2: mov edi, 1",
+    "  jmp 7f",
+    "3: mov edi, 2",
+    "  jmp 7f",
+    "4: mov edi, 3",
+    "  jmp 7f",
+    "5: mov edi, 4",
+    "  jmp 7f",
+    "6: mov edi, 5",
+    "7: mov rax, 0x10",
+    "  int 0x80",
+    "  ud2",
+    "user_hello_msg:",
+    "  .ascii \"hello ring3\\n\"",
+    ".global user_hello_end",
+    "user_hello_end:",
+);
+
+core::arch::global_asm!(
+    ".global user_fault",
+    "user_fault:",
+    "  mov rax, 0x1234",            // unmapped in the process address space
+    "  mov byte ptr [rax], 0x5a",
+    "  ud2",
+    ".global user_fault_end",
+    "user_fault_end:",
+);
+
+extern "C" {
+    fn user_hello();
+    fn user_hello_end();
+    fn user_fault();
+    fn user_fault_end();
 }
 
 // ------------------------------------------------------- test threads
@@ -694,6 +898,10 @@ fn test_allocator() -> bool {
 }
 
 fn report(name: &str, ok: bool) {
+    REPORTS.fetch_add(1, Ordering::Relaxed);
+    if !ok {
+        FAILS.fetch_add(1, Ordering::Relaxed);
+    }
     serial_println!("[{}] {}", if ok { " ok " } else { "FAIL" }, name);
 }
 

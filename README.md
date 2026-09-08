@@ -13,12 +13,17 @@
   - `src/arch/x86_64/`  端口 I/O、CR/MSR/CPUID、4 级分页（NX + PCD/PWT + 大页拆分）、
     GDT/TSS/per-CPU（`swapgs`）、IDT/统一 `TrapFrame`、8259+8254
   - `src/mm/`           位图页框分配器（physmap 视图）+ 架构无关 VMM 抽象
-  - `src/thread/`       内核线程、抢占式轮转调度、`sleep`/`exit`、`WaitQueue`
+  - `src/thread/`       内核线程 + 用户线程、抢占式轮转调度、`sleep`/`exit`、`WaitQueue`；
+    每个线程带自己的页表根，切换线程即切换地址空间
+  - `src/proc/`         `Process`/VMA/`HandleTable`/`ExitStatus`、用户指针校验
+  - `src/syscall.rs`    `int 0x80` v1 分发（P0：`sys_info`/`exit`/`yield`/`clock`/`log`）
   - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version），内核唯一的引导契约
 - `boot/uefi/`  UEFI 引导 stub，目标 `x86_64-unknown-uefi`，基于 `uefi-rs`
   - GOP 选 32bpp 模式 → 读 ESP 上的 `\rondos\kernel.elf` → 按 `p_paddr` 装载
     → 填 `BootInfo`（内存图 + framebuffer + initrd）→ 建页表 →
     `ExitBootServices` → 跳内核（`rdi` = `BootInfo` 物理地址）
+- `user/lib/rondos-abi/`  内核与用户程序共享的 ABI crate（syscall 号、`Status`、
+  handle 编码、`Info` 等结构体 + 编译期布局断言）
 - `files/`      启动 tar 镜像内容（将来的用户程序与资源）
 - `docs/user-mode-design.md`  用户态完整设计（迁移、ring 3、编译支持、可执行文件格式、
   冻结的 syscall ABI、Win3.1 复古桌面）
@@ -68,11 +73,17 @@ OVMF 路径用 `OVMF=/path/to/OVMF.fd` 覆盖（默认 `/usr/share/ovmf/OVMF.fd`
 | M0.6 | 版本化 `BootInfo`（引导交接正式化） | ✅ |
 | M0.7 | `x86_64-unknown-uefi` stub + 内核自有页表（删除 32 位跳板） | ✅ |
 | M0.8 | i686 路径移入 `legacy-i686` 分支 | ✅ |
+| P0 | `proc/`（进程 + VMA + handle 表）、每线程地址空间、`rondos-abi`、`int 0x80` v1 分发 | ✅ |
 
-`make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (10/10)`：
+`make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (16/16)`：
 分页/physmap/大页拆分/地址空间隔离/W^X/设备映射、ring3 系统调用往返、
-用户态缺页隔离、抢占、睡眠唤醒、线程退出。内核在第一条指令就切到自己的栈，
+用户态缺页隔离、抢占、睡眠唤醒、线程退出，以及 P0 的进程生命周期
+（handle 表、用户进程跑完 `sys_info`/`sys_clock_gettime`/`sys_yield`/`sys_log`/`sys_exit`、
+一个进程缺页只杀自己、所有帧回收）。内核在第一条指令就切到自己的栈，
 `BootInfo` 落地后立即切到内核自有的 PML4（丢掉 loader 的低地址 identity map）。
+
+`user/lib/rondos-abi/` 是内核与用户程序共享的 ABI crate（syscall 号、`Status`、
+handle 编码、结构体布局），内核通过 path 依赖它，两边布局不可能漂移。
 
 ## 参考资料
 

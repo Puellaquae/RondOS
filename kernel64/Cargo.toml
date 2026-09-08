@@ -3,9 +3,9 @@ name = "kernel64"
 version = "0.1.0"
 edition = "2021"
 
-# M0 scaffold: the x86-64 kernel that replaces kernel/ (i686) at M0.8.
-# No dependencies on purpose — boot is a multiboot trampoline until the UEFI
-# stub (M0.7) lands.
+# x86-64 kernel.  The only dependency is the shared ABI crate: syscall ids,
+# Status codes, handle encoding and struct layouts live there so the kernel and
+# user space cannot drift apart (design §4.1).
 
 [profile.dev]
 panic = "abort"
@@ -21,3 +21,4 @@ codegen-units = 1
 debug = false
 
 [dependencies]
+rondos-abi = { path = "../user/lib/rondos-abi", default-features = false, features = ["kernel"] }

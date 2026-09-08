@@ -559,6 +559,11 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | `preemption` | 200 Hz 定时器抢占，三个内核线程按轮转交错推进（a/b 计数同步增长） |
 | `sleep/wake` | `sleep(200ms)` 被定时器唤醒 3 次 |
 | `thread-exit` | `thread_exit` 后 TCB/内核栈在下一 tick 回收 |
+| `handle-table` | handle 编码 `index:32\|generation:32`：close 后 generation+1，旧 handle 必 `BadHandle`；rights 不足 `Permission`；VMA 单区间/权限校验 |
+| `user-spawn` | 内核为两个进程建地址空间（`create_kernel_address_space`）+ VMA + 用户线程，`cs=0x1b ss=0x23`，`iretq` 进 ring3 |
+| `user-process` | 用户程序依次调 `sys_info`（写栈上的 `Info`，校验 `abi_version`）、`sys_clock_gettime`、`sys_yield`、`sys_log`（内核打印 `user: hello ring3`）、`sys_exit(0)`；任何一步失败就以非零状态退出 |
+| `user-fault-isolation` | 另一个进程写未映射地址 → `#PF` → `ExitStatus::Fault{vector:14,addr:0x1234}`，**另一个进程照常跑完** |
+| `user-reclaim` | 两个进程死后，用户页、用户半区页表、内核栈全部归还分配器（`free_pages` 不下降） |
 
 **引导路径（M0.7 起只剩 UEFI 一条）**：
 
@@ -582,6 +587,10 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 * 触发调度的 `int 0x81` 汇编**不能写 `options(nomem)`**：处理函数会读写内存（调度器状态），谎报 `nomem` 会让编译器把内存操作重排到 asm 两侧；
 * **`rdi` 必须传 `BootInfo` 的物理地址**，不是 physmap 视角的 VA：内核的 `bootinfo::probe`/`adopt_external` 自己会做 `phys_to_virt`，传 VA 会二次加 `PHYS_MAP_BASE` 直接溢出 panic；
 * **不要继续跑在 loader 的页表上**：跳板/OVMF 都恒等映射低地址，`map_device(0x5200_0000, ...)` 这类测试会撞上已有的 1 GiB 大页并（正确地）报 `AlreadyMapped`，而 `huge-split` 又会误以为「低地址一定有大页」。正确做法是内核第一条指令就换到自有栈（`.bss` 里 64 KiB），拿到 `BootInfo` 后立刻 `create_kernel_address_space()` + `switch_to()`，把 loader 的恒等映射整体丢掉；
+* **用户态返回路径不能碰 `rax`**：`isr_common` 里给 DS/ES 装 `USER_DATA` 时写的是 `mov ax, ...`，如果放在 `pop rax` 之后就会把系统调用的返回值（`Status`）冲掉——表现是「syscall 明明成功，用户程序却看到 rax 非 0」。正解：在弹寄存器**之前**用 `[rsp+0x90]`（15 个 GPR + vector + error + rip 之后的 CS）判断特权级并装 DS/ES；
+* **`iretq` 不恢复 DS/ES**：它只从栈上恢复 CS/SS/RFLAGS/RIP/RSP，所以调度器第一次切进用户线程时 DS/ES 还是 `KERNEL_DATA`（DPL0），CPL3 下访问数据立刻 `#GP`。同一个修复点同时解决这两条；
+* **大结构体的 `Default` 会在内核栈上先造一个临时对象**：`ProcessTable`（16 个 `Process`，每个含 64 槽 handle 表）约 37 KiB，`Singleton::init` 的 `write_volatile(T::default())` 直接冲爆 64 KiB 引导栈/16 KiB 线程栈，表现为 `#PF` 落在 `.text` 里（`cr2` 看着莫名）。正解：给表一个 `const fn new()`，用 `UnsafeCell` 静态量直接落在 `.bss`（`[const { Process::new() }; N]`）；
+* **`pending_reap` 只能记一个线程是不够的**：同一 tick 内两个线程可能先后死亡（一个 `sys_exit`、一个缺页被杀），后者会覆盖前者的待回收索引，前者的内核栈和整个进程就永远泄漏了。正解：每 tick 扫一遍线程表，回收所有 `Dying` 且非当前线程的 TCB；
 * `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单
@@ -595,7 +604,9 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 | `thread/mod.rs` | 64 位 `TrapFrame`；`schedule(frame) -> frame`；`WaitQueue`；`Thread { proc, kind, kstack_top, cont }`；`syscall_stub` + resume trampoline |
 | `io/vga.rs` | 保留为 fallback，新增 `io/fb.rs`：`BootInfo` 取 fb 描述、写合并映射、帧缓冲控制台（**实机无串口时的唯一调试手段**） |
 | `io/input.rs`（新） | PS/2 键盘（+ 可选 aux 口）→ `InputEvent` 环形缓冲，作为可 `read` 的设备 handle |
-| `proc/mod.rs`（新） | `Process`、`HandleTable`、进程表、`exec::load` |
+| `proc/mod.rs`（新 ✅ P0） | `Process`、`VmaList`、`HandleTable`、`ProcessTable`、`ExitStatus`、`copy_from_user/to_user`；`exec::load` 仍待 P1 |
+| `user/lib/rondos-abi/`（新 ✅ P0） | 内核+用户共享的 ABI 定义（唯一真相源）：`SyscallId`/`Status`/`Handle`/`Rights`/`Info` + 布局断言 |
+| `syscall.rs`（新 ✅ P0） | `int 0x80` 分发；P0 实现 `0x00/0x10/0x11/0x13/0x15/0x16`，其余返回 `Status::Unsupported` |
 | `bootinfo.rs`（新） | `BootInfo` 版本化结构与校验 |
 | `boot/uefi/`（新） | `x86_64-unknown-uefi` stub，用 **`uefi-rs`**（已定：依赖不多、体积可控，省掉手写协议表） |
 
@@ -886,7 +897,7 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | 阶段 | 交付物 | 验收标准 |
 | --- | --- | --- |
 | **M0 迁移** | x86-64 + UEFI 单路径、4 级分页 + NX、64 位 trap/GDT/TSS、SSE 使能 + 每线程 FXSAVE、UEFI stub + `BootInfo`、帧缓冲控制台；删除 NASM loader | QEMU+OVMF 与**一台真机**都能启动并打印自检；现有调度/内存自检全过 |
-| **P0 内核地基** | ring3、TSS.RSP0 随调度更新、`schedule(frame)`、`Process`/VMA/handle 表骨架、`sys_exit`+`sys_log` | 内核手工构造用户线程，ring3 打印一行再 `sys_exit`；用户态非法写触发 `#PF` 只杀该线程 |
+| **P0 内核地基 ✅** | `proc/`（`Process`/VMA/`HandleTable`/`ExitStatus`）、每线程地址空间随调度切换、`rondos-abi` 共享 crate、`int 0x80` v1 分发（`sys_info`/`sys_exit`/`sys_thread_exit`/`sys_yield`/`sys_clock_gettime`/`sys_log`）、`kill_current` + `request_resched` | ✅ 内核构造用户进程，ring3 跑完 `sys_info`→`sys_log`→`sys_exit(0)`；另一个进程非法写只杀自己；帧全部回收（`make test` 16/16） |
 | **P1 装载与编译** | `user/` 工作区、target spec、`user.ld`、`rondos-abi`/`rondos-rt`、ELF64 装载器、`sys_spawn`/`sys_wait`、`init` | 串口/帧缓冲控制台出现 `init: hello from ring 3`；两个用户进程并发，一个崩溃不影响另一个 |
 | **P2 内存与 IPC** | `sys_mem_map/share`、用户堆、`chan_*`、`sys_wait` 多 handle、文件 handle、tmpfs 层、最小 C 支持 | echo 程序经 channel 回显；`/bin/*` 可读；一个 C 写的 hello 也能跑；`make test` grep `PASS` |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
