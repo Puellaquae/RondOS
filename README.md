@@ -4,10 +4,22 @@
 
 ## 目录
 
-- `kernel/`  Rust 内核，目标 `i686-unknown-none`，链接到虚拟地址 `0xc0022000`
+- `kernel/`  Rust 内核，目标 `i686-unknown-none`，链接到虚拟地址 `0xc0022000`（迁移中，M0.8 后删除）
 - `loader/stage1.s`  512 字节 MBR，把 Stage2 读到 `0x80000`
 - `loader/stage2.s`  解析内核 ELF32，按 `PT_LOAD` 段装入 1 MiB 临时区后 memcpy 到 `p_paddr`，建立分页并跳入 `e_entry`
+- `kernel64/`  **x86-64 内核**（迁移目标），高半区 `0xFFFFFFFF80000000`，`make run64` / `make test64`
+  - `boot/multiboot32.s`  临时 32 位跳板（进 long mode），M0.7 的 UEFI stub 到位后删除
 - `Makefile`  Linux 工具链构建脚本
+- `docs/user-mode-design.md`  用户态方案设计（x86-64 + UEFI 迁移、ring 3、编译支持、可执行文件格式、冻结的 syscall ABI、Win3.1 复古桌面）
+
+## x86-64 迁移进度
+
+M0.1（`arch/x86_64` 骨架）与 M0.2（4 级分页后端 + NX + physmap）已完成：
+
+```bash
+make run64      # QEMU 里启动 x86-64 内核（串口输出）
+make test64     # 无头启动并检查 6 项冒烟测试
+```
 
 ## 依赖
 
