@@ -1,0 +1,8 @@
+[package]
+name = "init"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rondos-abi = { path = "../../lib/rondos-abi", features = ["user"] }
+rondos-rt = { path = "../../lib/rondos-rt" }

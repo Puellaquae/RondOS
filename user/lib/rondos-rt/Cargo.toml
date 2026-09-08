@@ -1,0 +1,8 @@
+[package]
+name = "rondos-rt"
+version = "0.1.0"
+edition = "2021"
+description = "RondOS user-space runtime: _start, panic, print helpers"
+
+[dependencies]
+rondos-abi = { path = "../rondos-abi", features = ["user"] }

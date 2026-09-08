@@ -33,6 +33,25 @@ pub fn logged_bytes() -> usize {
     LOGGED_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Most recent `sys_log` payload, so the smoke test can assert on user output
+/// without parsing the serial stream.
+struct LastLogCell(core::cell::UnsafeCell<([u8; 64], usize)>);
+
+unsafe impl Sync for LastLogCell {}
+
+static LAST_LOG: LastLogCell = LastLogCell(core::cell::UnsafeCell::new(([0; 64], 0)));
+
+pub fn last_log() -> ([u8; 64], usize) {
+    unsafe { *LAST_LOG.0.get() }
+}
+
+fn remember_log(bytes: &[u8]) {
+    let cell = unsafe { &mut *LAST_LOG.0.get() };
+    let n = bytes.len().min(cell.0.len());
+    cell.0[..n].copy_from_slice(&bytes[..n]);
+    cell.1 = n;
+}
+
 pub fn dispatch(f: &mut TrapFrame) {
     let Some(id) = SyscallId::from_raw(f.rax) else {
         f.set_result(Status::Unsupported as u64, 0);
@@ -125,6 +144,7 @@ fn sys_log(f: &mut TrapFrame) {
     }
     let text = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
     crate::serial_println!("user: {}", text.trim_end_matches('\n'));
+    remember_log(&buf[..len]);
     LOGGED_BYTES.fetch_add(len, core::sync::atomic::Ordering::Relaxed);
     ok(f, len as u64);
 }

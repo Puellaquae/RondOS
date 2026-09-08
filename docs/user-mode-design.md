@@ -160,7 +160,9 @@ user/
 ```
 
 用户程序在 `user/targets/x86_64-rondos.json` 里以它为基础，改 `os: "rondos"`（便于 `cfg(target_os = "rondos")`）、
-**打开 SSE2 并把 `rustc-abi` 从 `softfloat` 换成 `sysv64`**（`x86-64` cpu 基线自带 SSE2），
+**打开 SSE2 并去掉 `softfloat`**（`x86-64` cpu 基线自带 SSE2；注意 `rustc-abi` 的合法值是
+`x86-sse2` 而不是 `sysv64`，直接写 `sysv64` 会被 rustc 拒绝，而带 `x86-sse2` 又要求
+`cfg(target_abi)` 匹配，所以最终**不写这个字段**、只保证 features 里 SSE2 开着），
 同时 `disable-redzone: false` 放开红区（用户态允许）。于是用户程序拿到硬件浮点，
 代价是内核必须给每个线程保存 FPU 状态（§7.3）。
 内核自身继续用上面的 soft-float spec：**内核代码永远不碰 XMM**，少一类难查的 bug。
@@ -604,7 +606,8 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 | `thread/mod.rs` | 64 位 `TrapFrame`；`schedule(frame) -> frame`；`WaitQueue`；`Thread { proc, kind, kstack_top, cont }`；`syscall_stub` + resume trampoline |
 | `io/vga.rs` | 保留为 fallback，新增 `io/fb.rs`：`BootInfo` 取 fb 描述、写合并映射、帧缓冲控制台（**实机无串口时的唯一调试手段**） |
 | `io/input.rs`（新） | PS/2 键盘（+ 可选 aux 口）→ `InputEvent` 环形缓冲，作为可 `read` 的设备 handle |
-| `proc/mod.rs`（新 ✅ P0） | `Process`、`VmaList`、`HandleTable`、`ProcessTable`、`ExitStatus`、`copy_from_user/to_user`；`exec::load` 仍待 P1 |
+| `proc/mod.rs`（新 ✅ P0） | `Process`、`VmaList`、`HandleTable`、`ProcessTable`、`ExitStatus`、`copy_from_user/to_user` |
+| `exec.rs`（新 ✅ P1a） | ELF64 装载（按段权限映射、W^X）、固定用户栈、ustar 查找、`spawn` |
 | `user/lib/rondos-abi/`（新 ✅ P0） | 内核+用户共享的 ABI 定义（唯一真相源）：`SyscallId`/`Status`/`Handle`/`Rights`/`Info` + 布局断言 |
 | `syscall.rs`（新 ✅ P0） | `int 0x80` 分发；P0 实现 `0x00/0x10/0x11/0x13/0x15/0x16`，其余返回 `Status::Unsupported` |
 | `bootinfo.rs`（新） | `BootInfo` 版本化结构与校验 |
@@ -898,7 +901,8 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | --- | --- | --- |
 | **M0 迁移** | x86-64 + UEFI 单路径、4 级分页 + NX、64 位 trap/GDT/TSS、SSE 使能 + 每线程 FXSAVE、UEFI stub + `BootInfo`、帧缓冲控制台；删除 NASM loader | QEMU+OVMF 与**一台真机**都能启动并打印自检；现有调度/内存自检全过 |
 | **P0 内核地基 ✅** | `proc/`（`Process`/VMA/`HandleTable`/`ExitStatus`）、每线程地址空间随调度切换、`rondos-abi` 共享 crate、`int 0x80` v1 分发（`sys_info`/`sys_exit`/`sys_thread_exit`/`sys_yield`/`sys_clock_gettime`/`sys_log`）、`kill_current` + `request_resched` | ✅ 内核构造用户进程，ring3 跑完 `sys_info`→`sys_log`→`sys_exit(0)`；另一个进程非法写只杀自己；帧全部回收（`make test` 16/16） |
-| **P1 装载与编译** | `user/` 工作区、target spec、`user.ld`、`rondos-abi`/`rondos-rt`、ELF64 装载器、`sys_spawn`/`sys_wait`、`init` | 串口/帧缓冲控制台出现 `init: hello from ring 3`；两个用户进程并发，一个崩溃不影响另一个 |
+| **P1a 装载与编译 ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器（`exec.rs`）、ustar 引导镜像、`init`/`crash` | ✅ `init: hello from ring 3` 出现在串口；`crash` 与 `init` 并发、缺页只杀自己；`make test` 17/17 |
+| **P1b 进程 API** | `sys_spawn`/`sys_wait` + 文件 handle（tarfs）、`init` 派生其他程序 | 待办 |
 | **P2 内存与 IPC** | `sys_mem_map/share`、用户堆、`chan_*`、`sys_wait` 多 handle、文件 handle、tmpfs 层、最小 C 支持 | echo 程序经 channel 回显；`/bin/*` 可读；一个 C 写的 hello 也能跑；`make test` grep `PASS` |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |

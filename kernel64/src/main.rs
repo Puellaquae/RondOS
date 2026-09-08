@@ -18,6 +18,7 @@
 
 mod arch;
 mod bootinfo;
+mod exec;
 mod io;
 mod mm;
 mod proc;
@@ -465,6 +466,11 @@ extern "C" fn after_phase2() -> ! {
     }
     report("user-reclaim", free_after >= free_before);
 
+    // ------------------------------------------------------------------ P1
+    // Real user programs: ELF64 images built by the `user/` workspace for the
+    // `x86_64-rondos` target, shipped in the boot tar the UEFI stub loaded.
+    test_user_images();
+
     serial_println!("----------------------------------------------");
     let total = REPORTS.load(Ordering::Relaxed);
     let failed = FAILS.load(Ordering::Relaxed);
@@ -474,6 +480,61 @@ extern "C" fn after_phase2() -> ! {
         serial_println!("smoke: {} FAILURE(S) of {}", failed, total);
     }
     halt_loop()
+}
+
+// ------------------------------------------------------- P1 user images
+
+fn test_user_images() {
+    let Some(tar) = exec::boot_tar() else {
+        serial_println!("exec: no boot tar (BootInfo.initrd_len == 0)");
+        return report("elf-loader", false);
+    };
+    serial_println!("exec: boot tar {} bytes", tar.len());
+
+    let (Some(init_elf), Some(crash_elf)) =
+        (exec::tar_find(tar, b"init.elf"), exec::tar_find(tar, b"crash.elf"))
+    else {
+        serial_println!("exec: boot tar is missing init.elf / crash.elf");
+        return report("elf-loader", false);
+    };
+
+    let free_before = mm::page_alloc().free_pages();
+    let (init_pid, crash_pid) = match (exec::spawn("init", init_elf), exec::spawn("crash", crash_elf))
+    {
+        (Ok(i), Ok(c)) => (i, c),
+        (i, c) => {
+            serial_println!("exec: spawn failed (init {:?}, crash {:?})", i, c);
+            return report("elf-loader", false);
+        }
+    };
+
+    // Both are alive and preemptible at this point: two independent address
+    // spaces, two ring3 threads.
+    let init_status = wait_for_exit(init_pid, 4000);
+    let crash_status = wait_for_exit(crash_pid, 4000);
+
+    // Both died: give the reaper a tick to return their pages and stacks.
+    thread::sleep(50);
+    let logged = syscall::logged_bytes();
+    let live = proc::table().live();
+    let free_after = mm::page_alloc().free_pages();
+    let ok = init_status == Some(ExitStatus::Exited(0))
+        && matches!(crash_status, Some(ExitStatus::Fault { vector: 14, .. }))
+        && logged >= 40
+        && live == 0
+        && free_after >= free_before;
+    if !ok {
+        serial_println!(
+            "exec: init {:?}, crash {:?}, {} logged bytes, {} live, frames {} -> {}",
+            init_status,
+            crash_status,
+            logged,
+            live,
+            free_before,
+            free_after
+        );
+    }
+    report("elf-loader", ok);
 }
 
 // ------------------------------------------------------- P0 user processes

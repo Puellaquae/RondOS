@@ -373,6 +373,27 @@ impl Process {
         Ok(())
     }
 
+    /// Write `src` to user VA `va` (which must already be mapped in `root`).
+    /// Used by the ELF loader; the kernel writes through the physmap so it does
+    /// not depend on this address space being active.
+    pub fn write_user(&self, va: u64, src: &[u8]) -> Result<(), Status> {
+        let mut off = 0usize;
+        while off < src.len() {
+            let cur = va + off as u64;
+            let pa = X86_64Paging::translate(self.root, cur as usize).ok_or(Status::BadAddress)?;
+            let n = (PAGE_SIZE - (cur as usize & (PAGE_SIZE - 1))).min(src.len() - off);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src[off..].as_ptr(),
+                    phys_to_virt(pa) as *mut u8,
+                    n,
+                )
+            };
+            off += n;
+        }
+        Ok(())
+    }
+
     fn unmap_range(&mut self, va: u64, len: u64) {
         let mut off = 0;
         while off < len {
