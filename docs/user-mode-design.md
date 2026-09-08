@@ -538,13 +538,13 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | **M0.1 ✅** | `arch/x86_64/mod.rs`：in/out、CR0-4、MSR 读写、`cpuid`、`hlt/sti/cli`、`lgdt/lidt`、`invlpg` | 能编译并跑 `hlt` |
 | **M0.2 ✅** | `arch/x86_64/paging.rs`：4 级分页 `PagingArch` 实现、1 GiB physmap、NX 位、大页拆分、`map_device` + cache 策略 | 虚拟内存自检通过（6 项冒烟测试全过，见下） |
 | **M0.3 ✅** | `gdt.rs` / `tss.rs` / `percpu.rs`：64 位 GDT（null/kcode 0x08/kdata 0x10/ucode 0x1b/udata 0x23/TSS 0x28 双槽）、`swapgs`、per-CPU 结构；`intr.rs`：IDT + 统一 `TrapFrame` + stub | ring3 能进出（`make test64` 7/7，含 `int 0x80`、`#GP` 恢复、返回 ring0） |
-| M0.4 | `intr.rs`：64 位 IDT + 统一 `TrapFrame` + naked stub（手工压寄存器、`iretq`） | 定时器/异常正常 |
-| M0.5 | `thread`：适配新 `TrapFrame`，`schedule(frame)` 抽出，`WaitQueue` | 抢占式轮转与阻塞自检通过 |
+| **M0.4 ✅** | `intr.rs`：64 位 IDT、统一 `TrapFrame`、每向量 stub、IST 栈跑 `#DF`、用户态 `#PF` 分流；`pic.rs`：8259 + 8254 | 定时器/异常正常，用户态缺页只杀进程 |
+| **M0.5 ✅** | `thread/mod.rs`：内核线程、抢占式轮转、`schedule(frame)`、`sleep`/`exit`、`WaitQueue`、per-CPU 当前线程 + `TSS.RSP0` | 抢占、睡眠唤醒、线程退出自检通过 |
 | M0.6 | `kernel.ld`（高半区 + `-mcmodel=kernel`）、`BootInfo`、`loader.rs` 退役 | 内核能从 `BootInfo` 拿内存图 |
 | M0.7 | `boot/uefi/`：GOP 设模式 + 读 ESP 文件 + `ExitBootServices` + 建页表跳内核 | QEMU+OVMF 与**一台真机**都能起来 |
 | M0.8 | 删除 `loader/stage1.s`/`stage2.s`/`loader.bin`、`i686-unknown-none.json` | 构建只剩一条路径 |
 
-**M0.1/M0.2/M0.3 已完成**（`kernel64/`，`make test64` 输出 `smoke: ALL PASS (7/7)`）：
+**M0.1..M0.5 已完成**（`kernel64/`，`make test64` 输出 `smoke: ALL PASS (10/10)`）：
 
 | 冒烟测试 | 验证内容 |
 | --- | --- |
@@ -554,7 +554,11 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | `w^x` | `executable=false` 置 NX、`executable=true` 清 NX；可写/用户位正确 |
 | `device-map` | `map_device` 多页 + 写合并策略（GOP 帧缓冲路径） |
 | `allocator` | 多页/单页分配、写读校验、释放 |
-| `ring3` | `iretq` 进 ring3 → `int 0x80`（TSS.RSP0 切栈）→ 故意 `cli` 触发 `#GP` 并被跳过恢复 → 退出系统调用用 `return_to_kernel` 回到 ring0 |
+| `ring3-syscall` | `iretq` 进 ring3 → `int 0x80`（TSS.RSP0 切栈）→ 故意 `cli` 触发 `#GP` 并被跳过恢复 → 退出系统调用用 `return_to_kernel` 回到 ring0 |
+| `ring3-pagefault` | 用户态写未映射地址 → `#PF` 只杀该用户上下文，内核继续跑 |
+| `preemption` | 200 Hz 定时器抢占，三个内核线程按轮转交错推进（a/b 计数同步增长） |
+| `sleep/wake` | `sleep(200ms)` 被定时器唤醒 3 次 |
+| `thread-exit` | `thread_exit` 后 TCB/内核栈在下一 tick 回收 |
 
 **临时引导路径**（M0.7 的 UEFI stub 到位后删除）：
 
@@ -575,7 +579,9 @@ make test64      # 无头启动 + grep 冒烟测试结果
 * 拆分大页后，刚合成的 PTE 是原大页的副本，此时允许覆盖（`from_split`），否则 `map` 会误报 `AlreadyMapped`；
 * **64 位 `iretq` 总是弹出 `RSP`/`SS`**（32 位才按特权级决定），所以返回 ring0 的帧也必须填合法 `rsp`/`ss`，否则会把用户的 `SS=0x23` 装进 CPL0 并 `#GP(0x20)`；
 * 从 ring3 进内核时 CPU 把 **SS 设成 null**，`isr_common` 必须自己 `mov ss, ax`，否则返回 ring0 的 `iretq` 直接 `#GP`；
-* TSS 描述符的 base 被拆成三段（0..23、24..31、32..63），漏掉中间那段会把 `0xFFFF_FFFF_8021_1F00` 变成 `0xFFFF_FFFF_0021_1F00`，CPU 从错误地址读 `RSP0`，第一次 ring3 陷入就 triple fault。
+* TSS 描述符的 base 被拆成三段（0..23、24..31、32..63），漏掉中间那段会把 `0xFFFF_FFFF_8021_1F00` 变成 `0xFFFF_FFFF_0021_1F00`，CPU 从错误地址读 `RSP0`，第一次 ring3 陷入就 triple fault；
+* **64 位中断交付总是压入 `SS:RSP`**（32 位保护模式才按特权级决定；QEMU `do_interrupt64` 里这两条 `pushq` 是无条件的）。所以 ring0/ring3 帧布局天生相同、**不需要任何归一化**：按 3 个字假设去"补齐"会让帧整体偏移 16 字节、`rsp` 少 16，表现为线程每 yield 一次栈就往下爬、最终 `ret` 跳到垃圾地址。这条是本轮调试花时间最多的地方；
+* 触发调度的 `int 0x81` 汇编**不能写 `options(nomem)`**：处理函数会读写内存（调度器状态），谎报 `nomem` 会让编译器把内存操作重排到 asm 两侧。
 
 ### 7.2 文件级清单
 

@@ -90,8 +90,8 @@ test64: kernel64 $(K64_BOOT32)
 	  -serial file:$(K64_LOG) -display none -no-reboot >/dev/null 2>&1 || true
 	@cat $(K64_LOG)
 	@grep -q "smoke: ALL PASS" $(K64_LOG) \
-	  && echo "==> M0.1/M0.2/M0.3 smoke tests PASS" \
-	  || (echo "==> M0.1/M0.2/M0.3 smoke tests FAIL"; exit 1)
+	  && echo "==> M0.1..M0.5 smoke tests PASS" \
+	  || (echo "==> M0.1..M0.5 smoke tests FAIL"; exit 1)
 
 $(STAGE1_BIN): loader/stage1.s
 	$(NASM) -f bin $< -o $@ -l loader/stage1.lst

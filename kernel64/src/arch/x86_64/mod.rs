@@ -12,6 +12,7 @@ use core::arch::asm;
 pub mod gdt;
 pub mod intr;
 pub mod paging;
+pub mod pic;
 pub mod percpu;
 pub mod tss;
 

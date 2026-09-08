@@ -1,33 +1,48 @@
-//! 64-bit IDT, canonical trap frame and exception dispatch — M0.3/M0.4.
+//! 64-bit IDT, canonical trap frame, exception/IRQ dispatch — M0.3/M0.4.
 //!
-//! Long mode has no `pusha`, and a privilege change pushes two extra words
-//! (`SS`, `RSP`), so the old i686 44-byte frame is replaced by one explicit
-//! layout used by *both* entry paths (ring0 and ring3):
+//! Long mode has no `pusha`, and the CPU pushes a *variable* number of words
+//! depending on how it entered the kernel:
+//!
+//! ```text
+//!   ring3 -> ring0 :  [rip][cs][rflags][rsp][ss]     (privilege change)
+//!   ring0 -> ring0 :  [rip][cs][rflags]              (no stack switch)
+//!   + error code   :  the CPU pushes it just below rip
+//! ```
+//!
+//! Because `iretq` in 64-bit mode **always** pops `rsp`/`ss`, every entry must
+//! end up with the same five-word tail.  The per-vector stub therefore tests
+//! the saved `CS` and, for ring0 entries, inserts two words after `rflags`
+//! (shifting the CPU frame down by 16 bytes and writing the original `rsp`
+//! plus the kernel data selector).  After that the frame is always:
 //!
 //! ```text
 //!   low address
-//!     r15 r14 r13 r12 r11 r10 r9 r8        <- stub pushes (last pushed = lowest)
+//!     r15 r14 r13 r12 r11 r10 r9 r8        <- stub pushes
 //!     rdi rsi rbp rdx rcx rbx rax
-//!     vector error                         <- stub normalizes (fake error = 0)
-//!     rip cs rflags                        <- CPU
-//!     rsp ss                               <- CPU, only on a privilege change
+//!     vector error
+//!     rip cs rflags rsp ss
 //!   high address
 //! ```
-//!
-//! The stub pushes a fake `error` for vectors that do not have one, so the
-//! layout is identical everywhere and `iretq` at the end works for both
-//! directions.
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::gdt::{KERNEL_CODE, KERNEL_DATA};
 use super::DescriptorTablePointer;
 
 /// `int 0x80` — the stable syscall gate (DPL=3).
 pub const VECTOR_SYSCALL: usize = 0x80;
+/// `int 0x81` — voluntary reschedule (yield / exit / sleep).
+pub const VECTOR_YIELD: usize = 0x81;
+pub const VECTOR_TIMER: usize = 0x20;
+pub const VECTOR_KEYBOARD: usize = 0x21;
+
+pub const VECTOR_BREAKPOINT: usize = 3;
+pub const VECTOR_DOUBLE_FAULT: usize = 8;
 pub const VECTOR_GENERAL_PROTECTION: usize = 13;
 pub const VECTOR_PAGE_FAULT: usize = 14;
-pub const VECTOR_BREAKPOINT: usize = 3;
+
+pub const IRQ_BASE: usize = 0x20;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +100,49 @@ impl TrapFrame {
         self.ss = KERNEL_DATA as u64;
         self.rflags = rflags;
     }
+
+    pub fn dump(&self, what: &str) {
+        crate::serial_println!(
+            "{} vec {} err {:#x} from {} rip {:#x} cs {:#x} rflags {:#x} rsp {:#x} ss {:#x}",
+            what,
+            self.vector,
+            self.error,
+            if self.from_user() { "user" } else { "kernel" },
+            self.rip,
+            self.cs,
+            self.rflags,
+            self.rsp,
+            self.ss
+        );
+        crate::serial_println!(
+            "  rax {:#018x} rbx {:#018x} rcx {:#018x} rdx {:#018x}",
+            self.rax,
+            self.rbx,
+            self.rcx,
+            self.rdx
+        );
+        crate::serial_println!(
+            "  rsi {:#018x} rdi {:#018x} rbp {:#018x} rsp {:#018x}",
+            self.rsi,
+            self.rdi,
+            self.rbp,
+            self.rsp
+        );
+        crate::serial_println!(
+            "  r8  {:#018x} r9  {:#018x} r10 {:#018x} r11 {:#018x}",
+            self.r8,
+            self.r9,
+            self.r10,
+            self.r11
+        );
+        crate::serial_println!(
+            "  r12 {:#018x} r13 {:#018x} r14 {:#018x} r15 {:#018x}",
+            self.r12,
+            self.r13,
+            self.r14,
+            self.r15
+        );
+    }
 }
 
 // ------------------------------------------------------------------ IDT
@@ -135,11 +193,28 @@ unsafe impl Sync for Idt {}
 
 static IDT: Idt = Idt(UnsafeCell::new([IdtEntry::missing(); 256]));
 
-// --------------------------------------------------------------- stubs
-//
-// One stub per vector: normalize the frame (push a fake error code when the
-// CPU did not) and jump to the common path.
+/// Dedicated stack for `#DF`, so a broken kernel stack still gets a report.
+#[repr(align(16))]
+struct DfStack(UnsafeCell<[u8; 8192]>);
 
+unsafe impl Sync for DfStack {}
+
+static DF_STACK: DfStack = DfStack(UnsafeCell::new([0; 8192]));
+
+// --------------------------------------------------------------- stubs
+
+// In **64-bit mode** interrupt delivery always pushes
+//
+//     [err?][rip][cs][rflags][rsp][ss]
+//
+// regardless of privilege level (unlike 32-bit protected mode, where SS:RSP
+// are only pushed on a privilege change).  `iretq` likewise always pops all
+// five.  So the frame needs *no* normalization at all: push a fake error code
+// for vectors that lack one, push the vector, push the GPRs, done.
+//
+// Layout produced (low -> high), matching [`TrapFrame`]:
+//
+//     r15..r8 rdi rsi rbp rdx rcx rbx rax  vector error  rip cs rflags rsp ss
 macro_rules! stub {
     ($name:ident, $vec:literal, $has_err:literal) => {
         core::arch::global_asm!(
@@ -148,10 +223,25 @@ macro_rules! stub {
                 ".type ", stringify!($name), ", @function\n",
                 stringify!($name), ":\n",
                 ".if ", $has_err, " == 0\n",
-                "push 0\n",
+                "  push 0\n", // fake error code
                 ".endif\n",
-                "push ", $vec, "\n",
-                "jmp isr_common\n",
+                "  push ", $vec, "\n",
+                "  push rax\n",
+                "  push rbx\n",
+                "  push rcx\n",
+                "  push rdx\n",
+                "  push rbp\n",
+                "  push rsi\n",
+                "  push rdi\n",
+                "  push r8\n",
+                "  push r9\n",
+                "  push r10\n",
+                "  push r11\n",
+                "  push r12\n",
+                "  push r13\n",
+                "  push r14\n",
+                "  push r15\n",
+                "  jmp isr_common\n",
             )
         );
         extern "C" {
@@ -192,36 +282,42 @@ stub!(isr_28, 28, 0);
 stub!(isr_29, 29, 0);
 stub!(isr_30, 30, 0);
 stub!(isr_31, 31, 0);
+
+// IRQs (PIC remapped to 0x20..0x2F) and software scheduling.
+stub!(isr_32, 32, 0); // IRQ0 timer
+stub!(isr_33, 33, 0); // IRQ1 keyboard
+stub!(isr_34, 34, 0);
+stub!(isr_35, 35, 0);
+stub!(isr_36, 36, 0);
+stub!(isr_37, 37, 0);
+stub!(isr_38, 38, 0);
+stub!(isr_39, 39, 0);
+stub!(isr_40, 40, 0);
+stub!(isr_41, 41, 0);
+stub!(isr_42, 42, 0);
+stub!(isr_43, 43, 0);
+stub!(isr_44, 44, 0);
+stub!(isr_45, 45, 0);
+stub!(isr_46, 46, 0);
+stub!(isr_47, 47, 0);
+
 stub!(isr_128, 128, 0); // int 0x80
+stub!(isr_129, 129, 0); // int 0x81
 
 core::arch::global_asm!(
     ".global isr_common",
     ".type isr_common, @function",
     "isr_common:",
-    "push rax",
-    "push rbx",
-    "push rcx",
-    "push rdx",
-    "push rbp",
-    "push rsi",
-    "push rdi",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
+    // The per-vector stub already saved the GPRs and normalized the frame.
     "mov ax, {kdata}",
     "mov ds, ax",
     "mov es, ax",
     // The CPU loads a *null* SS when entering ring0 from ring3 in long mode.
-    // Without this, `iretq` back to ring0 (same privilege level, so SS is not
-    // popped) raises #GP.
     "mov ss, ax",
     "mov rdi, rsp",
     "call {dispatch}",
+    // isr_dispatch returns the frame to resume (the scheduler may switch it).
+    "mov rsp, rax",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -247,11 +343,18 @@ core::arch::global_asm!(
 
 pub type Handler = fn(&mut TrapFrame);
 
+/// `fn(frame, vector) -> next_frame`; used by the scheduler on the timer/yield
+/// path.  The vector lets the scheduler distinguish a timer tick (advance time,
+/// wake sleepers) from a voluntary `int 0x81`.
+pub type SchedHook = fn(usize, usize) -> usize;
+
 struct HandlerTable(UnsafeCell<[Option<Handler>; 256]>);
 
 unsafe impl Sync for HandlerTable {}
 
 static HANDLERS: HandlerTable = HandlerTable(UnsafeCell::new([None; 256]));
+
+static SCHED_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_handler(vector: usize, handler: Handler) {
     assert!(vector < 256);
@@ -260,22 +363,40 @@ pub fn set_handler(vector: usize, handler: Handler) {
     }
 }
 
+pub fn set_sched_hook(hook: SchedHook) {
+    SCHED_HOOK.store(hook as usize, Ordering::Release);
+}
+
 fn handler_for(vector: usize) -> Option<Handler> {
     unsafe { (*HANDLERS.0.get())[vector] }
+}
+
+fn sched_hook() -> Option<SchedHook> {
+    let p = SCHED_HOOK.load(Ordering::Acquire);
+    if p == 0 {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<usize, SchedHook>(p) })
+    }
 }
 
 fn stub_addr(f: unsafe extern "C" fn()) -> usize {
     f as usize
 }
 
-fn install(idt: *mut [IdtEntry; 256], vector: usize, stub: unsafe extern "C" fn(), dpl: u8) {
+fn install(
+    idt: *mut [IdtEntry; 256],
+    vector: usize,
+    stub: unsafe extern "C" fn(),
+    dpl: u8,
+    ist: u8,
+) {
     unsafe {
-        (*idt)[vector] = IdtEntry::new(stub_addr(stub), KERNEL_CODE, dpl, 0);
+        (*idt)[vector] = IdtEntry::new(stub_addr(stub), KERNEL_CODE, dpl, ist);
     }
 }
 
-/// Build and load the IDT.  Only the vectors we can actually handle get a real
-/// stub; everything else stays non-present so a stray interrupt is loud.
+/// Build and load the IDT.
 pub fn init() {
     let idt = IDT.0.get();
     unsafe {
@@ -284,26 +405,41 @@ pub fn init() {
         }
     }
 
-    install(idt, 0, isr_0, 0);
-    install(idt, 1, isr_1, 0);
-    install(idt, 2, isr_2, 0);
-    install(idt, 3, isr_3, 3); // int3 from ring3 must be allowed
-    install(idt, 4, isr_4, 0);
-    install(idt, 5, isr_5, 0);
-    install(idt, 6, isr_6, 0);
-    install(idt, 7, isr_7, 0);
-    install(idt, 8, isr_8, 0);
-    install(idt, 10, isr_10, 0);
-    install(idt, 11, isr_11, 0);
-    install(idt, 12, isr_12, 0);
-    install(idt, 13, isr_13, 0);
-    install(idt, 14, isr_14, 0);
-    install(idt, 16, isr_16, 0);
-    install(idt, 17, isr_17, 0);
-    install(idt, 18, isr_18, 0);
-    install(idt, 19, isr_19, 0);
-    install(idt, 21, isr_21, 0);
-    install(idt, VECTOR_SYSCALL, isr_128, 3);
+    // CPU exceptions.
+    install(idt, 0, isr_0, 0, 0);
+    install(idt, 1, isr_1, 0, 0);
+    install(idt, 2, isr_2, 0, 0);
+    install(idt, 3, isr_3, 3, 0); // int3 from ring3
+    install(idt, 4, isr_4, 0, 0);
+    install(idt, 5, isr_5, 0, 0);
+    install(idt, 6, isr_6, 0, 0);
+    install(idt, 7, isr_7, 0, 0);
+    // #DF runs on its own IST stack so a broken kernel stack still reports.
+    let df_top = DF_STACK.0.get() as usize + 8192;
+    super::tss::set_ist(0, df_top as u64);
+    install(idt, 8, isr_8, 0, 1);
+    install(idt, 10, isr_10, 0, 0);
+    install(idt, 11, isr_11, 0, 0);
+    install(idt, 12, isr_12, 0, 0);
+    install(idt, 13, isr_13, 0, 0);
+    install(idt, 14, isr_14, 0, 0);
+    install(idt, 16, isr_16, 0, 0);
+    install(idt, 17, isr_17, 0, 0);
+    install(idt, 18, isr_18, 0, 0);
+    install(idt, 19, isr_19, 0, 0);
+    install(idt, 21, isr_21, 0, 0);
+
+    // IRQs.
+    let irq = [
+        isr_32, isr_33, isr_34, isr_35, isr_36, isr_37, isr_38, isr_39, isr_40, isr_41, isr_42,
+        isr_43, isr_44, isr_45, isr_46, isr_47,
+    ];
+    for (i, s) in irq.iter().enumerate() {
+        install(idt, IRQ_BASE + i, *s, 0, 0);
+    }
+
+    install(idt, VECTOR_SYSCALL, isr_128, 3, 0);
+    install(idt, VECTOR_YIELD, isr_129, 0, 0);
 
     let dtr = DescriptorTablePointer {
         limit: (256 * 16 - 1) as u16,
@@ -313,24 +449,31 @@ pub fn init() {
 }
 
 #[no_mangle]
-extern "C" fn isr_dispatch(frame: *mut TrapFrame) {
-    let f = unsafe { &mut *frame };
-    let vector = f.vector as usize;
-    match handler_for(vector) {
-        Some(h) => h(f),
-        None => unhandled(f),
+extern "C" fn isr_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let vector = unsafe { (*frame).vector as usize };
+
+    // Acknowledge the PIC before doing anything that may reschedule.
+    if (IRQ_BASE..IRQ_BASE + 16).contains(&vector) {
+        super::pic::end_of_interrupt((vector - IRQ_BASE) as u8);
     }
+
+    // Timer and voluntary-reschedule vectors go straight to the scheduler.
+    if vector == VECTOR_TIMER || vector == VECTOR_YIELD {
+        if let Some(hook) = sched_hook() {
+            return hook(frame as usize, vector) as *mut TrapFrame;
+        }
+    }
+
+    match handler_for(vector) {
+        Some(h) => h(unsafe { &mut *frame }),
+        None => unhandled(unsafe { &mut *frame }),
+    }
+    frame
 }
 
 fn unhandled(f: &mut TrapFrame) {
-    crate::serial_println!(
-        "unhandled vector {} from {} at rip {:#x} err {:#x}",
-        f.vector,
-        if f.from_user() { "user" } else { "kernel" },
-        f.rip,
-        f.error
-    );
-    crate::serial_println!("frame: {:#x?}", f);
+    crate::serial_println!("unhandled interrupt");
+    f.dump("frame");
     loop {
         super::hlt();
     }

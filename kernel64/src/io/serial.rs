@@ -186,5 +186,13 @@ macro_rules! serial_println {
 #[doc(hidden)]
 pub fn _serial_print(args: fmt::Arguments) {
     use core::fmt::Write;
+    // Interrupts off: a preempted thread inside `write_fmt` would otherwise
+    // interleave bytes with the next thread (and a naive spin lock would
+    // deadlock on a single CPU).
+    let if_set = crate::arch::x86_64::interrupts_enabled();
+    crate::arch::x86_64::cli();
     SERIAL_IO.get_mut().write_fmt(args).unwrap();
+    if if_set {
+        crate::arch::x86_64::sti();
+    }
 }

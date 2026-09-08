@@ -74,6 +74,11 @@ pub fn rsp0() -> u64 {
     unsafe { (*tss()).rsp[0] }
 }
 
+pub fn ist(index: usize) -> u64 {
+    assert!(index < 7);
+    unsafe { (*tss()).ist[index] }
+}
+
 pub fn set_ist(index: usize, value: u64) {
     assert!(index < 7);
     unsafe {
