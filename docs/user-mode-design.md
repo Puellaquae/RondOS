@@ -542,7 +542,7 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | **M0.5 ✅** | `thread/mod.rs`：内核线程、抢占式轮转、`schedule(frame)`、`sleep`/`exit`、`WaitQueue`、per-CPU 当前线程 + `TSS.RSP0` | 抢占、睡眠唤醒、线程退出自检通过 |
 | M0.6 | `kernel.ld`（高半区 + `-mcmodel=kernel`）、`BootInfo`、`loader.rs` 退役 | 内核能从 `BootInfo` 拿内存图 |
 | M0.7 | `boot/uefi/`：GOP 设模式 + 读 ESP 文件 + `ExitBootServices` + 建页表跳内核 | QEMU+OVMF 与**一台真机**都能起来 |
-| M0.8 | 删除 `loader/stage1.s`/`stage2.s`/`loader.bin`、`i686-unknown-none.json` | 构建只剩一条路径 |
+| **M0.8 ✅** | 删除 `kernel/`（i686）、`loader/*.s`、`loader.bin`；构建只剩 x64 一条路径 | i686 已完整保存在 **`legacy-i686` 分支**，`make` 只构建 x86-64 |
 
 **M0.1..M0.5 已完成**（`kernel64/`，`make test64` 输出 `smoke: ALL PASS (10/10)`）：
 
