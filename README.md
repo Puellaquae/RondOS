@@ -14,7 +14,8 @@
     GDT/TSS/per-CPU（`swapgs`）、IDT/统一 `TrapFrame`、8259+8254
   - `src/mm/`           位图页框分配器（physmap 视图）+ 架构无关 VMM 抽象
   - `src/thread/`       内核线程、抢占式轮转调度、`sleep`/`exit`、`WaitQueue`
-  - `src/multiboot.rs`  临时引导信息（M0.6 起换成版本化 `BootInfo`）
+  - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version）
+  - `src/multiboot.rs`  临时 multiboot 适配器（M0.7 后删除）
   - `boot/multiboot32.s` 临时 32 位跳板（建立分页 → long mode → 跳内核），
     M0.7 的 UEFI stub 到位后删除
 - `files/`      启动 tar 镜像内容（将来的用户程序与资源）
@@ -55,7 +56,7 @@ QEMU 无法用 `-kernel` 直接启动 64 位 ELF（multiboot 只收 32 位），
 | M0.3 | GDT/TSS/per-CPU `swapgs` + IDT，ring3 能进出 | ✅ |
 | M0.4 | 8259+8254、每向量 stub、`#DF` 用 IST、用户态 `#PF` 分流 | ✅ |
 | M0.5 | 内核线程、抢占式轮转、`sleep`/`exit`、`WaitQueue` | ✅ |
-| M0.6 | 版本化 `BootInfo`（引导交接正式化） | 进行中 |
+| M0.6 | 版本化 `BootInfo`（引导交接正式化） | ✅ |
 | M0.7 | `x86_64-unknown-uefi` stub（GOP 设模式 + 读 ESP 文件 + 跳内核） | 待办 |
 | M0.8 | 删除 32 位跳板与 i686 路径 | ✅（i686 已移入 `legacy-i686` 分支） |
 

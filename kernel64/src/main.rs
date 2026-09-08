@@ -15,6 +15,7 @@
 #![no_main]
 
 mod arch;
+mod bootinfo;
 mod io;
 mod mm;
 mod multiboot;
@@ -55,7 +56,7 @@ const STEP_PF: u64 = 1 << 3;
 const TIMER_HZ: u32 = 200;
 
 #[no_mangle]
-pub extern "C" fn _start(mbi_phys: u32) -> ! {
+pub extern "C" fn _start(boot: u64) -> ! {
     serial_println!();
     serial_println!("==============================================");
     serial_println!("RondOS x86-64 — M0.1..M0.5 scaffold");
@@ -63,10 +64,19 @@ pub extern "C" fn _start(mbi_phys: u32) -> ! {
 
     banner_cpu();
 
-    multiboot::parse(mbi_phys);
-    if let Some(name) = multiboot::boot_loader(mbi_phys) {
-        serial_println!("bootloader: {}", name);
+    // M0.6: the boot argument is either a `BootInfo` (future UEFI stub) or a
+    // multiboot info block (today's trampoline).  Detect by magic.
+    if bootinfo::probe(boot) {
+        let ok = bootinfo::adopt_external(boot);
+        serial_println!("bootinfo: adopted external structure (ok {})", ok);
+    } else {
+        let ok = multiboot::parse(boot as u32);
+        serial_println!("bootinfo: built from multiboot (ok {})", ok);
+        if let Some(name) = multiboot::boot_loader(boot as u32) {
+            serial_println!("bootloader: {}", name);
+        }
     }
+    bootinfo::dump();
     serial_println!(
         "memory: {} MiB usable, top {:#x}",
         mm::available_mem_size() / 1024 / 1024,

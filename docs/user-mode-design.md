@@ -540,11 +540,11 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | **M0.3 ✅** | `gdt.rs` / `tss.rs` / `percpu.rs`：64 位 GDT（null/kcode 0x08/kdata 0x10/ucode 0x1b/udata 0x23/TSS 0x28 双槽）、`swapgs`、per-CPU 结构；`intr.rs`：IDT + 统一 `TrapFrame` + stub | ring3 能进出（`make test64` 7/7，含 `int 0x80`、`#GP` 恢复、返回 ring0） |
 | **M0.4 ✅** | `intr.rs`：64 位 IDT、统一 `TrapFrame`、每向量 stub、IST 栈跑 `#DF`、用户态 `#PF` 分流；`pic.rs`：8259 + 8254 | 定时器/异常正常，用户态缺页只杀进程 |
 | **M0.5 ✅** | `thread/mod.rs`：内核线程、抢占式轮转、`schedule(frame)`、`sleep`/`exit`、`WaitQueue`、per-CPU 当前线程 + `TSS.RSP0` | 抢占、睡眠唤醒、线程退出自检通过 |
-| M0.6 | `kernel.ld`（高半区 + `-mcmodel=kernel`）、`BootInfo`、`loader.rs` 退役 | 内核能从 `BootInfo` 拿内存图 |
+| **M0.6 ✅** | `kernel.ld` 高半区、版本化 `BootInfo`（magic/size/version + 内存图 + fb + initrd + ACPI RSDP + cmdline）、multiboot 降级为临时生产者 | 内核只从 `BootInfo` 拿内存图；外部结构体带 magic 可被探测 |
 | M0.7 | `boot/uefi/`：GOP 设模式 + 读 ESP 文件 + `ExitBootServices` + 建页表跳内核 | QEMU+OVMF 与**一台真机**都能起来 |
 | **M0.8 ✅** | 删除 `kernel/`（i686）、`loader/*.s`、`loader.bin`；构建只剩 x64 一条路径 | i686 已完整保存在 **`legacy-i686` 分支**，`make` 只构建 x86-64 |
 
-**M0.1..M0.5 已完成**（`kernel64/`，`make test64` 输出 `smoke: ALL PASS (10/10)`）：
+**M0.1..M0.6 已完成**（`kernel64/`，`make test` 输出 `smoke: ALL PASS (10/10)`）：
 
 | 冒烟测试 | 验证内容 |
 | --- | --- |
