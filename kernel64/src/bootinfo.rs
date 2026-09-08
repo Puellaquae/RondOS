@@ -1,11 +1,11 @@
 //! Versioned boot handoff structure — M0.6.
 //!
-//! Until now the kernel read the multiboot info block directly and scattered
-//! its contents into `mm`.  This module defines the real handoff contract:
-//! a single, versioned, fixed-width structure that *any* loader can produce.
-//! Today `multiboot.rs` fills it (the temporary 32-bit trampoline path); at
-//! M0.7 the UEFI stub fills the same structure from GOP + `GetMemoryMap` +
-//! the ESP files, and the trampoline disappears.
+//! The kernel no longer parses a bootloader-specific info block: this module
+//! is the handoff contract, a single versioned fixed-width structure that
+//! *any* loader can produce.
+//! Since M0.7 the UEFI stub (`boot/uefi`) is the only producer: it fills this
+//! from GOP + `GetMemoryMap` + the ESP files.  The temporary multiboot
+//! trampoline that also fed it was deleted with the stub's arrival.
 //!
 //! Layout rules (the same discipline the user ABI will use, design §6.8):
 //!
@@ -13,24 +13,24 @@
 //!   recognise the structure and a future loader can append fields;
 //! * fixed-width fields only (`u32`/`u64`), explicit padding, no `usize`;
 //! * the memory map is a fixed inline array for now (the kernel has no heap at
-//!   this point); the UEFI stub will be able to fill the same array.
+//!   this point); the UEFI stub fills the same array.
 
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
 
-/// `"RND1"` — lets the kernel tell a `BootInfo` apart from a multiboot block.
+/// `"RND1"` — lets the kernel recognise a `BootInfo` handed over by a loader.
 pub const BOOTINFO_MAGIC: u32 = 0x524E_4431;
 pub const BOOTINFO_VERSION: u32 = 1;
 
 pub const MAX_MEM_ENTRIES: usize = 64;
 pub const MAX_CMDLINE: usize = 128;
 
+/// Historical value of the deleted 32-bit multiboot trampoline.
 pub const BOOT_KIND_MULTIBOOT: u32 = 1;
 pub const BOOT_KIND_UEFI: u32 = 2;
 
-/// Firmware memory descriptor kind (`EFI_CONVENTIONAL_MEMORY` / multiboot
-/// "available" are both 1).
+/// Firmware memory descriptor kind (`EFI_CONVENTIONAL_MEMORY` is 1).
 pub const MEM_KIND_USABLE: u32 = 1;
 
 #[repr(C)]

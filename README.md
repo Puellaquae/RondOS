@@ -14,10 +14,11 @@
     GDT/TSS/per-CPU（`swapgs`）、IDT/统一 `TrapFrame`、8259+8254
   - `src/mm/`           位图页框分配器（physmap 视图）+ 架构无关 VMM 抽象
   - `src/thread/`       内核线程、抢占式轮转调度、`sleep`/`exit`、`WaitQueue`
-  - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version）
-  - `src/multiboot.rs`  临时 multiboot 适配器（M0.7 后删除）
-  - `boot/multiboot32.s` 临时 32 位跳板（建立分页 → long mode → 跳内核），
-    M0.7 的 UEFI stub 到位后删除
+  - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version），内核唯一的引导契约
+- `boot/uefi/`  UEFI 引导 stub，目标 `x86_64-unknown-uefi`，基于 `uefi-rs`
+  - GOP 选 32bpp 模式 → 读 ESP 上的 `\rondos\kernel.elf` → 按 `p_paddr` 装载
+    → 填 `BootInfo`（内存图 + framebuffer + initrd）→ 建页表 →
+    `ExitBootServices` → 跳内核（`rdi` = `BootInfo` 物理地址）
 - `files/`      启动 tar 镜像内容（将来的用户程序与资源）
 - `docs/user-mode-design.md`  用户态完整设计（迁移、ring 3、编译支持、可执行文件格式、
   冻结的 syscall ABI、Win3.1 复古桌面）
@@ -27,7 +28,7 @@
 
 ```bash
 # Debian/Ubuntu
-sudo apt install nasm qemu-system-x86 make
+sudo apt install qemu-system-x86 ovmf make
 
 # Rust nightly + rust-src（no_std 内核 + build-std 需要）
 rustup install nightly
@@ -37,15 +38,23 @@ rustup component add rust-src --toolchain nightly
 ## 编译运行
 
 ```bash
-make            # 构建内核 + 32 位跳板
-make run        # 构建并启动 QEMU（串口输出）
+make            # 构建内核 + UEFI stub，并组装 build/esp/
+make run        # 用 QEMU + OVMF 启动 build/esp/（串口输出到 stdio）
 make test       # 无头启动，检查冒烟测试结果
 make release    # release 构建
 make clean
 ```
 
-QEMU 无法用 `-kernel` 直接启动 64 位 ELF（multiboot 只收 32 位），所以 `make run`
-是 `-kernel trampoline.bin -device loader,file=kernel64` 的组合。
+`make run` 把 `build/esp/` 当作 FAT 盘直接喂给 QEMU（`-drive file=fat:rw:...`），
+所以不需要 `mkfs.vfat`/`mtools`：
+
+```
+build/esp/EFI/BOOT/BOOTX64.EFI   UEFI stub
+build/esp/rondos/kernel.elf      x86-64 内核
+```
+
+OVMF 路径用 `OVMF=/path/to/OVMF.fd` 覆盖（默认 `/usr/share/ovmf/OVMF.fd`）。
+真机上把 `build/esp/` 里的两个文件拷进 ESP 的同样路径即可（Secure Boot 需关闭）。
 
 ## 迁移进度
 
@@ -57,11 +66,13 @@ QEMU 无法用 `-kernel` 直接启动 64 位 ELF（multiboot 只收 32 位），
 | M0.4 | 8259+8254、每向量 stub、`#DF` 用 IST、用户态 `#PF` 分流 | ✅ |
 | M0.5 | 内核线程、抢占式轮转、`sleep`/`exit`、`WaitQueue` | ✅ |
 | M0.6 | 版本化 `BootInfo`（引导交接正式化） | ✅ |
-| M0.7 | `x86_64-unknown-uefi` stub（GOP 设模式 + 读 ESP 文件 + 跳内核） | 待办 |
-| M0.8 | 删除 32 位跳板与 i686 路径 | ✅（i686 已移入 `legacy-i686` 分支） |
+| M0.7 | `x86_64-unknown-uefi` stub + 内核自有页表（删除 32 位跳板） | ✅ |
+| M0.8 | i686 路径移入 `legacy-i686` 分支 | ✅ |
 
-`make test` 目前输出 `smoke: ALL PASS (10/10)`：分页/physmap/大页拆分/地址空间
-隔离/W^X/设备映射、ring3 系统调用往返、用户态缺页隔离、抢占、睡眠唤醒、线程退出。
+`make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (10/10)`：
+分页/physmap/大页拆分/地址空间隔离/W^X/设备映射、ring3 系统调用往返、
+用户态缺页隔离、抢占、睡眠唤醒、线程退出。内核在第一条指令就切到自己的栈，
+`BootInfo` 落地后立即切到内核自有的 PML4（丢掉 loader 的低地址 identity map）。
 
 ## 参考资料
 

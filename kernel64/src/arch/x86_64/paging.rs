@@ -412,6 +412,34 @@ impl X86_64Paging {
         }
     }
 
+    /// Install a single 1 GiB huge page (`va`/`pa` must be 1 GiB aligned).
+    ///
+    /// The physmap is built with these; the smoke test uses it to exercise the
+    /// two-level split below without depending on the bootloader's tables.
+    /// The target PDPT entry must be free — this never splits implicitly.
+    pub fn map_huge_1g(root: usize, va: usize, pa: usize, flags: PageFlags) -> Result<(), MapError> {
+        debug_assert_eq!(va & (HUGE_1G - 1), 0);
+        debug_assert_eq!(pa & (HUGE_1G - 1), 0);
+        unsafe {
+            let i4 = pml4_idx(va);
+            let e4 = ld(root, i4);
+            let pdpt = if present(e4) {
+                (e4 & PTE_PHYS_MASK) as usize
+            } else {
+                let t = alloc_zero_frame().ok_or(MapError::OutOfMemory)?;
+                st(root, i4, t as u64 | table_flags(flags));
+                t
+            };
+            let i3 = pdpt_idx(va);
+            if present(ld(pdpt, i3)) {
+                return Err(MapError::AlreadyMapped);
+            }
+            st(pdpt, i3, pa as u64 | entry_flags(flags) | PTE_HUGE);
+            flush_for(root, va);
+            Ok(())
+        }
+    }
+
     /// Map `len` bytes of physical MMIO at `va` with the given cache policy.
     /// Used later for the GOP framebuffer (design §8.2).
     pub fn map_device(

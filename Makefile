@@ -1,70 +1,76 @@
-# RondOS build system (x86-64, UEFI-era scaffold)
+# RondOS build system (x86-64 + UEFI)
 #
-#   make            - build the kernel + boot trampoline
+#   make            - build the kernel, the UEFI stub and the ESP tree
 #   make release    - release build
-#   make run        - build then launch in QEMU
+#   make run        - build then boot the ESP in QEMU + OVMF (serial on stdio)
 #   make test       - headless boot; fail unless the smoke tests pass
 #   make clean      - remove all build artifacts
 #
-# The original i686 kernel and its NASM boot loader are preserved on the
-# `legacy-i686` git branch (see README.md).
+# The i686 kernel and its NASM BIOS loader are preserved on the `legacy-i686`
+# git branch (see README.md).  The 32-bit trampoline that M0.7 replaced lives
+# in git history only.
 
-NASM       ?= nasm
 QEMU       ?= qemu-system-x86_64
 CARGO      ?= $(HOME)/.cargo/bin/cargo
+OVMF       ?= /usr/share/ovmf/OVMF.fd
 
 KERNEL_DIR := kernel64
+BOOT_DIR   := boot/uefi
 K64_TARGET := x86_64-unknown-none
-K64_ELF    := $(KERNEL_DIR)/target/$(K64_TARGET)/debug/kernel64
-K64_ELF_REL := $(KERNEL_DIR)/target/$(K64_TARGET)/release/kernel64
-K64_ELF_REAL := $(K64_ELF)
-K64_BOOT32 := $(KERNEL_DIR)/build/trampoline.bin
-K64_LOG    := $(KERNEL_DIR)/build/serial.log
+UEFI_TARGET:= x86_64-unknown-uefi
+
+ESP        := build/esp
+ESP_KERNEL := $(ESP)/rondos/kernel.elf
+ESP_STUB   := $(ESP)/EFI/BOOT/BOOTX64.EFI
+ESP_TMP    := build/tmp
+SERIAL_LOG := build/uefi-serial.log
 
 CARGO_FLAG ?=
+PROFILE    := debug
 ifeq ($(filter release,$(MAKECMDGOALS)),release)
     CARGO_FLAG := --release
-    K64_ELF_REAL := $(K64_ELF_REL)
+    PROFILE    := release
 endif
 
-.PHONY: all release kernel kernel64 trampoline run test clean
+QEMU_FLAGS := -bios $(OVMF) -m 512 \
+              -drive file=fat:rw:$(ESP),format=raw \
+              -display none -no-reboot
 
-all: kernel trampoline
+.PHONY: all release kernel boot esp run test clean
+
+all: esp
 
 release: all
 
-kernel kernel64:
+kernel:
 	cd $(KERNEL_DIR) && $(CARGO) build $(CARGO_FLAG)
 
-# The 32-bit trampoline needs the kernel's entry address baked in.
-$(K64_BOOT32): $(KERNEL_DIR)/boot/multiboot32.s $(K64_ELF_REAL)
-	@mkdir -p $(KERNEL_DIR)/build
-	ENTRY=$$(readelf -h $(K64_ELF_REAL) | awk '/Entry point/{print $$4}'); \
-	  echo "==> trampoline entry $$ENTRY"; \
-	  $(NASM) -f bin -DENTRY_HI=$$ENTRY -o $@ $<
+boot:
+	cd $(BOOT_DIR) && $(CARGO) build $(CARGO_FLAG)
 
-trampoline: $(K64_BOOT32)
+# The ESP is a directory; QEMU's vvfat exposes it as a FAT drive, so testing
+# needs neither mkfs.vfat nor mtools.  TMPDIR is pinned inside the tree because
+# vvfat writes a scratch file next to the image.
+esp: kernel boot
+	@mkdir -p $(ESP)/EFI/BOOT $(ESP)/rondos $(ESP_TMP)
+	cp $(KERNEL_DIR)/target/$(K64_TARGET)/$(PROFILE)/kernel64 $(ESP_KERNEL)
+	cp $(BOOT_DIR)/target/$(UEFI_TARGET)/$(PROFILE)/rondos-boot.efi $(ESP_STUB)
 
-# QEMU cannot boot a 64-bit ELF with -kernel (multiboot is 32-bit only), so:
-#   -kernel trampoline.bin   boots the 32-bit trampoline
-#   -device loader,file=...  places the kernel's ELF64 segments at their p_paddr
-run: all
-	$(QEMU) -cpu max -m 512 \
-	  -kernel $(K64_BOOT32) \
-	  -device loader,file=$(K64_ELF_REAL) \
-	  -serial stdio -display none -no-reboot
+run: esp
+	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -serial stdio
 
-test: all
-	@rm -f $(K64_LOG)
-	@timeout 30 $(QEMU) -cpu max -m 512 \
-	  -kernel $(K64_BOOT32) \
-	  -device loader,file=$(K64_ELF_REAL) \
-	  -serial file:$(K64_LOG) -display none -no-reboot >/dev/null 2>&1 || true
-	@cat $(K64_LOG)
-	@grep -q "smoke: ALL PASS" $(K64_LOG) \
-	  && echo "==> smoke tests PASS" \
+test: esp
+	@rm -f $(SERIAL_LOG)
+	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 30 $(QEMU) $(QEMU_FLAGS) \
+	  -serial file:$(SERIAL_LOG) >/dev/null 2>&1 || true
+	@grep -v '^\[2J' $(SERIAL_LOG)
+	@grep -q "bootinfo: adopted UEFI structure" $(SERIAL_LOG) \
+	  || (echo "==> booted, but not through the UEFI stub"; exit 1)
+	@grep -q "smoke: ALL PASS" $(SERIAL_LOG) \
+	  && echo "==> smoke tests PASS (UEFI)" \
 	  || (echo "==> smoke tests FAIL"; exit 1)
 
 clean:
-	rm -rf $(KERNEL_DIR)/build
+	rm -rf build
 	cd $(KERNEL_DIR) && $(CARGO) clean
+	cd $(BOOT_DIR) && $(CARGO) clean

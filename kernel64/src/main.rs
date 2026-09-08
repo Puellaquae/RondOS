@@ -1,4 +1,4 @@
-//! RondOS x86-64 kernel — M0.1 … M0.5.
+//! RondOS x86-64 kernel — M0.1 … M0.7.
 //!
 //! Migration scaffold from `docs/user-mode-design.md` §7:
 //!
@@ -7,9 +7,11 @@
 //! * M0.3 GDT/TSS/per-CPU + IDT + ring3 round-trip
 //! * M0.4 ring0 frame normalization, PIC/PIT, IST for `#DF`, user `#PF` split
 //! * M0.5 kernel threads, preemptive round-robin, sleep/exit, WaitQueue
+//! * M0.6 versioned `BootInfo` boot contract
+//! * M0.7 UEFI stub + kernel-owned address space (the 32-bit trampoline is gone)
 //!
-//! `_start` is entered in long mode by `boot/multiboot32.s` with `rdi` = the
-//! physical address of the multiboot info block.
+//! `_start` is entered in long mode by the UEFI stub (`boot/uefi`) with
+//! `rdi` = the physical address of a `BootInfo`.
 
 #![no_std]
 #![no_main]
@@ -18,7 +20,6 @@ mod arch;
 mod bootinfo;
 mod io;
 mod mm;
-mod multiboot;
 mod thread;
 mod utils;
 
@@ -55,33 +56,66 @@ const STEP_PF: u64 = 1 << 3;
 
 const TIMER_HZ: u32 = 200;
 
+/// Stack the kernel runs on from its very first instruction.  It lives in
+/// `.bss`, i.e. inside the kernel window the loader maps, so it survives the
+/// switch to the kernel-owned page tables below.
+const BOOT_STACK_SIZE: usize = 64 * 1024;
+
+#[repr(align(16))]
+#[allow(dead_code)]
+struct BootStack([u8; BOOT_STACK_SIZE]);
+
+static mut BOOT_STACK: BootStack = BootStack([0; BOOT_STACK_SIZE]);
+
 #[no_mangle]
-pub extern "C" fn _start(boot: u64) -> ! {
+pub extern "C" fn _start(_boot: u64) -> ! {
+    // The loader's stack and page tables are temporary scaffolding.  Take a
+    // stack we own before touching anything, then never look back.
+    let stack_top = core::ptr::addr_of!(BOOT_STACK) as u64 + BOOT_STACK_SIZE as u64 - 8;
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {stack}",
+            "call {kmain}",
+            stack = in(reg) stack_top,
+            kmain = sym kmain,
+            options(noreturn),
+        )
+    }
+}
+
+extern "C" fn kmain(boot: u64) -> ! {
     serial_println!();
     serial_println!("==============================================");
-    serial_println!("RondOS x86-64 — M0.1..M0.5 scaffold");
+    serial_println!("RondOS x86-64 — M0.1..M0.7 scaffold");
     serial_println!("==============================================");
 
     banner_cpu();
 
-    // M0.6: the boot argument is either a `BootInfo` (future UEFI stub) or a
-    // multiboot info block (today's trampoline).  Detect by magic.
-    if bootinfo::probe(boot) {
-        let ok = bootinfo::adopt_external(boot);
-        serial_println!("bootinfo: adopted external structure (ok {})", ok);
-    } else {
-        let ok = multiboot::parse(boot as u32);
-        serial_println!("bootinfo: built from multiboot (ok {})", ok);
-        if let Some(name) = multiboot::boot_loader(boot as u32) {
-            serial_println!("bootloader: {}", name);
-        }
+    // M0.7: the single boot contract is a `BootInfo` produced by the UEFI stub
+    // (`boot/uefi`), passed in `rdi` as a physical address.
+    if !bootinfo::probe(boot) {
+        panic!("boot: no BootInfo at {:#x}", boot);
     }
+    if !bootinfo::adopt_external(boot) {
+        panic!("boot: BootInfo at {:#x} failed validation", boot);
+    }
+    serial_println!("bootinfo: adopted UEFI structure");
     bootinfo::dump();
     serial_println!(
         "memory: {} MiB usable, top {:#x}",
         mm::available_mem_size() / 1024 / 1024,
         mm::usable_end()
     );
+
+    // M0.7: the loader's page tables are scaffolding too.  Build a kernel-owned
+    // root (kernel half copied, low identity map dropped) and run on it from
+    // here on — this is what makes the kernel independent of the bootloader.
+    let root = match create_kernel_address_space() {
+        Some(r) => r,
+        None => panic!("paging: cannot create the kernel address space"),
+    };
+    X86_64Paging::switch_to(root);
+    serial_println!("paging: kernel-owned root {:#x}", root);
 
     let mut failures = 0usize;
     failures += !test_physmap() as usize;
@@ -462,7 +496,14 @@ fn test_physmap() -> bool {
 }
 
 fn test_huge_split() -> bool {
-    let root = X86_64Paging::active_root();
+    // Self-contained: build a private root with one 1 GiB page in the user
+    // half, then force the 1 GiB -> 2 MiB -> 4 KiB split.  Relying on the
+    // bootloader's identity map (as this test used to) is exactly what the
+    // kernel-owned address space removed.
+    let root = match create_kernel_address_space() {
+        Some(r) => r,
+        None => return fail("huge-split", "no PML4"),
+    };
     let frame = match mm::page_alloc().get_page(1) {
         Some(f) => f,
         None => return fail("huge-split", "no frame"),
@@ -470,8 +511,10 @@ fn test_huge_split() -> bool {
     let pa = virt_to_phys(frame as usize);
     unsafe { (frame as *mut u64).write_volatile(0xDEAD_BEEF_1234_5678) };
 
-    let va = 0x0100_0000usize;
-    let mut ok = X86_64Paging::map(root, va, pa, PAGE_KERNEL_RW).is_ok();
+    let base = 0x0000_6000_0000_0000usize; // 1 GiB aligned, user half
+    let va = base + 0x0100_0000;
+    let mut ok = X86_64Paging::map_huge_1g(root, base, 0, PAGE_USER_RW).is_ok();
+    ok &= X86_64Paging::map(root, va, pa, PAGE_KERNEL_RW).is_ok();
 
     match X86_64Paging::query(root, va) {
         Some(info) => {
@@ -485,14 +528,21 @@ fn test_huge_split() -> bool {
             ok = false;
         }
     }
-    ok &= X86_64Paging::translate(root, va + 0x1000) == Some(va + 0x1000);
-    ok &= X86_64Paging::translate(root, va + 0x20_0000) == Some(va + 0x20_0000);
+    // The rest of the split 1 GiB page must still map identity.
+    ok &= X86_64Paging::translate(root, va + 0x1000) == Some(0x0100_1000);
+    ok &= X86_64Paging::translate(root, va + 0x20_0000) == Some(0x0120_0000);
+
+    let boot_root = X86_64Paging::active_root();
+    X86_64Paging::switch_to(root);
     ok &= unsafe { (va as *const u64).read_volatile() } == 0xDEAD_BEEF_1234_5678;
+    X86_64Paging::switch_to(boot_root);
+
     ok &= X86_64Paging::map(root, va, pa + 0x1000, PAGE_KERNEL_RW)
         == Err(mm::vm::MapError::AlreadyMapped);
 
     ok &= X86_64Paging::unmap(root, va) == Ok(pa);
     mm::page_alloc().free_page(frame, 1);
+    destroy_address_space(root);
 
     report("huge-split", ok);
     ok

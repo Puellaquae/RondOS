@@ -541,10 +541,10 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | **M0.4 ✅** | `intr.rs`：64 位 IDT、统一 `TrapFrame`、每向量 stub、IST 栈跑 `#DF`、用户态 `#PF` 分流；`pic.rs`：8259 + 8254 | 定时器/异常正常，用户态缺页只杀进程 |
 | **M0.5 ✅** | `thread/mod.rs`：内核线程、抢占式轮转、`schedule(frame)`、`sleep`/`exit`、`WaitQueue`、per-CPU 当前线程 + `TSS.RSP0` | 抢占、睡眠唤醒、线程退出自检通过 |
 | **M0.6 ✅** | `kernel.ld` 高半区、版本化 `BootInfo`（magic/size/version + 内存图 + fb + initrd + ACPI RSDP + cmdline）、multiboot 降级为临时生产者 | 内核只从 `BootInfo` 拿内存图；外部结构体带 magic 可被探测 |
-| M0.7 | `boot/uefi/`：GOP 设模式 + 读 ESP 文件 + `ExitBootServices` + 建页表跳内核 | QEMU+OVMF 与**一台真机**都能起来 |
+| **M0.7 ✅** | `boot/uefi/`：GOP 设模式 + 读 ESP 文件 + `ExitBootServices` + 建页表跳内核；内核第一条指令切自有栈、拿到 `BootInfo` 后切**内核自有 PML4** | QEMU+OVMF 起来并 `smoke: ALL PASS (10/10)`；真机待 P5 前的实机验证 |
 | **M0.8 ✅** | 删除 `kernel/`（i686）、`loader/*.s`、`loader.bin`；构建只剩 x64 一条路径 | i686 已完整保存在 **`legacy-i686` 分支**，`make` 只构建 x86-64 |
 
-**M0.1..M0.6 已完成**（`kernel64/`，`make test` 输出 `smoke: ALL PASS (10/10)`）：
+**M0.1..M0.8 已完成**（`kernel64/` + `boot/uefi/`，`make test` 用 OVMF 启动并输出 `smoke: ALL PASS (10/10)`）：
 
 | 冒烟测试 | 验证内容 |
 | --- | --- |
@@ -560,18 +560,16 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | `sleep/wake` | `sleep(200ms)` 被定时器唤醒 3 次 |
 | `thread-exit` | `thread_exit` 后 TCB/内核栈在下一 tick 回收 |
 
-**临时引导路径**（M0.7 的 UEFI stub 到位后删除）：
-
-QEMU 的 multiboot 只接受 32 位镜像，而内核是 64 位高半区 ELF，所以 `qemu -kernel kernel64` 不可行。
-当前用 `boot/multiboot32.s`（NASM `-f bin`，multiboot a.out kludge 头）做 32 位跳板：
-建好恒等映射 / physmap / 内核 2 MiB 页映射 → `CR4.PAE|PGE` → `EFER.LME|NXE` → `CR0.WP|PG`
-→ `ljmp` 进 64 位 → 跳到内核入口（入口地址由 Makefile 从 ELF 读出后 `-D` 进去）。
+**引导路径（M0.7 起只剩 UEFI 一条）**：
 
 ```bash
-make kernel64    # 构建 x86-64 内核
-make run64       # QEMU：-kernel trampoline.bin -device loader,file=kernel64
-make test64      # 无头启动 + grep 冒烟测试结果
+make        # 内核 + UEFI stub + 组装 build/esp/
+make run    # QEMU + OVMF 启动 build/esp/（vvfat 把目录当 FAT 盘）
+make test   # 无头启动 + grep 冒烟测试结果
 ```
+
+跳板时代的 `boot/multiboot32.s` 与 `src/multiboot.rs` 已删除（git 历史里还能找到）：
+QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这条路径天生别扭。
 
 两个坑值得记住（都已修）：
 
@@ -581,7 +579,10 @@ make test64      # 无头启动 + grep 冒烟测试结果
 * 从 ring3 进内核时 CPU 把 **SS 设成 null**，`isr_common` 必须自己 `mov ss, ax`，否则返回 ring0 的 `iretq` 直接 `#GP`；
 * TSS 描述符的 base 被拆成三段（0..23、24..31、32..63），漏掉中间那段会把 `0xFFFF_FFFF_8021_1F00` 变成 `0xFFFF_FFFF_0021_1F00`，CPU 从错误地址读 `RSP0`，第一次 ring3 陷入就 triple fault；
 * **64 位中断交付总是压入 `SS:RSP`**（32 位保护模式才按特权级决定；QEMU `do_interrupt64` 里这两条 `pushq` 是无条件的）。所以 ring0/ring3 帧布局天生相同、**不需要任何归一化**：按 3 个字假设去"补齐"会让帧整体偏移 16 字节、`rsp` 少 16，表现为线程每 yield 一次栈就往下爬、最终 `ret` 跳到垃圾地址。这条是本轮调试花时间最多的地方；
-* 触发调度的 `int 0x81` 汇编**不能写 `options(nomem)`**：处理函数会读写内存（调度器状态），谎报 `nomem` 会让编译器把内存操作重排到 asm 两侧。
+* 触发调度的 `int 0x81` 汇编**不能写 `options(nomem)`**：处理函数会读写内存（调度器状态），谎报 `nomem` 会让编译器把内存操作重排到 asm 两侧；
+* **`rdi` 必须传 `BootInfo` 的物理地址**，不是 physmap 视角的 VA：内核的 `bootinfo::probe`/`adopt_external` 自己会做 `phys_to_virt`，传 VA 会二次加 `PHYS_MAP_BASE` 直接溢出 panic；
+* **不要继续跑在 loader 的页表上**：跳板/OVMF 都恒等映射低地址，`map_device(0x5200_0000, ...)` 这类测试会撞上已有的 1 GiB 大页并（正确地）报 `AlreadyMapped`，而 `huge-split` 又会误以为「低地址一定有大页」。正确做法是内核第一条指令就换到自有栈（`.bss` 里 64 KiB），拿到 `BootInfo` 后立刻 `create_kernel_address_space()` + `switch_to()`，把 loader 的恒等映射整体丢掉；
+* `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单
 
@@ -644,10 +645,13 @@ make test64      # 无头启动 + grep 冒烟测试结果
 | 2 | `OpenProtocol<SimpleFileSystem>` → 读 `\rondos\kernel.elf` 与 `\rondos\boot.tar` |
 | 3 | `GetMemoryMap` → 拷出内存描述符 |
 | 4 | 从 UEFI 配置表取 ACPI RSDP |
-| 5 | 分配一页放 `BootInfo`，填 fb/内存图/initrd/RSDP/cmdline |
+| 5 | 填 `BootInfo`（静态 `.bss` 里，天然在 stub 的恒等映射内）：fb / 内存图 / initrd / RSDP / cmdline |
 | 6 | `ExitBootServices` |
-| 7 | 建 4 级页表：physmap（1 GiB 页）+ 内核镜像（按 ELF `PT_LOAD`）+ 设备窗口；`EFER.NXE=1`；载入 CR3 |
-| 8 | `jmp` 内核入口，`rdi = physmap 视角的 &BootInfo` |
+| 7 | 建临时 4 级页表：恒等映射 0..4 GiB（保住 stub 自己）+ physmap（1 GiB 页，NX）+ 内核窗口（2 MiB 页）；`EFER.NXE=1`；载入 CR3 |
+| 8 | `jmp` 内核入口，`rdi = BootInfo` 的**物理地址** |
+
+**stub 的页表只是过桥**：内核拿到 `BootInfo` 后立刻建自己的 PML4 并 `switch_to`，
+所以 stub 只保证「内核映像 + physmap」可达即可（见 §7.1 的坑）。
 
 注意点：
 
@@ -694,16 +698,20 @@ QEMU 里有个**免依赖替代**：`-drive file=fat:rw:build/esp,format=raw` �
 （vvfat 对规范覆盖不全、写模式有已知怪癖，只适合开发。）
 
 **已定：构建统一用 mtools**（`sudo apt install mtools`）。分工是：QEMU 用 vvfat 免依赖快速迭代，
-`make usb` 用 mtools 出实机 U 盘镜像。选 mtools 的另一个收益是——**P5 的盘上文件系统就选 FAT**，
+`make usb` 用 mtools 出实机 U 盘镜像。**当前状态**：`make`/`make run`/`make test` 都走 vvfat，
+`make usb` 还没写（P5 前补，届时把 `build/esp/` 打成 `esp.img`）。选 mtools 的另一个收益是——**P5 的盘上文件系统就选 FAT**，
 宿主能直接用 `mtools` 读写镜像（拖文件进去、看日志），省掉自研 mkfs 与宿主打包器。
 
 ```make
+QEMU_FLAGS := -bios $(OVMF) -m 512 \
+              -drive file=fat:rw:$(ESP),format=raw \
+              -display none -no-reboot
+
 run: esp
-	qemu-system-x86_64 -machine q35 -m 512 -smp 1 \
-	  -bios /usr/share/OVMF/OVMF.fd \
-	  -drive file=fat:rw:build/esp,format=raw \
-	  -vga std -serial stdio -monitor none
+	TMPDIR=$(CURDIR)/build/tmp $(QEMU) $(QEMU_FLAGS) -serial stdio
 ```
+
+（`TMPDIR` 指向工程内是给 vvfat 的临时文件用；沙箱里 `/var/tmp` 不可写。）
 
 ### 8.5 Secure Boot
 
