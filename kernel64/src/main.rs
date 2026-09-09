@@ -95,6 +95,10 @@ extern "C" fn kmain(boot: u64) -> ! {
     serial_println!("RondOS x86-64 — M0.1..M0.7 scaffold");
     serial_println!("==============================================");
 
+    // M0.3 (finished in P2): user programs are built for SSE2, so the kernel
+    // must turn the FPU/SSE on and save it per thread.
+    arch::x86_64::enable_sse();
+
     banner_cpu();
 
     // M0.7: the single boot contract is a `BootInfo` produced by the UEFI stub

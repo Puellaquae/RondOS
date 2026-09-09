@@ -17,7 +17,7 @@
 
 #![allow(dead_code)]
 
-use core::array;
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 
 use crate::arch::x86_64::gdt::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
@@ -26,7 +26,6 @@ use crate::arch::x86_64::paging::X86_64Paging;
 use crate::arch::x86_64::{hlt, percpu};
 use crate::mm;
 use crate::mm::vm::PagingArch;
-use crate::utils::singleton::Singleton;
 
 /// PIT is configured to 200 Hz, i.e. one tick every 5 ms.
 pub const TICK_MS: u64 = 5;
@@ -42,6 +41,70 @@ const STACK_PAGES: usize = 4;
 
 /// `RFLAGS.IF`.
 const EFLAGS_IF: u64 = 0x200;
+
+/// Per-thread FPU/SSE state (design §7.3).  512 bytes is the `FXSAVE` image
+/// (x87 + MXCSR + XMM0..15); the kernel saves it eagerly on every context
+/// switch, because user programs are built for SSE2 while the kernel itself is
+/// soft-float and never touches the registers.
+#[repr(C, align(16))]
+pub struct FpuState([u8; 512]);
+
+impl FpuState {
+    const fn new() -> Self {
+        Self([0; 512])
+    }
+}
+
+/// `fxsave`/`fxrstor` require a 16-byte aligned 512-byte buffer; a misaligned
+/// operand raises `#GP(0)` (which is how this was found).
+#[inline]
+unsafe fn fxsave(area: *mut u8) {
+    debug_assert_eq!(area as usize % 16, 0, "fxsave needs a 16-byte aligned area");
+    core::arch::asm!("fxsave [{}]", in(reg) area, options(nostack, preserves_flags));
+}
+
+#[inline]
+unsafe fn fxrstor(area: *const u8) {
+    debug_assert_eq!(area as usize % 16, 0, "fxrstor needs a 16-byte aligned area");
+    core::arch::asm!("fxrstor [{}]", in(reg) area, options(nostack, preserves_flags));
+}
+
+/// A 512-byte FXSAVE image with a guaranteed 16-byte aligned start, even when
+/// it lives on the stack (the compiler only aligns locals to `align_of::<T>()`,
+/// which is not enough here because the requirement is hidden inside inline
+/// asm).
+struct AlignedFpu([u64; 66]);
+
+impl AlignedFpu {
+    fn new() -> Self {
+        Self([0; 66])
+    }
+
+    fn ptr(&mut self) -> *mut u8 {
+        ((self.0.as_mut_ptr() as usize + 15) & !15) as *mut u8
+    }
+}
+
+/// Give a brand-new thread a clean FPU state: x87 reset (`fninit`) and
+/// `MXCSR = 0x1F80` (all exceptions masked, round-to-nearest).
+///
+/// The current thread's live state is saved and restored around this, because
+/// creating a thread can happen inside a syscall of a user thread that may be
+/// using the registers.
+unsafe fn init_fpu(area: &mut FpuState) {
+    let mut saved = AlignedFpu::new();
+    let saved_ptr = saved.ptr();
+    fxsave(saved_ptr);
+    core::arch::asm!("fninit", options(nostack, preserves_flags));
+    static MXCSR_DEFAULT: u32 = 0x1F80;
+    core::arch::asm!(
+        "ldmxcsr [{}]",
+        in(reg) core::ptr::addr_of!(MXCSR_DEFAULT),
+        options(nostack, preserves_flags)
+    );
+    fxsave(area.0.as_mut_ptr());
+    fxrstor(saved_ptr);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
@@ -67,6 +130,8 @@ pub struct Thread {
     kind: ThreadKind,
     /// Page-table root to activate while this thread runs.
     root: usize,
+    /// FPU/SSE state, swapped by `schedule`.
+    fpu: FpuState,
     state: ThreadState,
     entry: Option<fn(usize)>,
     arg: usize,
@@ -90,6 +155,7 @@ impl Thread {
             name: "",
             kind: ThreadKind::Kernel,
             root: 0,
+            fpu: FpuState::new(),
             state: ThreadState::Ready,
             entry: None,
             arg: 0,
@@ -112,10 +178,14 @@ pub struct Scheduler {
     ticks: u64,
 }
 
-impl Default for Scheduler {
-    fn default() -> Self {
+impl Scheduler {
+    /// `const`-constructed straight into `.bss`.  A `Default` impl would build
+    /// a ~40 KiB temporary on the kernel stack (64 threads × FPU state), which
+    /// overflows a 16 KiB thread stack — and it is reached from the first
+    /// `current_pid()` call, long before `init()` runs.
+    pub const fn new() -> Self {
         Scheduler {
-            threads: array::from_fn(|_| Thread::new()),
+            threads: [const { Thread::new() }; MAX_THREADS],
             ready_head: NONE,
             ready_tail: NONE,
             current: MAIN_ID,
@@ -123,9 +193,7 @@ impl Default for Scheduler {
             ticks: 0,
         }
     }
-}
 
-impl Scheduler {
     fn enqueue(&mut self, idx: usize) {
         debug_assert!(self.threads[idx].next == NONE);
         if self.ready_head == NONE {
@@ -184,10 +252,15 @@ impl Scheduler {
     }
 }
 
-static SCHED: Singleton<Scheduler> = Singleton::UNINIT;
+#[repr(transparent)]
+struct SchedCell(UnsafeCell<Scheduler>);
+
+unsafe impl Sync for SchedCell {}
+
+static SCHED: SchedCell = SchedCell(UnsafeCell::new(Scheduler::new()));
 
 fn sched() -> &'static mut Scheduler {
-    SCHED.get_mut()
+    unsafe { &mut *SCHED.0.get() }
 }
 
 /// Build the initial frame for a brand-new kernel thread.  `iretq` pops `rsp`
@@ -280,10 +353,12 @@ pub fn init() {
             thread_entry_trampoline as *const () as usize,
         )
     };
+    unsafe { init_fpu(&mut idle_t.fpu) };
 
     s.current = MAIN_ID;
     s.idle = IDLE_ID;
 
+    unsafe { init_fpu(&mut s.threads[MAIN_ID].fpu) };
     let main_ptr = &mut s.threads[MAIN_ID] as *mut Thread as u64;
     let main_top = s.threads[MAIN_ID].kstack_top as u64;
     percpu::set_current_thread(main_ptr);
@@ -320,6 +395,7 @@ pub fn thread_create(name: &'static str, entry: fn(usize), arg: usize) -> Option
             t.stack_pages = STACK_PAGES;
             t.kstack_top = top;
             t.frame = unsafe { build_initial_frame(top, thread_entry_trampoline as *const () as usize) };
+            unsafe { init_fpu(&mut t.fpu) };
             s.enqueue(slot);
             Some(slot as u32)
         })()
@@ -359,6 +435,7 @@ pub fn thread_create_user(
             t.stack_pages = STACK_PAGES;
             t.kstack_top = top;
             t.frame = unsafe { build_user_frame(top, entry, user_stack_top, arg) };
+            unsafe { init_fpu(&mut t.fpu) };
             s.enqueue(slot);
             Some(slot as u32)
         })()
@@ -452,6 +529,10 @@ pub fn schedule(cur_frame: usize) -> usize {
     let cur_state = s.threads[cur].state;
     let cur_is_idle = s.threads[cur].is_idle;
 
+    // Eager per-thread FPU/SSE state (design §7.3): the kernel is soft-float,
+    // so nothing else would preserve it.
+    unsafe { fxsave(core::ptr::addr_of_mut!(s.threads[cur].fpu) as *mut u8) };
+
     match cur_state {
         ThreadState::Running => {
             s.threads[cur].frame = cur_frame;
@@ -492,6 +573,8 @@ pub fn schedule(cur_frame: usize) -> usize {
     if next_root != 0 && next_root != X86_64Paging::active_root() {
         X86_64Paging::switch_to(next_root);
     }
+
+    unsafe { fxrstor(core::ptr::addr_of!(s.threads[next].fpu) as *const u8) };
 
     s.current = next;
     let next_ptr = &mut s.threads[next] as *mut Thread as u64;

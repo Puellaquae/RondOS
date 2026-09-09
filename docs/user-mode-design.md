@@ -544,6 +544,7 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | **M0.5 ✅** | `thread/mod.rs`：内核线程、抢占式轮转、`schedule(frame)`、`sleep`/`exit`、`WaitQueue`、per-CPU 当前线程 + `TSS.RSP0` | 抢占、睡眠唤醒、线程退出自检通过 |
 | **M0.6 ✅** | `kernel.ld` 高半区、版本化 `BootInfo`（magic/size/version + 内存图 + fb + initrd + ACPI RSDP + cmdline）、multiboot 降级为临时生产者 | 内核只从 `BootInfo` 拿内存图；外部结构体带 magic 可被探测 |
 | **M0.7 ✅** | `boot/uefi/`：GOP 设模式 + 读 ESP 文件 + `ExitBootServices` + 建页表跳内核；内核第一条指令切自有栈、拿到 `BootInfo` 后切**内核自有 PML4** | QEMU+OVMF 起来并 `smoke: ALL PASS (10/10)`；真机待 P5 前的实机验证 |
+| **M0.9 ✅**（P2 补做） | `enable_sse()`（CR0.EM/TS 清、CR4.OSFXSR\|OSXMMEXCPT 置）+ 每线程 `fxsave`/`fxrstor`（`schedule` 里急切保存） | `spin` 持续把 `xmm0` 改成另一个值，`init` 睡 50 ms 后 `xmm0` 仍是自己的标记（`make test` 17/17） |
 | **M0.8 ✅** | 删除 `kernel/`（i686）、`loader/*.s`、`loader.bin`；构建只剩 x64 一条路径 | i686 已完整保存在 **`legacy-i686` 分支**，`make` 只构建 x86-64 |
 
 **M0.1..M0.8 已完成**（`kernel64/` + `boot/uefi/`，`make test` 用 OVMF 启动并输出 `smoke: ALL PASS (10/10)`）：
@@ -596,6 +597,9 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 * **`pending_reap` 只能记一个线程是不够的**：同一 tick 内两个线程可能先后死亡（一个 `sys_exit`、一个缺页被杀），后者会覆盖前者的待回收索引，前者的内核栈和整个进程就永远泄漏了。正解：每 tick 扫一遍线程表，回收所有 `Dying` 且非当前线程的 TCB；
 * **`StartupBlock` 必须放在 `rsp` *上方***：第一版把它写在 `rsp` 下面（栈的生长方向），用户程序一压栈就把 `caps` 数组覆盖成垃圾，表现为「内核明明授予了 root 句柄，`init` 却说没有」。栈顶往下的顺序是 `StartupBlock` → capability 数组 → `rsp`；
 * **`sys_wait` 可以在 syscall 里直接 `thread::sleep`**：`int 0x81` 从 ring0 再压一层帧、调用调度器，被唤醒后从嵌套帧返回、继续跑完 syscall 处理函数，再回到最外层帧 `iretq`。这样 P1 不需要 §6.3 的续体机制就能实现阻塞式等待（真正的续体留给 P2 的 channel recv）；
+* **`fxsave`/`fxrstor` 要求 16 字节对齐**：操作数没对齐是 `#GP(0)`，而编译器只按 `align_of::<T>()` 对齐局部变量——把要求藏在 inline asm 里，编译器看不见。正解：`#[repr(align(16))]` 的 `FpuState` 放进 `Thread`（数组基址天然 16 对齐），栈上的临时区用一个 528 字节的 `[u64; 66]` 手动向上取整，并在 `fxsave` 里 `debug_assert` 对齐；
+* **读一个固定 FPU 寄存器不能写成输入操作数**：`in("xmm0") 0` 会让编译器先往 xmm0 里搬 0，把要读的值冲掉。正解是把 xmm0 声明成输出（clobber）`out("xmm0") _`、在模板里直接读写 `xmm0`；
+* **`Scheduler` 也别用 `Default`**：`Thread` 里加了 512 字节 FPU 状态后，64 个线程的 `Default` 临时对象约 40 KiB，而 `current_pid()` 在 `thread::init()` 之前就可能触发它——直接爆掉 64 KiB 引导栈。和 `ProcessTable` 一样，改成 `const fn new()` 落进 `.bss`；
 * `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单

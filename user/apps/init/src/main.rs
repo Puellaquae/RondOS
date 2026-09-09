@@ -55,12 +55,22 @@ fn check_fault_child(root: Handle) -> i32 {
 }
 
 fn check_killed_child(root: Handle) -> i32 {
+    // Put a marker in xmm0; the child below hammers xmm0 with a different
+    // value, so getting ours back proves the kernel saves FPU state per thread.
+    const MARKER: u64 = 0x600d_f00d_1234_5678;
+    rondos_rt::set_xmm0(MARKER);
+
     let image = step!(20, open_file(root, b"/bin/spin"));
     let child = step!(21, spawn(image));
     let _ = close(image);
 
     // Let it run, then kill it: `sys_wait` must report Killed, not a timeout.
     sleep_ns(50_000_000);
+    let xmm = rondos_rt::xmm0();
+    if xmm != MARKER {
+        println!("init: xmm0 lost across switches: {:#x}", xmm);
+        return 25;
+    }
     step!(22, kill(child));
 
     let w = step!(23, wait(&[child], 5_000_000_000));
@@ -68,7 +78,7 @@ fn check_killed_child(root: Handle) -> i32 {
         println!("init: spin child ended with reason {}", w.reason);
         return 24;
     }
-    println!("init: child spin killed after 50 ms");
+    println!("init: child spin killed after 50 ms (xmm0 preserved)");
     let _ = close(child);
     0
 }

@@ -140,6 +140,36 @@ pub fn now_ns() -> u64 {
     unsafe { syscall(SyscallId::ClockGettime, 0, 0, 0, 0, 0, 0).value }
 }
 
+/// Write a marker into `xmm0` (FPU-state test helper).
+///
+/// `xmm0` is declared as an explicit *output* operand (a clobber) while the
+/// template writes it: that is the only way to pin a fixed FPU register without
+/// the compiler materialising an input into it first.
+pub fn set_xmm0(v: u64) {
+    unsafe {
+        core::arch::asm!(
+            "movq xmm0, {}",
+            in(reg) v,
+            out("xmm0") _,
+            options(nostack, nomem),
+        );
+    }
+}
+
+/// Read the marker back from `xmm0`.
+pub fn xmm0() -> u64 {
+    let out: u64;
+    unsafe {
+        core::arch::asm!(
+            "movq {}, xmm0",
+            out(reg) out,
+            out("xmm0") _,
+            options(nostack, nomem),
+        );
+    }
+    out
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{

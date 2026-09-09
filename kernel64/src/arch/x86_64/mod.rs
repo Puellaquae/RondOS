@@ -107,6 +107,24 @@ pub const CR4_PGE: u64 = 1 << 7;
 /// `CR4.OSFXSR` / `CR4.OSXMMEXCPT` — SSE enable (M0.3+, see design §7.3).
 pub const CR4_OSFXSR: u64 = 1 << 9;
 pub const CR4_OSXMMEXCPT: u64 = 1 << 10;
+/// `CR0.EM` — no FPU (must be clear) / `CR0.TS` — lazy FPU switch (must be clear
+/// while the kernel runs `fxsave`/`fxrstor` eagerly).
+pub const CR0_EM: u64 = 1 << 2;
+pub const CR0_TS: u64 = 1 << 3;
+
+/// Let user code use SSE2 and let the kernel use `fxsave`/`fxrstor`.
+///
+/// Firmware usually enables this already (OVMF does), but the kernel must not
+/// depend on the firmware for a feature it relies on: without `CR4.OSFXSR` an
+/// SSE instruction in ring3 raises `#UD`, and with `CR0.TS` set `fxsave`
+/// faults.  The kernel itself stays soft-float — only the save/restore of
+/// *user* state touches the FPU.
+pub fn enable_sse() {
+    let cr0 = cr0();
+    set_cr0((cr0 & !(CR0_EM | CR0_TS)) | CR0_WP);
+    let cr4 = cr4();
+    set_cr4(cr4 | CR4_OSFXSR | CR4_OSXMMEXCPT);
+}
 
 // ---------------------------------------------------------------- MSRs
 
