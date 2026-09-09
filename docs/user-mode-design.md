@@ -600,6 +600,9 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 * **`fxsave`/`fxrstor` 要求 16 字节对齐**：操作数没对齐是 `#GP(0)`，而编译器只按 `align_of::<T>()` 对齐局部变量——把要求藏在 inline asm 里，编译器看不见。正解：`#[repr(align(16))]` 的 `FpuState` 放进 `Thread`（数组基址天然 16 对齐），栈上的临时区用一个 528 字节的 `[u64; 66]` 手动向上取整，并在 `fxsave` 里 `debug_assert` 对齐；
 * **读一个固定 FPU 寄存器不能写成输入操作数**：`in("xmm0") 0` 会让编译器先往 xmm0 里搬 0，把要读的值冲掉。正解是把 xmm0 声明成输出（clobber）`out("xmm0") _`、在模板里直接读写 `xmm0`；
 * **`Scheduler` 也别用 `Default`**：`Thread` 里加了 512 字节 FPU 状态后，64 个线程的 `Default` 临时对象约 40 KiB，而 `current_pid()` 在 `thread::init()` 之前就可能触发它——直接爆掉 64 KiB 引导栈。和 `ProcessTable` 一样，改成 `const fn new()` 落进 `.bss`；
+* **回收线程前必须把它从就绪队列里摘掉**：`sys_kill` 会把一个还在队列里的线程标成 `Dying`，如果下一 tick 直接 `reclaim`（把 TCB 重置成 `frame = 0`），链表里就留下一个指向空槽的索引，`dequeue` 取出它、`isr_common` 执行 `mov rsp, rax` 得到 `rsp = 0`，下一条指令就是 `#DF`。`reclaim` 现在先 `unlink`；
+* **`MemObj` 里存的是物理地址**：页框分配器返回的是 physmap 视图（`0xFFFF_8000…`），直接当 `pa` 映射进用户页会指向不存在的物理地址（表现为用户一写就 `#PF`）。分配时 `virt_to_phys`，释放时 `phys_to_virt`；
+* **关闭句柄要释放对象引用**：`close` 只 bump generation 是不够的，`MemObj`/`ChanObj` 的引用计数不减就永远回收不了那一页；
 * `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单
@@ -616,9 +619,10 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 | `proc/mod.rs`（新 ✅ P0） | `Process`、`VmaList`、`HandleTable`、`ProcessTable`、`ExitStatus`、`copy_from_user/to_user` |
 | `exec.rs`（新 ✅ P1） | ELF64 装载（按段权限映射、W^X）、固定用户栈 + `StartupBlock`/capability、`spawn_path`/`spawn_entry`/`exit_status` |
 | `fs.rs`（新 ✅ P1） | boot tar 只读文件系统：`find`/`entries`/`read`/`read_all`（ustar，无 GNU 扩展） |
-| `proc/mod.rs` ✅ P1 | `ObjRef`（Dir/File/Device/Process）+ 句柄即权限；`sys_kill` 走 `thread::kill_pid` |
+| `proc/mod.rs` ✅ P1/P2 | `ObjRef`（Dir/File/Device/Memory/Chan/Process）+ 句柄即权限；共享 VMA 只解映射不释放帧；`sys_kill` 走 `thread::kill_pid` |
+| `obj.rs`（新 ✅ P2a） | `MemObj`（页帧 + 引用计数 + 设备物理页）与 `ChanObj`（有界消息队列）全局表 |
 | `user/lib/rondos-abi/`（新 ✅ P0） | 内核+用户共享的 ABI 定义（唯一真相源）：`SyscallId`/`Status`/`Handle`/`Rights`/`Info` + 布局断言 |
-| `syscall.rs`（新 ✅ P0/P1） | `int 0x80` 分发；已实现 `0x00/0x10/0x11/0x13/0x14/0x15/0x16` + `0x20/0x21/0x22/0x23` + `0x50/0x51/0x52/0x56`，其余返回 `Status::Unsupported` |
+| `syscall.rs`（新 ✅ P0/P1/P2a） | `int 0x80` 分发；已实现 `0x00/0x10/0x11/0x13/0x14/0x15/0x16`、`0x20/0x21/0x22/0x23`、`0x30/0x31/0x32/0x33`、`0x40/0x41/0x42`、`0x50/0x51/0x52/0x54/0x56`，其余返回 `Status::Unsupported` |
 | `bootinfo.rs`（新） | `BootInfo` 版本化结构与校验 |
 | `boot/uefi/`（新） | `x86_64-unknown-uefi` stub，用 **`uefi-rs`**（已定：依赖不多、体积可控，省掉手写协议表） |
 
@@ -911,7 +915,8 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | **M0 迁移** | x86-64 + UEFI 单路径、4 级分页 + NX、64 位 trap/GDT/TSS、SSE 使能 + 每线程 FXSAVE、UEFI stub + `BootInfo`、帧缓冲控制台；删除 NASM loader | QEMU+OVMF 与**一台真机**都能启动并打印自检；现有调度/内存自检全过 |
 | **P0 内核地基 ✅** | `proc/`（`Process`/VMA/`HandleTable`/`ExitStatus`）、每线程地址空间随调度切换、`rondos-abi` 共享 crate、`int 0x80` v1 分发（`sys_info`/`sys_exit`/`sys_thread_exit`/`sys_yield`/`sys_clock_gettime`/`sys_log`）、`kill_current` + `request_resched` | ✅ 内核构造用户进程，ring3 跑完 `sys_info`→`sys_log`→`sys_exit(0)`；另一个进程非法写只杀自己；帧全部回收（`make test` 16/16） |
 | **P1 装载与进程 API ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器、tarfs（boot.tar）、`StartupBlock` + capability、`sys_open/read/write/close/spawn/wait/proc_status/kill/sleep_ns`、`init` 派生并回收子进程 | ✅ `init` 从 tar 打开 `bin/crash` 并 spawn → `sys_wait` 拿到 `FAULT{14,0xdeadbeef}`；再 spawn `bin/spin` → `sleep` → `sys_kill` → wait 拿到 `KILLED`；全部回收，`make test` 17/17 |
-| **P2 内存与 IPC** | `sys_mem_map/share`、用户堆、`chan_*`、`sys_wait` 多 handle、文件 handle、tmpfs 层、最小 C 支持 | echo 程序经 channel 回显；`/bin/*` 可读；一个 C 写的 hello 也能跑；`make test` grep `PASS` |
+| **P2a 内存与 IPC ✅** | `sys_mem_map/unmap/share/map_phys`（引用计数的 `MemObj`）、`chan_create/send/recv`（有界消息队列）、`sys_stat`、`sys_spawn` 的 capability 委托 | ✅ `init` 映射共享内存并回读、创建 channel 并把一端委托给 `bin/echo`，`echo` 收到后原样送回；全部回收，`make test` 17/17 |
+| **P2b 文件与 C** | tmpfs 可写层、`sys_readdir`、channel 传递 handle、用户堆（`sys_mem_map` 之上的 allocator）、最小 C（`rondos.h` + crt0） | 待办 |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |
 | **P5 打磨** | AHCI、APIC/IOAPIC、xHCI HID 鼠标、demand paging/COW、`ET_DYN`+ASLR、`syscall` 快路径、FAT 盘上 FS、wasm 前端 | 老 ABI 程序在新内核上照跑；实机可持久化存盘、可用真鼠标 |

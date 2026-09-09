@@ -6,6 +6,7 @@ members = [
     "apps/init",
     "apps/crash",
     "apps/spin",
+    "apps/echo",
 ]
 
 [profile.dev]

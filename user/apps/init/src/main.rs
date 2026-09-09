@@ -8,8 +8,11 @@
 #![no_std]
 #![no_main]
 
-use rondos_abi::{exit_kind, wait_reason, Handle, ObjKind, StartupBlock};
-use rondos_rt::{close, kill, open_file, print, println, proc_status, sleep_ns, spawn, wait};
+use rondos_abi::{exit_kind, mem_flags, wait_reason, CapDesc, Handle, ObjKind, StartupBlock};
+use rondos_rt::{
+    chan_create, chan_recv, chan_send, close, kill, mem_map, open_file, print, println,
+    proc_status, sleep_ns, spawn, spawn_with_caps, wait,
+};
 
 /// Touch .data so the image carries a writable, non-executable segment: the
 /// loader must map it RW + NX while .text stays R + X.
@@ -83,6 +86,65 @@ fn check_killed_child(root: Handle) -> i32 {
     0
 }
 
+/// Channel round-trip: delegate one end to `bin/echo`, send, receive it back.
+fn check_echo_child(root: Handle) -> i32 {
+    let (a, b) = step!(30, chan_create());
+    let image = step!(31, open_file(root, b"/bin/echo"));
+    let child = step!(
+        32,
+        spawn_with_caps(
+            image,
+            &[CapDesc {
+                kind: ObjKind::Chan as u32,
+                _pad0: 0,
+                rights: rondos_abi::rights::READ | rondos_abi::rights::WRITE,
+                handle: b.0,
+            }]
+        )
+    );
+    let _ = close(image);
+    let _ = close(b);
+
+    let msg = b"ping through a channel";
+    step!(33, chan_send(a, msg));
+    let mut buf = [0u8; 64];
+    let n = step!(34, chan_recv(a, &mut buf));
+    if &buf[..n] != msg {
+        println!("init: channel echoed the wrong bytes");
+        return 35;
+    }
+    println!("init: channel echoed {} bytes", n);
+
+    let w = step!(36, wait(&[child], 5_000_000_000));
+    if w.reason != wait_reason::EXITED {
+        println!("init: echo child ended with reason {}", w.reason);
+        return 37;
+    }
+    let _ = close(a);
+    let _ = close(child);
+    0
+}
+
+/// Shared memory: map an object, write a pattern, read it back.
+fn check_shared_memory() -> i32 {
+    let (h, va) = step!(40, mem_map(4096, mem_flags::READ | mem_flags::WRITE));
+    if va == 0 {
+        println!("init: mem_map returned no address");
+        return 41;
+    }
+    let p = va as *mut u64;
+    unsafe {
+        p.write_volatile(0xfeed_face_cafe_1234);
+        if p.read_volatile() != 0xfeed_face_cafe_1234 {
+            println!("init: shared memory did not round-trip");
+            return 42;
+        }
+    }
+    println!("init: shared memory at {:#x} round-trips", va);
+    let _ = rondos_rt::mem_unmap(h);
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
     print!("init: hello from ring 3\n");
@@ -105,6 +167,14 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
         return rc;
     }
     let rc = check_killed_child(root);
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_shared_memory();
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_echo_child(root);
     if rc != 0 {
         return rc;
     }

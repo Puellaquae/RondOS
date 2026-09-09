@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo"
+version = "0.1.0"
+dependencies = [
+ "rondos-abi",
+ "rondos-rt",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [

@@ -218,7 +218,39 @@ impl Scheduler {
         Some(head)
     }
 
+    /// Remove `idx` from the ready list.  A thread can be killed while it sits
+    /// in the queue; reclaiming it without unlinking would leave a stale index
+    /// whose slot has been reset (frame = 0), and the next `dequeue` would
+    /// return it — `isr_common` would then load `rsp = 0`.
+    fn unlink(&mut self, idx: usize) {
+        if self.ready_head == NONE {
+            return;
+        }
+        if self.ready_head as usize == idx {
+            self.ready_head = self.threads[idx].next;
+            if self.ready_head == NONE {
+                self.ready_tail = NONE;
+            }
+            self.threads[idx].next = NONE;
+            return;
+        }
+        let mut prev = self.ready_head;
+        while prev != NONE {
+            let next = self.threads[prev as usize].next;
+            if next as usize == idx {
+                self.threads[prev as usize].next = self.threads[idx].next;
+                if self.ready_tail as usize == idx {
+                    self.ready_tail = prev;
+                }
+                self.threads[idx].next = NONE;
+                return;
+            }
+            prev = next;
+        }
+    }
+
     fn reclaim(&mut self, idx: usize) {
+        self.unlink(idx);
         let (stack, pages) = (self.threads[idx].stack, self.threads[idx].stack_pages);
         let kind = self.threads[idx].kind;
         // A dead user thread takes its process down with it: free the user
@@ -565,6 +597,7 @@ pub fn schedule(cur_frame: usize) -> usize {
     } else {
         s.threads[next].frame
     };
+    debug_assert!(next_frame != 0, "thread {} has no saved frame", next);
 
     // Address spaces follow the thread: a user thread runs on its process
     // root, a kernel thread on the kernel root (identical kernel half, so the

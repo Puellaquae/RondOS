@@ -35,6 +35,32 @@ const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
+/// Capabilities a parent can delegate in one `sys_spawn`.
+pub const MAX_EXTRA_CAPS: usize = 4;
+
+/// A capability to install in a new process, already resolved and rights-checked
+/// by the caller (`sys_spawn`).
+#[derive(Clone, Copy, Debug)]
+pub struct PendingCap {
+    pub kind: ObjKind,
+    pub id: u32,
+    /// Object length (memory objects) / 0.
+    pub len: u64,
+    /// Object flags (memory objects) / 0.
+    pub flags: u64,
+    pub rights: u64,
+}
+
+impl PendingCap {
+    pub const EMPTY: PendingCap = PendingCap {
+        kind: ObjKind::None,
+        id: 0,
+        len: 0,
+        flags: 0,
+        rights: 0,
+    };
+}
+
 /// A loaded image: where to start and where its last byte lives.
 #[derive(Debug, Clone, Copy)]
 pub struct Image {
@@ -63,6 +89,10 @@ fn u64_at(buf: &[u8], off: usize) -> Result<u64, Status> {
 
 fn as_bytes<T>(v: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
+}
+
+fn bytes_of<T>(v: &[T]) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) }
 }
 
 /// Load `elf` into `p`'s address space.  On failure the caller tears the
@@ -146,18 +176,73 @@ pub fn map_stack(p: &mut Process, image: &Image) -> Result<u64, Status> {
 ///
 /// The block carries the process's capabilities, which is how `init` learns
 /// the root directory handle — there is no global namespace to look it up in.
-fn write_startup(p: &mut Process, image: &Image, stack_top: u64) -> Result<(u64, u64), Status> {
+fn write_startup(
+    p: &mut Process,
+    image: &Image,
+    stack_top: u64,
+    extra: &[PendingCap],
+) -> Result<(u64, u64), Status> {
+    // The root directory capability is implicit; everything else is delegated
+    // by the parent and installed here.
+    let mut caps = [CapDesc::default(); 1 + MAX_EXTRA_CAPS];
     let root_dir = p
         .handles_mut()
         .insert(ObjRef::Dir { node: 0 }, rights::ALL)
         .ok_or(Status::OutOfMemory)?;
-
-    let caps = [CapDesc {
+    caps[0] = CapDesc {
         kind: ObjKind::Dir as u32,
         _pad0: 0,
         rights: rights::ALL,
         handle: root_dir.0,
-    }];
+    };
+    let mut n_caps = 1usize;
+
+    for c in extra.iter().take(MAX_EXTRA_CAPS) {
+        let obj = match c.kind {
+            ObjKind::Memory => {
+                if !crate::obj::mem().retain(c.id) {
+                    return Err(Status::BadHandle);
+                }
+                match p.map_memobj(c.id, c.flags) {
+                    Ok(va) => ObjRef::Memory {
+                        id: c.id,
+                        va,
+                        len: c.len,
+                    },
+                    Err(e) => {
+                        crate::obj::mem().release(c.id);
+                        return Err(e);
+                    }
+                }
+            }
+            ObjKind::Chan => {
+                if !crate::obj::chans().retain(c.id) {
+                    return Err(Status::BadHandle);
+                }
+                ObjRef::Chan { id: c.id }
+            }
+            _ => return Err(Status::Unsupported),
+        };
+        let handle = match p.handles_mut().insert(obj, c.rights) {
+            Some(h) => h,
+            None => {
+                match obj {
+                    ObjRef::Memory { id, .. } => crate::obj::mem().release(id),
+                    ObjRef::Chan { id } => crate::obj::chans().release(id),
+                    _ => {}
+                }
+                return Err(Status::OutOfMemory);
+            }
+        };
+        caps[n_caps] = CapDesc {
+            kind: c.kind as u32,
+            _pad0: 0,
+            rights: c.rights,
+            handle: handle.0,
+        };
+        n_caps += 1;
+    }
+
     // Layout, from the top of the stack downwards: StartupBlock, then the
     // capability array, then rsp.  Everything lives *above* rsp so the
     // program's own stack growth can never clobber it.
@@ -165,7 +250,7 @@ fn write_startup(p: &mut Process, image: &Image, stack_top: u64) -> Result<(u64,
     let caps_va = (block_va - size_of::<CapDesc>() as u64) & !0xf;
     let rsp = caps_va - 16;
 
-    p.write_user(caps_va, as_bytes(&caps))?;
+    p.write_user(caps_va, bytes_of(&caps[..n_caps]))?;
     let block = StartupBlock {
         hdr: StructHeader::new(size_of::<StartupBlock>() as u32),
         abi_version: ABI_VERSION,
@@ -177,7 +262,7 @@ fn write_startup(p: &mut Process, image: &Image, stack_top: u64) -> Result<(u64,
         envp: Slice::default(),
         caps: Slice {
             ptr: caps_va,
-            count: caps.len() as u64,
+            count: n_caps as u64,
         },
         window: Handle::INVALID,
         random_seed: crate::thread::ticks() ^ 0x9E37_79B9_7F4A_7C15,
@@ -190,6 +275,15 @@ fn write_startup(p: &mut Process, image: &Image, stack_top: u64) -> Result<(u64,
 /// Load `elf` into a fresh process and start its first thread.  `rdi` on entry
 /// points at the `StartupBlock`.
 pub fn spawn_bytes(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
+    spawn_bytes_with_caps(name, elf, &[])
+}
+
+/// As [`spawn_bytes`], additionally installing `caps` in the child.
+pub fn spawn_bytes_with_caps(
+    name: &'static str,
+    elf: &[u8],
+    extra: &[PendingCap],
+) -> Result<u32, Status> {
     let pid = crate::proc::table().create(0).ok_or(Status::OutOfMemory)?;
 
     let prepared = {
@@ -199,7 +293,7 @@ pub fn spawn_bytes(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
         (|| -> Result<(usize, Image, u64, u64), Status> {
             let image = load_elf(p, elf)?;
             let stack_top = map_stack(p, &image)?;
-            let (rsp, block) = write_startup(p, &image, stack_top)?;
+            let (rsp, block) = write_startup(p, &image, stack_top, extra)?;
             Ok((p.root(), image, rsp, block))
         })()
     };
@@ -240,6 +334,11 @@ pub fn spawn_bytes(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
 
 /// Read a tar entry into freshly allocated frames and spawn it.
 pub fn spawn_entry(entry: &Entry) -> Result<u32, Status> {
+    spawn_entry_with_caps(entry, &[])
+}
+
+/// As [`spawn_entry`], delegating `caps` to the child.
+pub fn spawn_entry_with_caps(entry: &Entry, caps: &[PendingCap]) -> Result<u32, Status> {
     let fs = TarFs::root().ok_or(Status::NotFound)?;
     let len = entry.len as usize;
     if len == 0 || len > 16 * 1024 * 1024 {
@@ -252,7 +351,11 @@ pub fn spawn_entry(entry: &Entry) -> Result<u32, Status> {
     let result = {
         let dst = unsafe { core::slice::from_raw_parts_mut(buf, len) };
         fs.read_all(entry, dst).and_then(|n| {
-            spawn_bytes(core::str::from_utf8(entry.name).unwrap_or("image"), &dst[..n])
+            spawn_bytes_with_caps(
+                core::str::from_utf8(entry.name).unwrap_or("image"),
+                &dst[..n],
+                caps,
+            )
         })
     };
     crate::mm::page_alloc().free_page(buf, pages);

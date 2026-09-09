@@ -17,13 +17,14 @@
 use core::mem::size_of;
 
 use crate::arch::x86_64::intr::{self, TrapFrame};
-use crate::exec;
+use crate::exec::{self, PendingCap};
 use crate::fs;
+use crate::obj;
 use crate::proc::{self, ExitStatus, ObjRef};
 use crate::thread;
 use rondos_abi::{
-    feature, open_flags, rights, wait_reason, Clock, Handle, Info, LogLevel, Status,
-    StructHeader, SyscallId, WaitResult, ABI_VERSION,
+    feature, mem_flags, open_flags, rights, wait_reason, CapDesc, Clock, Handle, Info, LogLevel,
+    ObjKind, Slice, Stat, Status, StructHeader, SyscallId, WaitResult, ABI_VERSION,
 };
 
 /// Largest `sys_log` payload accepted in one call (keeps the copy on-stack).
@@ -31,6 +32,13 @@ const MAX_LOG_LEN: usize = 512;
 
 /// `sys_wait` accepts at most this many handles in one call.
 const MAX_WAIT_HANDLES: usize = 16;
+
+/// `sys_spawn` accepts at most this many delegated capabilities.
+const MAX_SPAWN_CAPS: usize = 4;
+
+fn as_bytes_mut<T>(v: &mut T) -> &mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut(v as *mut T as *mut u8, size_of::<T>()) }
+}
 
 static LOGGED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -80,6 +88,14 @@ pub fn dispatch(f: &mut TrapFrame) {
         SyscallId::Wait => sys_wait(f),
         SyscallId::ProcStatus => sys_proc_status(f),
         SyscallId::Kill => sys_kill(f),
+        SyscallId::MemMap => sys_mem_map(f),
+        SyscallId::MemUnmap => sys_mem_unmap(f),
+        SyscallId::MemShare => sys_mem_share(f),
+        SyscallId::MemMapPhys => sys_mem_map_phys(f),
+        SyscallId::ChanCreate => sys_chan_create(f),
+        SyscallId::ChanSend => sys_chan_send(f),
+        SyscallId::ChanRecv => sys_chan_recv(f),
+        SyscallId::Stat => sys_stat(f),
         // Everything else is declared in the frozen v1 table but lands in P1+.
         _ => f.set_result(Status::Unsupported as u64, 0),
     }
@@ -327,9 +343,70 @@ fn sys_close(f: &mut TrapFrame) {
 /// program gets the root directory capability automatically.
 fn sys_spawn(f: &mut TrapFrame) {
     let h = Handle(f.rdi);
+    let argv_ptr = f.rsi;
+    let envp_ptr = f.rdx;
+    let caps_ptr = f.r10;
+    let _flags = f.r8;
+
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
+    // argv/envp arrive in P3 with the manifest work.
+    if argv_ptr != 0 || envp_ptr != 0 {
+        return err(f, Status::Unsupported);
+    }
+
+    // Resolve the capabilities to delegate, checking that the caller really
+    // holds them with at least the requested rights.
+    let mut pending = [PendingCap::EMPTY; MAX_SPAWN_CAPS];
+    let mut n_caps = 0usize;
+    if caps_ptr != 0 {
+        let mut slice = Slice::default();
+        if let Err(s) = p.copy_from_user(as_bytes_mut(&mut slice), caps_ptr) {
+            return err(f, s);
+        }
+        if slice.count as usize > MAX_SPAWN_CAPS {
+            return err(f, Status::InvalidArgument);
+        }
+        for i in 0..slice.count as usize {
+            let mut desc = CapDesc::default();
+            let at = slice.ptr + i as u64 * size_of::<CapDesc>() as u64;
+            if let Err(s) = p.copy_from_user(as_bytes_mut(&mut desc), at) {
+                return err(f, s);
+            }
+            let slot = match p.handles().resolve(Handle(desc.handle), rights::NONE) {
+                Ok(slot) => slot,
+                Err(s) => return err(f, s),
+            };
+            if !slot.allows(desc.rights) {
+                return err(f, Status::Permission);
+            }
+            match slot.obj {
+                ObjRef::Memory { id, len, .. } => {
+                    let flags = obj::mem().get(id).map(|o| o.flags).unwrap_or(0);
+                    pending[n_caps] = PendingCap {
+                        kind: ObjKind::Memory,
+                        id,
+                        len,
+                        flags,
+                        rights: desc.rights,
+                    };
+                }
+                ObjRef::Chan { id } => {
+                    pending[n_caps] = PendingCap {
+                        kind: ObjKind::Chan,
+                        id,
+                        len: 0,
+                        flags: 0,
+                        rights: desc.rights,
+                    };
+                }
+                _ => return err(f, Status::Unsupported),
+            }
+            n_caps += 1;
+        }
+    }
+
     let (off, len) = match p.handles().resolve(h, rights::READ) {
         Ok(slot) => match slot.obj {
             ObjRef::File { off, len, .. } => (off, len),
@@ -342,7 +419,7 @@ fn sys_spawn(f: &mut TrapFrame) {
         len,
         name: b"child",
     };
-    let pid = match exec::spawn_entry(&entry) {
+    let pid = match exec::spawn_entry_with_caps(&entry, &pending[..n_caps]) {
         Ok(pid) => pid,
         Err(s) => return err(f, s),
     };
@@ -475,6 +552,283 @@ fn sys_sleep_ns(f: &mut TrapFrame) {
         thread::yield_now();
     }
     ok(f, 0)
+}
+
+// --------------------------------------------------- P2: memory and channels
+
+fn mem_rights(flags: u64) -> u64 {
+    let mut r = rights::READ | rights::MAP;
+    if flags & mem_flags::WRITE != 0 {
+        r |= rights::WRITE;
+    }
+    if flags & mem_flags::SHARE != 0 {
+        r |= rights::SHARE;
+    }
+    r
+}
+
+/// `0x30 sys_mem_map(len, flags) -> Handle<Memory>`
+///
+/// Creates an anonymous memory object, maps it into the caller and returns the
+/// handle; `sys_stat` reports the mapping address.
+fn sys_mem_map(f: &mut TrapFrame) {
+    let len = f.rdi;
+    let flags = f.rsi;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let Some(id) = obj::mem().create(len, flags) else {
+        return err(f, Status::OutOfMemory);
+    };
+    let va = match p.map_memobj(id, flags) {
+        Ok(va) => va,
+        Err(s) => {
+            obj::mem().release(id);
+            return err(f, s);
+        }
+    };
+    match p
+        .handles_mut()
+        .insert(ObjRef::Memory { id, va, len }, mem_rights(flags))
+    {
+        Some(h) => ok(f, h.0),
+        None => {
+            let _ = p.unmap_memobj(va);
+            obj::mem().release(id);
+            err(f, Status::OutOfMemory)
+        }
+    }
+}
+
+/// `0x31 sys_mem_unmap(handle)`: unmap and close.
+fn sys_mem_unmap(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let va = match p.handles().resolve(h, rights::MAP) {
+        Ok(slot) => match slot.obj {
+            ObjRef::Memory { va, .. } => va,
+            _ => return err(f, Status::InvalidArgument),
+        },
+        Err(s) => return err(f, s),
+    };
+    let _ = p.unmap_memobj(va);
+    let _ = p.handles_mut().close(h);
+    ok(f, 0)
+}
+
+/// `0x32 sys_mem_share(handle, rights) -> Handle<Memory>`
+fn sys_mem_share(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
+    let want = f.rsi;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let (id, va, len, have) = match p.handles().resolve(h, rights::SHARE) {
+        Ok(slot) => match slot.obj {
+            ObjRef::Memory { id, va, len } => (id, va, len, slot.rights),
+            _ => return err(f, Status::InvalidArgument),
+        },
+        Err(s) => return err(f, s),
+    };
+    if want & !have != 0 {
+        return err(f, Status::Permission);
+    }
+    if !obj::mem().retain(id) {
+        return err(f, Status::BadHandle);
+    }
+    match p
+        .handles_mut()
+        .insert(ObjRef::Memory { id, va, len }, want)
+    {
+        Some(nh) => ok(f, nh.0),
+        None => {
+            obj::mem().release(id);
+            err(f, Status::OutOfMemory)
+        }
+    }
+}
+
+/// `0x33 sys_mem_map_phys(pa, len, cache) -> Handle<Memory>`
+///
+/// Maps device memory (the framebuffer) into the caller.  v1 has no
+/// `Cap::DEVICE_MAP` check yet — P3 will add it together with the display
+/// server.
+fn sys_mem_map_phys(f: &mut TrapFrame) {
+    let pa = f.rdi;
+    let len = f.rsi;
+    let cache = f.rdx;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let Some(id) = obj::mem().create_phys(pa, len, cache) else {
+        return err(f, Status::InvalidArgument);
+    };
+    let va = match p.map_memobj(id, cache) {
+        Ok(va) => va,
+        Err(s) => {
+            obj::mem().release(id);
+            return err(f, s);
+        }
+    };
+    match p
+        .handles_mut()
+        .insert(ObjRef::Memory { id, va, len }, rights::READ | rights::MAP)
+    {
+        Some(h) => ok(f, h.0),
+        None => {
+            let _ = p.unmap_memobj(va);
+            obj::mem().release(id);
+            err(f, Status::OutOfMemory)
+        }
+    }
+}
+
+/// `0x40 sys_chan_create(out: &mut [Handle; 2])`
+///
+/// The two handles are two ends of the same message queue: either end may send
+/// and receive.
+fn sys_chan_create(f: &mut TrapFrame) {
+    let out = f.rdi;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let Some(id) = obj::chans().create() else {
+        return err(f, Status::OutOfMemory);
+    };
+    let rw = rights::READ | rights::WRITE;
+    let a = p.handles_mut().insert(ObjRef::Chan { id }, rw);
+    let b = a.and_then(|_| {
+        obj::chans().retain(id);
+        p.handles_mut().insert(ObjRef::Chan { id }, rw)
+    });
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let pair = [a.0.to_ne_bytes(), b.0.to_ne_bytes()];
+            let bytes = unsafe { core::slice::from_raw_parts(pair.as_ptr() as *const u8, 16) };
+            match p.copy_to_user(out, bytes) {
+                Ok(()) => ok(f, 2),
+                Err(s) => {
+                    let _ = p.handles_mut().close(a);
+                    let _ = p.handles_mut().close(b);
+                    err(f, s)
+                }
+            }
+        }
+        _ => {
+            obj::chans().release(id);
+            err(f, Status::OutOfMemory)
+        }
+    }
+}
+
+/// `0x41 sys_chan_send(handle, buf, len) -> n`
+///
+/// Blocks (up to ~1 s) while the queue is full.
+fn sys_chan_send(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
+    let len = f.rdx as usize;
+    if len == 0 || len > obj::CHAN_MSG_BYTES {
+        return err(f, Status::InvalidArgument);
+    }
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let id = match p.handles().resolve(h, rights::WRITE) {
+        Ok(slot) => match slot.obj {
+            ObjRef::Chan { id } => id,
+            _ => return err(f, Status::InvalidArgument),
+        },
+        Err(s) => return err(f, s),
+    };
+    let mut buf = [0u8; obj::CHAN_MSG_BYTES];
+    if let Err(s) = p.copy_from_user(&mut buf[..len], f.rsi) {
+        return err(f, s);
+    }
+
+    let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
+    loop {
+        match obj::chans().send(id, &buf[..len]) {
+            Ok(n) => return ok(f, n as u64),
+            Err(Status::NotReady) if thread::ticks() < deadline => {
+                thread::sleep(thread::TICK_MS);
+            }
+            Err(s) => return err(f, s),
+        }
+    }
+}
+
+/// `0x42 sys_chan_recv(handle, buf, len) -> n`
+fn sys_chan_recv(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
+    let len = f.rdx as usize;
+    if len == 0 {
+        return err(f, Status::InvalidArgument);
+    }
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let id = match p.handles().resolve(h, rights::READ) {
+        Ok(slot) => match slot.obj {
+            ObjRef::Chan { id } => id,
+            _ => return err(f, Status::InvalidArgument),
+        },
+        Err(s) => return err(f, s),
+    };
+    let mut buf = [0u8; obj::CHAN_MSG_BYTES];
+    let want = len.min(obj::CHAN_MSG_BYTES);
+
+    let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
+    loop {
+        match obj::chans().recv(id, &mut buf[..want]) {
+            Ok(n) => {
+                if let Err(s) = p.copy_to_user(f.rsi, &buf[..n]) {
+                    return err(f, s);
+                }
+                return ok(f, n as u64);
+            }
+            Err(Status::NotReady) if thread::ticks() < deadline => {
+                thread::sleep(thread::TICK_MS);
+            }
+            Err(s) => return err(f, s),
+        }
+    }
+}
+
+/// `0x54 sys_stat(handle, &mut Stat)`
+fn sys_stat(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
+    let out_ptr = f.rsi;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let mut out = Stat {
+        hdr: StructHeader::new(size_of::<Stat>() as u32),
+        ..Default::default()
+    };
+    match p.handles().resolve(h, rights::NONE) {
+        Ok(slot) => {
+            out.kind = slot.kind() as u32;
+            out.rights = slot.rights;
+            match slot.obj {
+                ObjRef::File { len, .. } => out.len_bytes = len as u64,
+                ObjRef::Memory { va, len, .. } => {
+                    out.len_bytes = len;
+                    out.va = va;
+                }
+                _ => {}
+            }
+        }
+        Err(s) => return err(f, s),
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(&out as *const Stat as *const u8, size_of::<Stat>())
+    };
+    match p.copy_to_user(out_ptr, bytes) {
+        Ok(()) => ok(f, bytes.len() as u64),
+        Err(s) => err(f, s),
+    }
 }
 
 /// `0x15 sys_clock_gettime(kind) -> ns`

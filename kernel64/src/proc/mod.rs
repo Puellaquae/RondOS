@@ -30,6 +30,11 @@ pub const MAX_HANDLES: usize = 64;
 
 const NO_PID: u32 = u32::MAX;
 
+/// Where `sys_mem_map` places shared objects (design §3: 0x4000_0000_0000+).
+pub const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+/// Bump granularity so a few objects do not share a page table.
+const MMAP_STEP: u64 = 0x10_0000;
+
 // ---------------------------------------------------------------------- VMA
 
 /// One contiguous virtual range with uniform permissions.
@@ -38,11 +43,28 @@ pub struct Vma {
     pub start: u64,
     pub end: u64,
     pub flags: PageFlags,
+    /// True when the frames belong to a shared [`crate::obj::MemObj`]: the
+    /// process may unmap them but must not free them on exit.
+    pub shared: bool,
 }
 
 impl Vma {
     pub const fn new(start: u64, end: u64, flags: PageFlags) -> Self {
-        Self { start, end, flags }
+        Self {
+            start,
+            end,
+            flags,
+            shared: false,
+        }
+    }
+
+    pub const fn shared(start: u64, end: u64, flags: PageFlags) -> Self {
+        Self {
+            start,
+            end,
+            flags,
+            shared: true,
+        }
     }
 
     /// Page-aligned size in bytes.
@@ -153,6 +175,10 @@ pub enum ObjRef {
     File { off: u32, len: u32, pos: u64 },
     /// A device node: 0 = console (`sys_write` -> the kernel log).
     Device { node: u32 },
+    /// A shared memory object, mapped in this process at `va`.
+    Memory { id: u32, va: u64, len: u64 },
+    /// One end of a message channel.
+    Chan { id: u32 },
     /// Another process, addressable for `sys_wait`/`sys_proc_status`/`sys_kill`.
     Process { pid: u32 },
 }
@@ -164,6 +190,8 @@ impl ObjRef {
             ObjRef::Dir { .. } => ObjKind::Dir,
             ObjRef::File { .. } => ObjKind::File,
             ObjRef::Device { .. } => ObjKind::Device,
+            ObjRef::Memory { .. } => ObjKind::Memory,
+            ObjRef::Chan { .. } => ObjKind::Chan,
             ObjRef::Process { .. } => ObjKind::Process,
         }
     }
@@ -193,6 +221,16 @@ impl HandleSlot {
 
     pub fn kind(&self) -> ObjKind {
         self.obj.kind()
+    }
+}
+
+/// Drop the reference a handle held on a kernel object.  Must be called
+/// exactly once per *used* slot — both by `close` and by process teardown.
+fn release_obj(obj: ObjRef) {
+    match obj {
+        ObjRef::Memory { id, .. } => crate::obj::mem().release(id),
+        ObjRef::Chan { id } => crate::obj::chans().release(id),
+        _ => {}
     }
 }
 
@@ -264,6 +302,7 @@ impl HandleTable {
         if !slot.used || slot.generation != h.generation() {
             return Err(Status::BadHandle);
         }
+        release_obj(slot.obj);
         // Bump the generation so the closed handle value can never resolve.
         let gen = slot.generation.wrapping_add(1);
         *slot = HandleSlot {
@@ -279,6 +318,17 @@ impl HandleTable {
 
     pub fn clear(&mut self) {
         for s in self.slots.iter_mut() {
+            *s = HandleSlot::empty();
+        }
+    }
+
+    /// Drop every handle, releasing kernel-object references.  Called when a
+    /// process dies.
+    pub fn release_all(&mut self) {
+        for s in self.slots.iter_mut() {
+            if s.used {
+                release_obj(s.obj);
+            }
             *s = HandleSlot::empty();
         }
     }
@@ -311,6 +361,8 @@ pub struct Process {
     thread: u32,
     /// Frames returned to the allocator when the process died (diagnostics).
     freed_pages: u64,
+    /// Next free VA in the shared-memory window (design §3).
+    next_mmap_va: u64,
 }
 
 impl Process {
@@ -325,6 +377,7 @@ impl Process {
             status: ExitStatus::Running,
             thread: NO_PID,
             freed_pages: 0,
+            next_mmap_va: MMAP_BASE,
         }
     }
 
@@ -444,6 +497,54 @@ impl Process {
         }
     }
 
+    /// Map a shared memory object into this process at a fresh VA and record a
+    /// shared VMA (the frames are not owned here).
+    pub fn map_memobj(&mut self, id: u32, flags: u64) -> Result<u64, Status> {
+        let Some(obj) = crate::obj::mem().get(id) else {
+            return Err(Status::BadHandle);
+        };
+        let pages = obj.page_count();
+        let page_flags = PageFlags {
+            writable: (flags & rondos_abi::mem_flags::WRITE) != 0,
+            user: true,
+            executable: (flags & rondos_abi::mem_flags::EXEC) != 0,
+            cache: crate::mm::vm::CachePolicy::WriteBack,
+        };
+        let va = self.next_mmap_va;
+        for i in 0..pages {
+            let pa = obj.pages[i];
+            if X86_64Paging::map(self.root, va as usize + i * PAGE_SIZE, pa, page_flags).is_err() {
+                for j in 0..i {
+                    let _ = X86_64Paging::unmap(self.root, va as usize + j * PAGE_SIZE);
+                }
+                return Err(Status::OutOfMemory);
+            }
+        }
+        let end = va + (pages * PAGE_SIZE) as u64;
+        self.vmas.insert(Vma::shared(va, end, page_flags))?;
+        self.next_mmap_va += MMAP_STEP;
+        Ok(va)
+    }
+
+    /// Unmap a shared object: drop the VMA and remove its mappings, keeping the
+    /// frames (the object still owns them).
+    pub fn unmap_memobj(&mut self, va: u64) -> Result<(), Status> {
+        let Some(vma) = self.vmas.find(va) else {
+            return Err(Status::BadAddress);
+        };
+        if !vma.shared {
+            return Err(Status::InvalidArgument);
+        }
+        let end = vma.end;
+        let _ = self.vmas.remove(va);
+        let mut cur = va;
+        while cur < end {
+            let _ = X86_64Paging::unmap(self.root, cur as usize);
+            cur += PAGE_SIZE as u64;
+        }
+        Ok(())
+    }
+
     pub fn copy_from_user(&self, dst: &mut [u8], src_va: u64) -> Result<(), Status> {
         self.vmas.check(src_va, dst.len() as u64, false)?;
         unsafe {
@@ -470,19 +571,24 @@ impl Process {
     }
 
     fn teardown(&mut self) {
+        // Handles go first: releasing a memory object may free its frames, and
+        // those must not be double-freed by the VMA walk below.
+        self.handles.release_all();
+
         for vma in self.vmas.iter() {
-            let (start, end) = (vma.start, vma.end);
+            let (start, end, shared) = (vma.start, vma.end, vma.shared);
             let mut va = start;
             while va < end {
                 if let Ok(pa) = X86_64Paging::unmap(self.root, va as usize) {
-                    page_alloc().free_page(phys_to_virt(pa) as *mut u8, 1);
-                    self.freed_pages += 1;
+                    if !shared {
+                        page_alloc().free_page(phys_to_virt(pa) as *mut u8, 1);
+                        self.freed_pages += 1;
+                    }
                 }
                 va += PAGE_SIZE as u64;
             }
         }
         destroy_address_space(self.root);
-        self.handles.clear();
         self.root = 0;
     }
 }

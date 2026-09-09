@@ -129,6 +129,96 @@ pub fn kill(handle: Handle) -> Result<(), Status> {
     abi::kill(handle).status.is_ok().then_some(()).ok_or(Status::Broken)
 }
 
+// ------------------------------------------------------- P2: memory, channels
+
+/// Create and map an anonymous memory object; returns `(handle, va)`.
+pub fn mem_map(len_bytes: u64, flags: u64) -> Result<(Handle, u64), Status> {
+    let r = abi::mem_map(len_bytes, flags);
+    if !r.status.is_ok() {
+        return Err(r.status);
+    }
+    let handle = Handle(r.value);
+    let st = stat(handle)?;
+    Ok((handle, st.va))
+}
+
+pub fn mem_unmap(handle: Handle) -> Result<(), Status> {
+    abi::mem_unmap(handle).status.is_ok().then_some(()).ok_or(Status::Broken)
+}
+
+pub fn mem_share(handle: Handle, rights: u64) -> Result<Handle, Status> {
+    let r = abi::mem_share(handle, rights);
+    if r.status.is_ok() {
+        Ok(Handle(r.value))
+    } else {
+        Err(r.status)
+    }
+}
+
+pub fn mem_map_phys(pa: u64, len_bytes: u64, cache: u64) -> Result<(Handle, u64), Status> {
+    let r = abi::mem_map_phys(pa, len_bytes, cache);
+    if !r.status.is_ok() {
+        return Err(r.status);
+    }
+    let handle = Handle(r.value);
+    let st = stat(handle)?;
+    Ok((handle, st.va))
+}
+
+pub fn stat(handle: Handle) -> Result<abi::Stat, Status> {
+    let mut out = abi::Stat::default();
+    let r = abi::stat(handle, &mut out);
+    if r.status.is_ok() {
+        Ok(out)
+    } else {
+        Err(r.status)
+    }
+}
+
+/// Create a channel pair `(a, b)`; both ends can send and receive.
+pub fn chan_create() -> Result<(Handle, Handle), Status> {
+    let mut pair = [Handle::INVALID; 2];
+    let r = abi::chan_create(&mut pair);
+    if r.status.is_ok() {
+        Ok((pair[0], pair[1]))
+    } else {
+        Err(r.status)
+    }
+}
+
+pub fn chan_send(handle: Handle, buf: &[u8]) -> Result<usize, Status> {
+    let r = abi::chan_send(handle, buf);
+    if r.status.is_ok() {
+        Ok(r.value as usize)
+    } else {
+        Err(r.status)
+    }
+}
+
+pub fn chan_recv(handle: Handle, buf: &mut [u8]) -> Result<usize, Status> {
+    let r = abi::chan_recv(handle, buf);
+    if r.status.is_ok() {
+        Ok(r.value as usize)
+    } else {
+        Err(r.status)
+    }
+}
+
+/// `sys_spawn` with delegated capabilities.
+pub fn spawn_with_caps(image: Handle, caps: &[abi::CapDesc]) -> Result<Handle, Status> {
+    let r = abi::spawn_with_caps(image, caps);
+    if r.status.is_ok() {
+        Ok(Handle(r.value))
+    } else {
+        Err(r.status)
+    }
+}
+
+/// The first capability of `kind` in the `StartupBlock`.
+pub fn cap(kind: abi::ObjKind) -> Option<Handle> {
+    startup().and_then(|b| b.cap(kind)).map(|c| Handle(c.handle))
+}
+
 pub fn yield_now() {
     unsafe {
         syscall(SyscallId::Yield, 0, 0, 0, 0, 0, 0);

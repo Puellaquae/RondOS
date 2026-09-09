@@ -22,6 +22,7 @@ mod exec;
 mod fs;
 mod io;
 mod mm;
+mod obj;
 mod proc;
 mod syscall;
 mod thread;

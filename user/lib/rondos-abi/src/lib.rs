@@ -323,7 +323,7 @@ pub struct Slice {
 
 /// One capability handed to a new process at startup.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CapDesc {
     pub kind: u32,
     pub _pad0: u32,
@@ -426,6 +426,31 @@ pub mod wait_reason {
     pub const KILLED: u32 = 3;
 }
 
+/// Flags for `sys_mem_map` (and the permissions of the resulting mapping).
+pub mod mem_flags {
+    pub const READ: u64 = 1 << 0;
+    pub const WRITE: u64 = 1 << 1;
+    pub const EXEC: u64 = 1 << 2;
+    /// Shareable with other processes.
+    pub const SHARE: u64 = 1 << 3;
+    pub const RW: u64 = READ | WRITE;
+}
+
+/// `sys_stat` output.  `va` is where the handle is mapped in *this* process
+/// (memory objects), 0 otherwise.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stat {
+    pub hdr: StructHeader,
+    /// [`ObjKind`] value.
+    pub kind: u32,
+    pub _pad0: u32,
+    pub len_bytes: u64,
+    pub va: u64,
+    pub rights: u64,
+    pub _reserved: [u64; 2],
+}
+
 /// Open flags for `sys_open`.
 pub mod open_flags {
     pub const READ: u64 = 1 << 0;
@@ -461,6 +486,8 @@ const _: () = {
     assert!(core::mem::offset_of!(StartupBlock, caps) == 72);
     assert!(core::mem::size_of::<ExitStatus>() == 56);
     assert!(core::mem::offset_of!(ExitStatus, rip) == 24);
+    assert!(core::mem::size_of::<Stat>() == 56);
+    assert!(core::mem::offset_of!(Stat, va) == 24);
 };
 
 // --------------------------------------------------------------- user stubs
@@ -597,10 +624,34 @@ pub fn close(handle: Handle) -> SyscallResult {
     unsafe { syscall(SyscallId::Close, handle.0, 0, 0, 0, 0, 0) }
 }
 
-/// `0x20 sys_spawn(image) -> Handle<Process>` (argv/envp/caps are P2).
+/// `0x20 sys_spawn(image) -> Handle<Process>` (no extra capabilities).
 #[cfg(feature = "user")]
 pub fn spawn(image: Handle) -> SyscallResult {
     unsafe { syscall(SyscallId::Spawn, image.0, 0, 0, 0, 0, 0) }
+}
+
+/// `0x20 sys_spawn(image, argv, envp, caps, flags) -> Handle<Process>`.
+///
+/// `argv`/`envp` must be empty slices in v1; `caps` is a `Slice<CapDesc>`
+/// naming capabilities of the *caller* to delegate to the child.
+#[cfg(feature = "user")]
+pub fn spawn_with_caps(image: Handle, caps: &[CapDesc]) -> SyscallResult {
+    let slice = Slice {
+        ptr: caps.as_ptr() as u64,
+        count: caps.len() as u64,
+    };
+    unsafe {
+        // rdi=image, rsi=argv, rdx=envp, r10=caps, r8=flags
+        syscall(
+            SyscallId::Spawn,
+            image.0,
+            0,
+            0,
+            core::ptr::addr_of!(slice) as u64,
+            0,
+            0,
+        )
+    }
 }
 
 /// `0x21 sys_wait(handles, timeout_ns) -> index | (reason << 32)`
@@ -639,4 +690,82 @@ pub fn proc_status(handle: Handle, out: &mut ExitStatus) -> SyscallResult {
 #[cfg(feature = "user")]
 pub fn kill(handle: Handle) -> SyscallResult {
     unsafe { syscall(SyscallId::Kill, handle.0, 0, 0, 0, 0, 0) }
+}
+
+/// `0x30 sys_mem_map(len, flags) -> Handle<Memory>`
+#[cfg(feature = "user")]
+pub fn mem_map(len_bytes: u64, flags: u64) -> SyscallResult {
+    unsafe { syscall(SyscallId::MemMap, len_bytes, flags, 0, 0, 0, 0) }
+}
+
+/// `0x31 sys_mem_unmap(handle)`
+#[cfg(feature = "user")]
+pub fn mem_unmap(handle: Handle) -> SyscallResult {
+    unsafe { syscall(SyscallId::MemUnmap, handle.0, 0, 0, 0, 0, 0) }
+}
+
+/// `0x32 sys_mem_share(handle, rights) -> Handle<Memory>`
+#[cfg(feature = "user")]
+pub fn mem_share(handle: Handle, rights: u64) -> SyscallResult {
+    unsafe { syscall(SyscallId::MemShare, handle.0, rights, 0, 0, 0, 0) }
+}
+
+/// `0x33 sys_mem_map_phys(pa, len, cache) -> Handle<Memory>` (needs `DEVICE_MAP`)
+#[cfg(feature = "user")]
+pub fn mem_map_phys(pa: u64, len_bytes: u64, cache: u64) -> SyscallResult {
+    unsafe { syscall(SyscallId::MemMapPhys, pa, len_bytes, cache, 0, 0, 0) }
+}
+
+/// `0x40 sys_chan_create(out: &mut [Handle; 2])`
+#[cfg(feature = "user")]
+pub fn chan_create(out: &mut [Handle; 2]) -> SyscallResult {
+    unsafe { syscall(SyscallId::ChanCreate, out.as_mut_ptr() as u64, 0, 0, 0, 0, 0) }
+}
+
+/// `0x41 sys_chan_send(handle, buf, len) -> n`
+#[cfg(feature = "user")]
+pub fn chan_send(handle: Handle, buf: &[u8]) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::ChanSend,
+            handle.0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x42 sys_chan_recv(handle, buf, len) -> n`
+#[cfg(feature = "user")]
+pub fn chan_recv(handle: Handle, buf: &mut [u8]) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::ChanRecv,
+            handle.0,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x54 sys_stat(handle, &mut Stat)`
+#[cfg(feature = "user")]
+pub fn stat(handle: Handle, out: &mut Stat) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Stat,
+            handle.0,
+            out as *mut Stat as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
 }
