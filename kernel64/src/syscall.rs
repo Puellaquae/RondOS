@@ -404,11 +404,21 @@ fn sys_write(f: &mut TrapFrame) {
 }
 
 /// `0x56 sys_close(handle)`
+///
+/// Closing a memory handle also drops its mapping: the handle *is* the
+/// capability, so revoking it must revoke access.  (Frames survive as long as
+/// the object has another reference.)
 fn sys_close(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
-    match p.handles_mut().close(Handle(f.rdi)) {
+    if let Ok(slot) = p.handles().resolve(h, rights::NONE) {
+        if let ObjRef::Memory { va, .. } = slot.obj {
+            let _ = p.unmap_memobj(va);
+        }
+    }
+    match p.handles_mut().close(h) {
         Ok(()) => ok(f, 0),
         Err(s) => err(f, s),
     }
@@ -496,7 +506,8 @@ fn sys_spawn(f: &mut TrapFrame) {
         len,
         name: b"child",
     };
-    let pid = match exec::spawn_entry_with_caps(&entry, &pending[..n_caps]) {
+    let parent = p.pid();
+    let pid = match exec::spawn_entry_with_caps(&entry, &pending[..n_caps], parent) {
         Ok(pid) => pid,
         Err(s) => return err(f, s),
     };
@@ -657,7 +668,8 @@ fn sys_mem_map(f: &mut TrapFrame) {
     let Some(id) = obj::mem().create(len, flags) else {
         return err(f, Status::OutOfMemory);
     };
-    let va = match p.map_memobj(id, flags) {
+    let r = mem_rights(flags);
+    let va = match p.map_memobj(id, r, 0) {
         Ok(va) => va,
         Err(s) => {
             obj::mem().release(id);
@@ -666,7 +678,7 @@ fn sys_mem_map(f: &mut TrapFrame) {
     };
     match p
         .handles_mut()
-        .insert(ObjRef::Memory { id, va, len }, mem_rights(flags))
+        .insert(ObjRef::Memory { id, va, len }, r)
     {
         Some(h) => ok(f, h.0),
         None => {
@@ -739,10 +751,15 @@ fn sys_mem_map_phys(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
+    // Device memory is a privileged capability (design §6.5): only a process
+    // holding a device handle with MAP may reach physical memory.
+    if !p.has_device_map() {
+        return err(f, Status::Permission);
+    }
     let Some(id) = obj::mem().create_phys(pa, len, cache) else {
         return err(f, Status::InvalidArgument);
     };
-    let va = match p.map_memobj(id, cache) {
+    let va = match p.map_memobj(id, rights::READ | rights::MAP, cache as u32) {
         Ok(va) => va,
         Err(s) => {
             obj::mem().release(id);

@@ -20,6 +20,7 @@
 use core::mem::size_of;
 
 use crate::fs::{Entry, TarFs};
+use crate::arch::x86_64::paging::valid_user_range;
 use crate::mm::vm::{PageFlags, PAGE_USER_RW, PAGE_USER_RX};
 use crate::mm::PAGE_SIZE;
 use crate::proc::{ObjRef, Process};
@@ -108,12 +109,21 @@ pub fn load_elf(p: &mut Process, elf: &[u8]) -> Result<Image, Status> {
     let phoff = u64_at(elf, 32)? as usize;
     let phentsize = u16_at(elf, 54)? as usize;
     let phnum = u16_at(elf, 56)? as usize;
-    if phentsize < 56 {
+    if phentsize < 56 || phnum == 0 || phnum > 64 {
+        return Err(Status::InvalidArgument);
+    }
+    // Program header table must lie inside the file (checked arithmetic: a
+    // crafted e_phoff/e_phnum must not wrap into reading arbitrary memory).
+    let table_end = phoff
+        .checked_add(phnum.checked_mul(phentsize).ok_or(Status::InvalidArgument)?)
+        .ok_or(Status::InvalidArgument)?;
+    if table_end > elf.len() {
         return Err(Status::InvalidArgument);
     }
 
     let mut end = 0u64;
     let mut segments = 0u32;
+    let mut entry_in_exec = false;
     for i in 0..phnum {
         let ph = phoff + i * phentsize;
         if u32_at(elf, ph)? != PT_LOAD {
@@ -122,6 +132,7 @@ pub fn load_elf(p: &mut Process, elf: &[u8]) -> Result<Image, Status> {
         let flags = u32_at(elf, ph + 4)?;
         let offset = u64_at(elf, ph + 8)? as usize;
         let vaddr = u64_at(elf, ph + 16)?;
+        let align = u64_at(elf, ph + 48)?;
         let filesz = u64_at(elf, ph + 32)? as usize;
         let memsz = u64_at(elf, ph + 40)? as usize;
 
@@ -130,7 +141,12 @@ pub fn load_elf(p: &mut Process, elf: &[u8]) -> Result<Image, Status> {
         if memsz == 0 {
             continue;
         }
-        if vaddr % PAGE_SIZE as u64 != 0 {
+        if vaddr % PAGE_SIZE as u64 != 0 || (align != 0 && align < PAGE_SIZE as u64) {
+            return Err(Status::InvalidArgument);
+        }
+        // The security boundary: a user process's kernel half is *shared* with
+        // the kernel's own page tables, so an ELF must never name a VA there.
+        if !valid_user_range(vaddr as usize, memsz) {
             return Err(Status::InvalidArgument);
         }
         if offset.checked_add(filesz).map_or(true, |e| e > elf.len()) || filesz > memsz {
@@ -143,8 +159,9 @@ pub fn load_elf(p: &mut Process, elf: &[u8]) -> Result<Image, Status> {
             }
             PAGE_USER_RX
         } else {
+            // Honour PF_W: read-only data stays read-only (doc §5.1).
             PageFlags {
-                writable: true,
+                writable: (flags & PF_W) != 0,
                 ..PAGE_USER_RW
             }
         };
@@ -153,11 +170,16 @@ pub fn load_elf(p: &mut Process, elf: &[u8]) -> Result<Image, Status> {
         if filesz > 0 {
             p.write_user(vaddr, &elf[offset..offset + filesz])?;
         }
+        if (flags & PF_X) != 0 && entry >= vaddr && entry < vaddr + memsz as u64 {
+            entry_in_exec = true;
+        }
         end = end.max(vaddr + memsz as u64);
         segments += 1;
     }
 
-    if segments == 0 || entry == 0 {
+    // The entry point must be inside an executable segment: jumping anywhere
+    // else would let a crafted image start execution at data.
+    if segments == 0 || entry == 0 || !entry_in_exec {
         return Err(Status::InvalidArgument);
     }
     Ok(Image {
@@ -172,6 +194,9 @@ pub fn map_stack(p: &mut Process, image: &Image) -> Result<u64, Status> {
     const STACK_PAGES: u64 = 2;
     let base = (image.end + 0xffff) & !0xffff; // 64 KiB above the image
     let len = STACK_PAGES * PAGE_SIZE as u64;
+    if !valid_user_range(base as usize, len as usize) {
+        return Err(Status::InvalidArgument);
+    }
     p.map_anon(base, len, PAGE_USER_RW)?;
     Ok(base + len)
 }
@@ -208,7 +233,7 @@ fn write_startup(
                 if !crate::obj::mem().retain(c.id) {
                     return Err(Status::BadHandle);
                 }
-                match p.map_memobj(c.id, c.flags) {
+                match p.map_memobj(c.id, c.rights, 0) {
                     Ok(va) => ObjRef::Memory {
                         id: c.id,
                         va,
@@ -231,6 +256,10 @@ fn write_startup(
         let handle = match p.handles_mut().insert(obj, c.rights) {
             Some(h) => h,
             None => {
+                // Unmap first: the frames must not be freed while mapped.
+                if let ObjRef::Memory { va, .. } = obj {
+                    let _ = p.unmap_memobj(va);
+                }
                 match obj {
                     ObjRef::Memory { id, .. } => crate::obj::mem().release(id),
                     ObjRef::Chan { id } => crate::obj::chans().release(id),
@@ -248,11 +277,30 @@ fn write_startup(
         n_caps += 1;
     }
 
-    // Layout, from the top of the stack downwards: StartupBlock, then the
-    // capability array, then rsp.  Everything lives *above* rsp so the
-    // program's own stack growth can never clobber it.
+    // The kernel is the root of trust: `init` (parent 0) additionally gets a
+    // device capability so it can map the framebuffer; children must be given
+    // one explicitly.
+    if p.parent() == 0 {
+        if let Some(dev) = p
+            .handles_mut()
+            .insert(ObjRef::Device { node: 0 }, rights::MAP)
+        {
+            caps[n_caps] = CapDesc {
+                kind: ObjKind::Device as u32,
+                _pad0: 0,
+                rights: rights::MAP,
+                handle: dev.0,
+            };
+            n_caps += 1;
+        }
+    }
+
+    // Layout from the top of the stack downwards: StartupBlock, then the
+    // capability array, then rsp.  The array is placed *below* the whole block
+    // (block size + array size), otherwise a 2-capability array would overlap
+    // the block and the block write would corrupt caps[1].
     let block_va = (stack_top - size_of::<StartupBlock>() as u64) & !0xf;
-    let caps_va = (block_va - size_of::<CapDesc>() as u64) & !0xf;
+    let caps_va = (block_va - (n_caps as u64) * size_of::<CapDesc>() as u64) & !0xf;
     let rsp = caps_va - 16;
 
     p.write_user(caps_va, bytes_of(&caps[..n_caps]))?;
@@ -279,8 +327,8 @@ fn write_startup(
 
 /// Load `elf` into a fresh process and start its first thread.  `rdi` on entry
 /// points at the `StartupBlock`.
-pub fn spawn_bytes(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
-    spawn_bytes_with_caps(name, elf, &[])
+pub fn spawn_bytes(name: &'static str, elf: &[u8], parent: u32) -> Result<u32, Status> {
+    spawn_bytes_with_caps(name, elf, &[], parent)
 }
 
 /// As [`spawn_bytes`], additionally installing `caps` in the child.
@@ -288,8 +336,9 @@ pub fn spawn_bytes_with_caps(
     name: &'static str,
     elf: &[u8],
     extra: &[PendingCap],
+    parent: u32,
 ) -> Result<u32, Status> {
-    let pid = crate::proc::table().create(0).ok_or(Status::OutOfMemory)?;
+    let pid = crate::proc::table().create(parent).ok_or(Status::OutOfMemory)?;
 
     let prepared = {
         let Some(p) = crate::proc::table().get(pid) else {
@@ -338,12 +387,16 @@ pub fn spawn_bytes_with_caps(
 }
 
 /// Read a tar entry into freshly allocated frames and spawn it.
-pub fn spawn_entry(entry: &Entry) -> Result<u32, Status> {
-    spawn_entry_with_caps(entry, &[])
+pub fn spawn_entry(entry: &Entry, parent: u32) -> Result<u32, Status> {
+    spawn_entry_with_caps(entry, &[], parent)
 }
 
 /// As [`spawn_entry`], delegating `caps` to the child.
-pub fn spawn_entry_with_caps(entry: &Entry, caps: &[PendingCap]) -> Result<u32, Status> {
+pub fn spawn_entry_with_caps(
+    entry: &Entry,
+    caps: &[PendingCap],
+    parent: u32,
+) -> Result<u32, Status> {
     let fs = TarFs::root().ok_or(Status::NotFound)?;
     let len = entry.len as usize;
     if len == 0 || len > 16 * 1024 * 1024 {
@@ -360,6 +413,7 @@ pub fn spawn_entry_with_caps(entry: &Entry, caps: &[PendingCap]) -> Result<u32, 
                 core::str::from_utf8(entry.name).unwrap_or("image"),
                 &dst[..n],
                 caps,
+                parent,
             )
         })
     };
@@ -371,7 +425,7 @@ pub fn spawn_entry_with_caps(entry: &Entry, caps: &[PendingCap]) -> Result<u32, 
 pub fn spawn_path(path: &[u8]) -> Result<u32, Status> {
     let fs = TarFs::root().ok_or(Status::NotFound)?;
     let entry = fs.find(path).ok_or(Status::NotFound)?;
-    spawn_entry(&entry)
+    spawn_entry(&entry, 0)
 }
 
 /// The `ExitStatus` of `pid` as an ABI struct (for `sys_proc_status`).

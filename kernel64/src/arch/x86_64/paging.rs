@@ -35,6 +35,19 @@ use crate::mm::vm::{CachePolicy, MapError, PageFlags, PagingArch, PAGE_SIZE};
 pub const PHYS_MAP_BASE: usize = 0xFFFF_8000_0000_0000;
 /// Base the kernel image is linked at (`VA = KERNEL_VIRT_BASE + PA`).
 pub const KERNEL_VIRT_BASE: usize = 0xFFFF_FFFF_8000_0000;
+/// First VA of the kernel half: everything below belongs to user space.
+pub const USER_VA_LIMIT: usize = 0x0000_8000_0000_0000;
+
+/// True when `[va, va+len)` is a legal user-space range.
+///
+/// This is a **security boundary**, not a sanity check: a process's PML4 kernel
+/// half is *shared* with the kernel root, so mapping a user page at a kernel VA
+/// would rewrite the kernel's own page tables (and vice versa).  Every path
+/// that takes a VA from user-controlled input (ELF `p_vaddr`, `mmap` cursors,
+/// stack placement) must go through this.
+pub fn valid_user_range(va: usize, len: usize) -> bool {
+    len != 0 && va < USER_VA_LIMIT && va.checked_add(len).is_some_and(|end| end <= USER_VA_LIMIT)
+}
 /// How much RAM the boot trampoline mapped in the physmap (4 x 1 GiB pages).
 pub const PHYS_MAP_LIMIT: usize = 0x1_0000_0000;
 

@@ -32,8 +32,8 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arch::x86_64::intr::TrapFrame;
 use arch::x86_64::paging::{
-    create_kernel_address_space, destroy_address_space, phys_to_virt, virt_to_phys, X86_64Paging,
-    KERNEL_VIRT_BASE, PHYS_MAP_BASE,
+    self, create_kernel_address_space, destroy_address_space, phys_to_virt, virt_to_phys,
+    X86_64Paging, KERNEL_VIRT_BASE, PHYS_MAP_BASE,
 };
 use arch::x86_64::{cpuid, gdt, halt_loop, has_nx, intr, percpu, pic};
 use proc::ExitStatus;
@@ -130,6 +130,10 @@ extern "C" fn kmain(boot: u64) -> ! {
 
     test_physmap();
     test_huge_split();
+    test_user_va_guard();
+    test_elf_reject();
+    test_allocator_bounds();
+    test_memobj_refs();
     test_address_space();
     test_wx();
     test_device_map();
@@ -758,6 +762,166 @@ fn test_physmap() -> bool {
         }
     }
     report("physmap", ok);
+    ok
+}
+
+/// A user-supplied VA in the kernel half must be refused: the kernel half of a
+/// process root is shared with the kernel's own tables, so mapping there would
+/// rewrite kernel page tables.
+fn test_user_va_guard() -> bool {
+    let pid = match proc::table().create(0) {
+        Some(p) => p,
+        None => return fail("user-va-guard", "no process"),
+    };
+    let mut ok = true;
+    {
+        let p = match proc::table().get(pid) {
+            Some(p) => p,
+            None => return fail("user-va-guard", "no process"),
+        };
+        // Kernel image, physmap and the very top of the user half + 1 page.
+        for va in [
+            0xFFFF_FFFF_8020_0000u64,
+            0xFFFF_8000_0000_0000,
+            paging::USER_VA_LIMIT as u64,
+            paging::USER_VA_LIMIT as u64 - 0x1000 + 1,
+        ] {
+            if p.map_anon(va, 0x1000, PAGE_USER_RW).is_ok() {
+                serial_println!("user-va-guard: mapped {:#x}", va);
+                ok = false;
+            }
+        }
+        // A legal user VA still works.
+        ok &= p.map_anon(0x0000_0000_5000_0000, 0x1000, PAGE_USER_RW).is_ok();
+    }
+    proc::table().reap(pid);
+    report("user-va-guard", ok);
+    ok
+}
+
+/// A crafted ELF must not be able to name a kernel VA, wrap its segment size,
+/// start at data, or ask for W+X.
+fn test_elf_reject() -> bool {
+    // Minimal ELF64 header + one PT_LOAD, patched per case.
+    let mut img = [0u8; 64 + 56];
+    img[0..4].copy_from_slice(b"\x7fELF");
+    img[4] = 2; // ELF64
+    img[5] = 1; // little endian
+    img[6] = 1; // EV_CURRENT
+    img[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    img[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    img[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // e_entry
+    img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    img[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    img[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+    let set_ph = |img: &mut [u8], flags: u32, vaddr: u64, filesz: u64, memsz: u64, align: u64| {
+        let ph = &mut img[64..120];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&flags.to_le_bytes());
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&vaddr.to_le_bytes());
+        ph[32..40].copy_from_slice(&filesz.to_le_bytes());
+        ph[40..48].copy_from_slice(&memsz.to_le_bytes());
+        ph[48..56].copy_from_slice(&align.to_le_bytes());
+    };
+
+    let pid = match proc::table().create(0) {
+        Some(p) => p,
+        None => return fail("elf-reject", "no process"),
+    };
+    let mut ok = true;
+    {
+        let p = match proc::table().get(pid) {
+            Some(p) => p,
+            None => return fail("elf-reject", "no process"),
+        };
+        // 1. kernel-half vaddr
+        set_ph(&mut img, 5, 0xFFFF_FFFF_8020_0000, 0, 0x1000, 0x1000);
+        ok &= exec::load_elf(p, &img).is_err();
+        // 2. vaddr + memsz wraps past the user half
+        set_ph(&mut img, 5, 0x0000_7FFF_FFFF_F000, 0, 0x2000, 0x1000);
+        ok &= exec::load_elf(p, &img).is_err();
+        // 3. W+X segment
+        set_ph(&mut img, 7, 0x40_0000, 0, 0x1000, 0x1000);
+        ok &= exec::load_elf(p, &img).is_err();
+        // 4. entry outside any executable segment (entry stays 0x400000)
+        set_ph(&mut img, 4, 0x80_0000, 0, 0x1000, 0x1000);
+        ok &= exec::load_elf(p, &img).is_err();
+        // 5. program header table outside the file
+        let mut bad = img;
+        bad[56..58].copy_from_slice(&200u16.to_le_bytes());
+        ok &= exec::load_elf(p, &bad).is_err();
+        // 6. a well-formed image still loads
+        set_ph(&mut img, 5, 0x40_0000, 0, 0x1000, 0x1000);
+        ok &= exec::load_elf(p, &img).is_ok();
+    }
+    proc::table().reap(pid);
+    report("elf-reject", ok);
+    ok
+}
+
+/// The frame allocator must return `None` (not panic) for impossible requests.
+fn test_allocator_bounds() -> bool {
+    let mut ok = true;
+    ok &= mm::page_alloc().get_page(usize::MAX / 4096).is_none();
+    ok &= mm::page_alloc().get_page(usize::MAX).is_none();
+    // A normal single-page round trip still works afterwards.
+    let before = mm::page_alloc().free_pages();
+    match mm::page_alloc().get_page(1) {
+        Some(p) => {
+            mm::page_alloc().free_page(p, 1);
+            ok &= mm::page_alloc().free_pages() == before;
+        }
+        None => ok = false,
+    }
+    report("allocator-bounds", ok);
+    ok
+}
+
+/// Closing a memory handle must unmap it; the frames survive until the last
+/// reference (mapping or handle) is gone.
+fn test_memobj_refs() -> bool {
+    let pid = match proc::table().create(0) {
+        Some(p) => p,
+        None => return fail("memobj-refs", "no process"),
+    };
+    let mut ok = true;
+    {
+        let p = match proc::table().get(pid) {
+            Some(p) => p,
+            None => return fail("memobj-refs", "no process"),
+        };
+        let id = match obj::mem().create(0x1000, 0) {
+            Some(id) => id,
+            None => return fail("memobj-refs", "no object"),
+        };
+        // The mapping takes a reference of its own (page tables also cost
+        // frames, so only deltas *after* the mapping are asserted).
+        let va = match p.map_memobj(id, rondos_abi::rights::READ | rondos_abi::rights::WRITE, 0) {
+            Ok(va) => va,
+            Err(e) => {
+                serial_println!("memobj-refs: map failed {:?}", e);
+                proc::table().reap(pid);
+                return fail("memobj-refs", "map");
+            }
+        };
+        ok &= X86_64Paging::translate(p.root(), va as usize).is_some();
+        let free_mapped = mm::page_alloc().free_pages();
+
+        // Drop the creator's reference: the mapping still holds one, so the
+        // frame must stay alive and mapped.
+        obj::mem().release(id);
+        ok &= X86_64Paging::translate(p.root(), va as usize).is_some();
+        ok &= mm::page_alloc().free_pages() == free_mapped;
+
+        // Unmapping drops the last reference and returns exactly that frame.
+        let _ = p.unmap_memobj(va);
+        ok &= X86_64Paging::translate(p.root(), va as usize).is_none();
+        ok &= mm::page_alloc().free_pages() == free_mapped + 1;
+    }
+    proc::table().reap(pid);
+    report("memobj-refs", ok);
     ok
 }
 

@@ -405,8 +405,7 @@ fn create_slot(s: &mut Scheduler) -> Option<usize> {
 
 /// Create a new kernel thread.  Returns the thread id on success.
 pub fn thread_create(name: &'static str, entry: fn(usize), arg: usize) -> Option<u32> {
-    crate::arch::x86_64::cli();
-    let result = {
+    let result = crate::arch::x86_64::without_interrupts(|| {
         let s = sched();
         (|| {
             let slot = create_slot(s)?;
@@ -431,8 +430,7 @@ pub fn thread_create(name: &'static str, entry: fn(usize), arg: usize) -> Option
             s.enqueue(slot);
             Some(slot as u32)
         })()
-    };
-    crate::arch::x86_64::sti();
+    });
     result
 }
 
@@ -448,8 +446,7 @@ pub fn thread_create_user(
     user_stack_top: u64,
     arg: u64,
 ) -> Option<u32> {
-    crate::arch::x86_64::cli();
-    let result = {
+    let result = crate::arch::x86_64::without_interrupts(|| {
         let s = sched();
         (|| {
             let slot = create_slot(s)?;
@@ -471,8 +468,7 @@ pub fn thread_create_user(
             s.enqueue(slot);
             Some(slot as u32)
         })()
-    };
-    crate::arch::x86_64::sti();
+    });
     result
 }
 
@@ -510,23 +506,23 @@ pub fn kill_current() {
 /// The target may be running, ready or blocked; `schedule` skips Dying threads
 /// in the ready queue and the reaper frees its stack and process next tick.
 pub fn kill_pid(pid: u32) -> bool {
-    crate::arch::x86_64::cli();
-    let s = sched();
-    for i in 0..MAX_THREADS {
-        if !s.threads[i].used {
-            continue;
-        }
-        if s.threads[i].kind == (ThreadKind::User { pid }) {
-            s.threads[i].state = ThreadState::Dying;
-            if i == s.current {
-                intr::request_resched();
+    crate::arch::x86_64::without_interrupts(|| {
+        let s = sched();
+        let mut killed = false;
+        for i in 0..MAX_THREADS {
+            if !s.threads[i].used {
+                continue;
             }
-            crate::arch::x86_64::sti();
-            return true;
+            if s.threads[i].kind == (ThreadKind::User { pid }) {
+                s.threads[i].state = ThreadState::Dying;
+                if i == s.current {
+                    intr::request_resched();
+                }
+                killed = true;
+            }
         }
-    }
-    crate::arch::x86_64::sti();
-    false
+        killed
+    })
 }
 
 /// `fn(frame, vector) -> next_frame` installed as the scheduler hook.
@@ -555,7 +551,13 @@ fn sched_entry(frame: usize, vector: usize) -> usize {
 
 /// Core context switch.  `cur_frame` is the frame built by the entry stub of
 /// the thread being switched out; returns the frame to resume.
+static IN_SCHEDULE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn schedule(cur_frame: usize) -> usize {
+    // Nested scheduling means an interrupt re-entered the scheduler while a
+    // handler still held `&'static mut` tables — a hard invariant violation.
+    let was = IN_SCHEDULE.swap(true, core::sync::atomic::Ordering::AcqRel);
+    debug_assert!(!was, "nested schedule()");
     let s = sched();
     let cur = s.current;
     let cur_state = s.threads[cur].state;
@@ -615,6 +617,7 @@ pub fn schedule(cur_frame: usize) -> usize {
     percpu::set_current_thread(next_ptr);
     percpu::set_kernel_stack(next_top);
 
+    IN_SCHEDULE.store(false, core::sync::atomic::Ordering::Release);
     next_frame
 }
 
@@ -629,10 +632,7 @@ pub fn current_name() -> &'static str {
 }
 
 pub fn ticks() -> u64 {
-    crate::arch::x86_64::cli();
-    let t = sched().ticks;
-    crate::arch::x86_64::sti();
-    t
+    crate::arch::x86_64::without_interrupts(|| sched().ticks)
 }
 
 /// Block the current thread until the next tick takes it off the CPU.

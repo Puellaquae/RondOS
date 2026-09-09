@@ -19,8 +19,10 @@
 
 use core::cell::UnsafeCell;
 
-use crate::arch::x86_64::paging::{destroy_address_space, phys_to_virt, X86_64Paging};
-use crate::mm::vm::{PageFlags, PagingArch, PAGE_USER_RW};
+use crate::arch::x86_64::paging::{
+    destroy_address_space, phys_to_virt, valid_user_range, X86_64Paging,
+};
+use crate::mm::vm::{CachePolicy, PageFlags, PagingArch, PAGE_USER_RW};
 use crate::mm::{page_alloc, PAGE_SIZE};
 use rondos_abi::{Handle, ObjKind, Status};
 
@@ -46,7 +48,12 @@ pub struct Vma {
     /// True when the frames belong to a shared [`crate::obj::MemObj`]: the
     /// process may unmap them but must not free them on exit.
     pub shared: bool,
+    /// The `MemObj` this VMA maps (only meaningful when `shared`).
+    pub mem_id: u32,
 }
+
+/// `Vma::mem_id` when the VMA is private.
+pub const NO_MEM: u32 = u32::MAX;
 
 impl Vma {
     pub const fn new(start: u64, end: u64, flags: PageFlags) -> Self {
@@ -55,15 +62,17 @@ impl Vma {
             end,
             flags,
             shared: false,
+            mem_id: NO_MEM,
         }
     }
 
-    pub const fn shared(start: u64, end: u64, flags: PageFlags) -> Self {
+    pub const fn shared(start: u64, end: u64, flags: PageFlags, mem_id: u32) -> Self {
         Self {
             start,
             end,
             flags,
             shared: true,
+            mem_id,
         }
     }
 
@@ -318,6 +327,13 @@ impl HandleTable {
         self.slots.iter().filter(|s| s.used).count()
     }
 
+    /// Does the table hold a live handle of `kind` with `rights`?
+    pub fn has_kind_with(&self, kind: ObjKind, rights: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.used && s.kind() == kind && s.allows(rights))
+    }
+
     pub fn clear(&mut self) {
         for s in self.slots.iter_mut() {
             *s = HandleSlot::empty();
@@ -391,6 +407,10 @@ impl Process {
         self.root
     }
 
+    pub fn parent(&self) -> u32 {
+        self.parent
+    }
+
     pub fn status(&self) -> ExitStatus {
         self.status
     }
@@ -424,6 +444,11 @@ impl Process {
     /// arrives in P5.
     pub fn map_anon(&mut self, va: u64, len: u64, flags: PageFlags) -> Result<(), Status> {
         if va % PAGE_SIZE as u64 != 0 || len == 0 || len % PAGE_SIZE as u64 != 0 {
+            return Err(Status::InvalidArgument);
+        }
+        // Never map outside the user half: the kernel half is shared with the
+        // kernel's own tables (see paging::valid_user_range).
+        if !valid_user_range(va as usize, len as usize) {
             return Err(Status::InvalidArgument);
         }
         let pages = (len / PAGE_SIZE as u64) as usize;
@@ -501,31 +526,63 @@ impl Process {
 
     /// Map a shared memory object into this process at a fresh VA and record a
     /// shared VMA (the frames are not owned here).
-    pub fn map_memobj(&mut self, id: u32, flags: u64) -> Result<u64, Status> {
+    /// Map a shared memory object, taking a reference for the *mapping* itself
+    /// (the handle holds the other one).  Permissions come from the caller's
+    /// **handle rights**, never from the object's creation flags: a read-only
+    /// capability must not produce a writable mapping.
+    pub fn map_memobj(&mut self, id: u32, rights: u64, cache: u32) -> Result<u64, Status> {
         let Some(obj) = crate::obj::mem().get(id) else {
             return Err(Status::BadHandle);
         };
         let pages = obj.page_count();
         let page_flags = PageFlags {
-            writable: (flags & rondos_abi::mem_flags::WRITE) != 0,
+            writable: (rights & rondos_abi::rights::WRITE) != 0,
             user: true,
-            executable: (flags & rondos_abi::mem_flags::EXEC) != 0,
-            cache: crate::mm::vm::CachePolicy::WriteBack,
+            executable: (rights & rondos_abi::rights::EXEC) != 0,
+            cache: match cache {
+                x if x == CachePolicy::WriteThrough as u32 => CachePolicy::WriteThrough,
+                x if x == CachePolicy::Uncached as u32 => CachePolicy::Uncached,
+                x if x == CachePolicy::WriteCombining as u32 => CachePolicy::WriteCombining,
+                _ => CachePolicy::WriteBack,
+            },
         };
         let va = self.next_mmap_va;
+        if !valid_user_range(va as usize, (pages * PAGE_SIZE) as usize) {
+            return Err(Status::OutOfMemory);
+        }
+        if !crate::obj::mem().retain(id) {
+            return Err(Status::BadHandle);
+        }
+        let pa_list = obj.pages;
         for i in 0..pages {
-            let pa = obj.pages[i];
-            if X86_64Paging::map(self.root, va as usize + i * PAGE_SIZE, pa, page_flags).is_err() {
+            if X86_64Paging::map(self.root, va as usize + i * PAGE_SIZE, pa_list[i], page_flags)
+                .is_err()
+            {
                 for j in 0..i {
                     let _ = X86_64Paging::unmap(self.root, va as usize + j * PAGE_SIZE);
                 }
+                crate::obj::mem().release(id);
                 return Err(Status::OutOfMemory);
             }
         }
         let end = va + (pages * PAGE_SIZE) as u64;
-        self.vmas.insert(Vma::shared(va, end, page_flags))?;
+        if self.vmas.insert(Vma::shared(va, end, page_flags, id)).is_err() {
+            let mut cur = va;
+            while cur < end {
+                let _ = X86_64Paging::unmap(self.root, cur as usize);
+                cur += PAGE_SIZE as u64;
+            }
+            crate::obj::mem().release(id);
+            return Err(Status::OutOfMemory);
+        }
         self.next_mmap_va += MMAP_STEP;
         Ok(va)
+    }
+
+    /// True when the process holds a device capability that allows mapping
+    /// physical memory (the framebuffer and other MMIO).
+    pub fn has_device_map(&self) -> bool {
+        self.handles.has_kind_with(rondos_abi::ObjKind::Device, rondos_abi::rights::MAP)
     }
 
     /// Install an object that arrived over a channel (or any other delegation
@@ -534,7 +591,7 @@ impl Process {
     pub fn install_obj(&mut self, d: &crate::obj::ObjDesc) -> Result<Handle, Status> {
         let obj = match d.kind {
             k if k == rondos_abi::ObjKind::Memory as u32 => {
-                let va = self.map_memobj(d.id, d.flags)?;
+                let va = self.map_memobj(d.id, d.rights, 0)?;
                 let len = crate::obj::mem().get(d.id).map(|o| o.len).unwrap_or(0);
                 ObjRef::Memory { id: d.id, va, len }
             }
@@ -544,21 +601,17 @@ impl Process {
                 len: d.aux,
                 pos: 0,
             },
-            _ => {
-                release_obj(match d.kind {
-                    k if k == rondos_abi::ObjKind::Memory as u32 => ObjRef::Memory {
-                        id: d.id,
-                        va: 0,
-                        len: 0,
-                    },
-                    _ => ObjRef::Chan { id: d.id },
-                });
-                return Err(Status::Unsupported);
-            }
+            // Unknown descriptor kinds own no reference in this process.
+            _ => return Err(Status::Unsupported),
         };
         match self.handles_mut().insert(obj, d.rights) {
             Some(h) => Ok(h),
             None => {
+                // Undo the mapping *before* dropping the reference, or the
+                // frames would be freed while the PTEs still point at them.
+                if let ObjRef::Memory { va, .. } = obj {
+                    let _ = self.unmap_memobj(va);
+                }
                 release_obj(obj);
                 Err(Status::OutOfMemory)
             }
@@ -574,12 +627,16 @@ impl Process {
         if !vma.shared {
             return Err(Status::InvalidArgument);
         }
-        let end = vma.end;
+        let (end, mem_id) = (vma.end, vma.mem_id);
         let _ = self.vmas.remove(va);
         let mut cur = va;
         while cur < end {
             let _ = X86_64Paging::unmap(self.root, cur as usize);
             cur += PAGE_SIZE as u64;
+        }
+        // The mapping held one reference; the handle holds another.
+        if mem_id != NO_MEM {
+            crate::obj::mem().release(mem_id);
         }
         Ok(())
     }
@@ -615,7 +672,7 @@ impl Process {
         self.handles.release_all();
 
         for vma in self.vmas.iter() {
-            let (start, end, shared) = (vma.start, vma.end, vma.shared);
+            let (start, end, shared, mem_id) = (vma.start, vma.end, vma.shared, vma.mem_id);
             let mut va = start;
             while va < end {
                 if let Ok(pa) = X86_64Paging::unmap(self.root, va as usize) {
@@ -625,6 +682,9 @@ impl Process {
                     }
                 }
                 va += PAGE_SIZE as u64;
+            }
+            if mem_id != NO_MEM {
+                crate::obj::mem().release(mem_id);
             }
         }
         destroy_address_space(self.root);

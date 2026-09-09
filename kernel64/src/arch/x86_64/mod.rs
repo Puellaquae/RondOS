@@ -214,7 +214,40 @@ pub fn read_rsp() -> usize {
     sp
 }
 
+/// Save `RFLAGS` (mostly for `IF`) so a critical section can restore exactly
+/// the previous interrupt state instead of unconditionally enabling them.
 #[inline]
+pub fn save_flags() -> u64 {
+    let f: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) f, options(nomem));
+    }
+    f
+}
+
+/// Restore flags saved by [`save_flags`].
+#[inline]
+pub fn restore_flags(flags: u64) {
+    unsafe {
+        asm!("push {}", "popfq", in(reg) flags, options(nomem));
+    }
+}
+
+/// Run `f` with interrupts disabled, restoring the previous state afterwards.
+///
+/// **Never use `cli(); ...; sti();` directly inside a syscall**: `int 0x80` is
+/// an interrupt gate, so `IF` is already clear on entry and an unconditional
+/// `sti` would let a timer tick re-enter the scheduler while the handler still
+/// holds `&'static mut` references to kernel tables.
+#[inline]
+pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
+    let flags = save_flags();
+    cli();
+    let out = f();
+    restore_flags(flags);
+    out
+}
+
 pub fn interrupts_enabled() -> bool {
     (read_rflags() & (1 << 9)) != 0
 }

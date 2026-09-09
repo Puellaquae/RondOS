@@ -106,7 +106,18 @@ impl BitMap {
         }
     }
 
+    /// True when any bit in `[start, start+len)` equals `val`.
+    ///
+    /// An out-of-range request reports `true` ("this start is unusable") so
+    /// `find` skips it instead of asserting — otherwise every OOM path in the
+    /// kernel would panic instead of returning `None`.
     fn contains(&self, start: usize, len: usize, val: bool) -> bool {
+        if len == 0 {
+            return false;
+        }
+        if start >= self.size || len > self.size - start {
+            return true;
+        }
         for i in 0..len {
             if self.test(start + i) == val {
                 return true;
@@ -116,7 +127,10 @@ impl BitMap {
     }
 
     fn find(&self, start: usize, len: usize, val: bool) -> Option<usize> {
-        for i in start..self.size {
+        if len == 0 || len > self.size {
+            return None;
+        }
+        for i in start..=self.size - len {
             if !self.contains(i, len, !val) {
                 return Some(i);
             }
