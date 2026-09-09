@@ -48,7 +48,7 @@ all: esp
 release: all
 
 user:
-	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash
+	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin
 
 kernel:
 	cd $(KERNEL_DIR) && $(CARGO) build $(CARGO_FLAG)
@@ -61,8 +61,9 @@ boot:
 $(BOOT_TAR): user
 	@mkdir -p build
 	python3 tools/mktar.py $@ \
-	  init.elf=$(USER_BIN)/init \
-	  crash.elf=$(USER_BIN)/crash
+	  bin/init=$(USER_BIN)/init \
+	  bin/crash=$(USER_BIN)/crash \
+	  bin/spin=$(USER_BIN)/spin
 
 # The ESP is a directory; QEMU's vvfat exposes it as a FAT drive, so testing
 # needs neither mkfs.vfat nor mtools.  TMPDIR is pinned inside the tree because
@@ -89,6 +90,9 @@ test: esp
 	@grep -q "user: init: hello from ring 3" $(SERIAL_LOG) \
 	  && echo "==> init reached ring 3" \
 	  || (echo "==> init did not run"; exit 1)
+	@grep -q "user: init: all children reaped, exiting" $(SERIAL_LOG) \
+	  && echo "==> init spawned, waited for and killed its children" \
+	  || (echo "==> init child handling failed"; exit 1)
 
 clean:
 	rm -rf build

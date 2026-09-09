@@ -142,10 +142,36 @@ impl VmaList {
 
 // -------------------------------------------------------------- handle table
 
+/// What a handle points at.  Small and `Copy` on purpose: the handle table is
+/// a fixed array, and a file cursor lives here rather than in a kernel object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjRef {
+    None,
+    /// A tarfs directory node (0 = root).
+    Dir { node: u32 },
+    /// A tarfs regular file: `(offset, length)` into the boot tar plus a cursor.
+    File { off: u32, len: u32, pos: u64 },
+    /// A device node: 0 = console (`sys_write` -> the kernel log).
+    Device { node: u32 },
+    /// Another process, addressable for `sys_wait`/`sys_proc_status`/`sys_kill`.
+    Process { pid: u32 },
+}
+
+impl ObjRef {
+    pub const fn kind(self) -> ObjKind {
+        match self {
+            ObjRef::None => ObjKind::None,
+            ObjRef::Dir { .. } => ObjKind::Dir,
+            ObjRef::File { .. } => ObjKind::File,
+            ObjRef::Device { .. } => ObjKind::Device,
+            ObjRef::Process { .. } => ObjKind::Process,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct HandleSlot {
-    pub kind: ObjKind,
-    pub id: u32,
+    pub obj: ObjRef,
     pub rights: u64,
     pub generation: u32,
     used: bool,
@@ -154,8 +180,7 @@ pub struct HandleSlot {
 impl HandleSlot {
     const fn empty() -> Self {
         Self {
-            kind: ObjKind::None,
-            id: 0,
+            obj: ObjRef::None,
             rights: 0,
             generation: 0,
             used: false,
@@ -164,6 +189,10 @@ impl HandleSlot {
 
     pub fn allows(&self, rights: u64) -> bool {
         self.rights & rights == rights
+    }
+
+    pub fn kind(&self) -> ObjKind {
+        self.obj.kind()
     }
 }
 
@@ -182,17 +211,28 @@ impl HandleTable {
         }
     }
 
-    pub fn insert(&mut self, kind: ObjKind, id: u32, rights: u64) -> Option<Handle> {
+    pub fn insert(&mut self, obj: ObjRef, rights: u64) -> Option<Handle> {
         for (i, s) in self.slots.iter_mut().enumerate() {
             if !s.used {
                 s.used = true;
-                s.kind = kind;
-                s.id = id;
+                s.obj = obj;
                 s.rights = rights;
                 return Some(Handle::new(i as u32, s.generation));
             }
         }
         None
+    }
+
+    /// Mutate the object a handle points at (file cursor, ...).
+    pub fn with_mut<T>(&mut self, h: Handle, f: impl FnOnce(&mut HandleSlot) -> T) -> Result<T, Status> {
+        let slot = self
+            .slots
+            .get_mut(h.index() as usize)
+            .ok_or(Status::BadHandle)?;
+        if !slot.used || slot.generation != h.generation() {
+            return Err(Status::BadHandle);
+        }
+        Ok(f(slot))
     }
 
     pub fn get(&self, h: Handle) -> Result<&HandleSlot, Status> {
@@ -627,6 +667,17 @@ pub fn exit_current(status: ExitStatus) {
     crate::thread::kill_current();
 }
 
+/// `sys_kill`: mark another process dead and kill its thread.
+pub fn kill(pid: u32) -> Result<(), Status> {
+    let p = table().get(pid).ok_or(Status::NotFound)?;
+    p.set_status(ExitStatus::Killed);
+    if crate::thread::kill_pid(pid) {
+        Ok(())
+    } else {
+        Err(Status::NotFound)
+    }
+}
+
 /// `sys_exit` / a user fault both land here.
 pub fn copy_from_user(dst: &mut [u8], src_va: u64) -> Result<(), Status> {
     current_ref()
@@ -647,7 +698,10 @@ pub fn selftest_handles() -> bool {
     let mut t = HandleTable::new();
     let mut ok = true;
 
-    let a = t.insert(ObjKind::Chan, 7, rondos_abi::rights::READ | rondos_abi::rights::WRITE);
+    let a = t.insert(
+        ObjRef::File { off: 512, len: 128, pos: 0 },
+        rondos_abi::rights::READ | rondos_abi::rights::WRITE,
+    );
     let a = match a {
         Some(a) => a,
         None => return false,
@@ -659,7 +713,7 @@ pub fn selftest_handles() -> bool {
     ok &= t.close(a).is_ok();
     // Same index, bumped generation: the old handle must be dead.
     ok &= t.get(a).err() == Some(Status::BadHandle);
-    let b = t.insert(ObjKind::File, 9, rondos_abi::rights::READ).unwrap();
+    let b = t.insert(ObjRef::Dir { node: 0 }, rondos_abi::rights::READ).unwrap();
     ok &= b.index() == 0 && b.generation() == 1;
     ok &= t.get(b).is_ok() && t.get(a).is_err();
     ok &= t.resolve(Handle::new(0, 7), rondos_abi::rights::READ).err() == Some(Status::BadHandle);

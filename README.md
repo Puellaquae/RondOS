@@ -16,7 +16,9 @@
   - `src/thread/`       内核线程 + 用户线程、抢占式轮转调度、`sleep`/`exit`、`WaitQueue`；
     每个线程带自己的页表根，切换线程即切换地址空间
   - `src/proc/`         `Process`/VMA/`HandleTable`/`ExitStatus`、用户指针校验
-  - `src/syscall.rs`    `int 0x80` v1 分发（P0：`sys_info`/`exit`/`yield`/`clock`/`log`）
+  - `src/syscall.rs`    `int 0x80` v1 分发（info/exit/yield/clock/log/sleep + 文件与进程组）
+  - `src/fs.rs`         boot tar 只读文件系统（ustar，`bin/init` 等）
+  - `src/exec.rs`       ELF64 装载、`StartupBlock` + capability、`spawn_path`/`spawn_entry`
   - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version），内核唯一的引导契约
 - `boot/uefi/`  UEFI 引导 stub，目标 `x86_64-unknown-uefi`，基于 `uefi-rs`
   - GOP 选 32bpp 模式 → 读 ESP 上的 `\rondos\kernel.elf` → 按 `p_paddr` 装载
@@ -28,7 +30,8 @@
   - `lib/rondos-abi/`  内核与用户程序共享的 ABI crate（syscall 号、`Status`、
     handle 编码、`Info` 等结构体 + 编译期布局断言）
   - `lib/rondos-rt/`  `_start`、`panic`、`println!`（走 `sys_log`）
-  - `apps/init/`、`apps/crash/`  首批用户程序（后者故意缺页，验证隔离）
+  - `apps/init/`、`apps/crash/`、`apps/spin/`  首批用户程序：`init` 用 root 能力
+    打开并 `spawn` 另两个，`wait`/`proc_status` 拿结果，再 `kill` 掉长跑的那个
 - `tools/mktar.py`  确定性 ustar 打包器（生成 `build/boot.tar`）
 - `files/`      启动 tar 镜像内容（将来的用户程序与资源）
 - `docs/user-mode-design.md`  用户态完整设计（迁移、ring 3、编译支持、可执行文件格式、
@@ -81,8 +84,9 @@ OVMF 路径用 `OVMF=/path/to/OVMF.fd` 覆盖（默认 `/usr/share/ovmf/OVMF.fd`
 | M0.7 | `x86_64-unknown-uefi` stub + 内核自有页表（删除 32 位跳板） | ✅ |
 | M0.8 | i686 路径移入 `legacy-i686` 分支 | ✅ |
 | P0 | `proc/`（进程 + VMA + handle 表）、每线程地址空间、`rondos-abi`、`int 0x80` v1 分发 | ✅ |
-| P1a | `user/` 工作区（target spec + `user.ld` + `rondos-rt`）、ELF64 装载器、boot.tar、`init`/`crash` | ✅ |
-| P1b | `sys_spawn`/`sys_wait` + 文件 handle、`init` 派生其他程序 | 待办 |
+| P1 | `user/` 工作区、ELF64 装载器、boot.tar（tarfs）、`StartupBlock` + capability、
+`sys_open`/`read`/`write`/`close`/`spawn`/`wait`/`proc_status`/`kill`/`sleep_ns`，
+`init` 派生并回收子进程 | ✅ |
 
 `make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (17/17)`：
 分页/physmap/大页拆分/地址空间隔离/W^X/设备映射、ring3 系统调用往返、
@@ -90,7 +94,8 @@ OVMF 路径用 `OVMF=/path/to/OVMF.fd` 覆盖（默认 `/usr/share/ovmf/OVMF.fd`
 （handle 表、用户进程跑完 `sys_info`/`sys_clock_gettime`/`sys_yield`/`sys_log`/`sys_exit`、
 一个进程缺页只杀自己、所有帧回收，以及 P1a 的 ELF 装载（`user/` 编译出的
 `init`/`crash` 从 `boot.tar` 装载进 ring3，`init` 打印后正常退出、`crash` 缺页只杀自己）。
-内核在第一条指令就切到自己的栈，
+P1 的 `init` 从 boot tar 里 `open`/`spawn`/`wait`/`kill` 自己的子进程，
+内核不含任何进程策略。内核在第一条指令就切到自己的栈，
 `BootInfo` 落地后立即切到内核自有的 PML4（丢掉 loader 的低地址 identity map）。
 
 `user/lib/rondos-abi/` 是内核与用户程序共享的 ABI crate（syscall 号、`Status`、

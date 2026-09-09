@@ -1,10 +1,9 @@
-//! ELF64 loading and the boot tar image — P1.
+//! ELF64 loading and process creation — P1.
 //!
 //! The kernel no longer carries user code: the UEFI stub loads `\rondos\boot.tar`
-//! into memory (already reported as `BootInfo.initrd_*`) and the kernel finds
-//! `/bin/*` inside it.  Programs are ordinary ELF64 `ET_EXEC` images built by
-//! the `user/` workspace for the `x86_64-rondos` target: fixed-address, page
-//! aligned `PT_LOAD`s, `.text` R+X and data RW+NX.
+//! into memory (already reported as `BootInfo.initrd_*`), [`crate::fs::TarFs`]
+//! finds `/bin/*` inside it, and this module turns an ELF64 image into a
+//! running ring3 process.
 //!
 //! The loader is deliberately strict and small:
 //!
@@ -13,15 +12,21 @@
 //!   it) and is mapped with the segment's own permissions — W^X comes from the
 //!   ELF flags, not from a policy table;
 //! * `p_filesz` bytes are copied, `[p_filesz, p_memsz)` is zeroed;
-//! * a fixed user stack is mapped above the image (the real one grows on
-//!   demand in P5).
+//! * a fixed user stack is mapped above the image, with the [`StartupBlock`]
+//!   and the granted capabilities written at its top (design §5.3/§5.4).
 
 #![allow(dead_code)]
 
+use core::mem::size_of;
+
+use crate::fs::{Entry, TarFs};
 use crate::mm::vm::{PageFlags, PAGE_USER_RW, PAGE_USER_RX};
 use crate::mm::PAGE_SIZE;
-use crate::proc::Process;
-use rondos_abi::Status;
+use crate::proc::{ObjRef, Process};
+use rondos_abi::{
+    rights, CapDesc, ExitStatus, Handle, ObjKind, Slice, StartupBlock, Status, StructHeader,
+    ABI_VERSION,
+};
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ET_EXEC: u16 = 2;
@@ -54,6 +59,10 @@ fn u64_at(buf: &[u8], off: usize) -> Result<u64, Status> {
     buf.get(off..off + 8)
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
         .ok_or(Status::InvalidArgument)
+}
+
+fn as_bytes<T>(v: &T) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
 }
 
 /// Load `elf` into `p`'s address space.  On failure the caller tears the
@@ -129,21 +138,72 @@ pub fn map_stack(p: &mut Process, image: &Image) -> Result<u64, Status> {
     let base = (image.end + 0xffff) & !0xffff; // 64 KiB above the image
     let len = STACK_PAGES * PAGE_SIZE as u64;
     p.map_anon(base, len, PAGE_USER_RW)?;
-    Ok(base + len - 16)
+    Ok(base + len)
 }
 
-/// Load `elf` into a fresh process and start its first thread.
-pub fn spawn(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
+/// Write the `StartupBlock` + granted capabilities at the top of the user
+/// stack and return the initial `rsp` (just below them).
+///
+/// The block carries the process's capabilities, which is how `init` learns
+/// the root directory handle — there is no global namespace to look it up in.
+fn write_startup(p: &mut Process, image: &Image, stack_top: u64) -> Result<(u64, u64), Status> {
+    let root_dir = p
+        .handles_mut()
+        .insert(ObjRef::Dir { node: 0 }, rights::ALL)
+        .ok_or(Status::OutOfMemory)?;
+
+    let caps = [CapDesc {
+        kind: ObjKind::Dir as u32,
+        _pad0: 0,
+        rights: rights::ALL,
+        handle: root_dir.0,
+    }];
+    // Layout, from the top of the stack downwards: StartupBlock, then the
+    // capability array, then rsp.  Everything lives *above* rsp so the
+    // program's own stack growth can never clobber it.
+    let block_va = (stack_top - size_of::<StartupBlock>() as u64) & !0xf;
+    let caps_va = (block_va - size_of::<CapDesc>() as u64) & !0xf;
+    let rsp = caps_va - 16;
+
+    p.write_user(caps_va, as_bytes(&caps))?;
+    let block = StartupBlock {
+        hdr: StructHeader::new(size_of::<StartupBlock>() as u32),
+        abi_version: ABI_VERSION,
+        _pad0: 0,
+        feature_bits: rondos_abi::feature::SSE | rondos_abi::feature::DEVICE_MAP,
+        entry: image.entry,
+        image_base: 0x40_0000,
+        argv: Slice::default(),
+        envp: Slice::default(),
+        caps: Slice {
+            ptr: caps_va,
+            count: caps.len() as u64,
+        },
+        window: Handle::INVALID,
+        random_seed: crate::thread::ticks() ^ 0x9E37_79B9_7F4A_7C15,
+        _reserved: [0; 4],
+    };
+    p.write_user(block_va, as_bytes(&block))?;
+    Ok((rsp, block_va))
+}
+
+/// Load `elf` into a fresh process and start its first thread.  `rdi` on entry
+/// points at the `StartupBlock`.
+pub fn spawn_bytes(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
     let pid = crate::proc::table().create(0).ok_or(Status::OutOfMemory)?;
 
-    // Everything that borrows the process happens in one scope.
     let prepared = {
         let Some(p) = crate::proc::table().get(pid) else {
             return Err(Status::NotFound);
         };
-        load_elf(p, elf).and_then(|image| map_stack(p, &image).map(|top| (p.root(), image, top)))
+        (|| -> Result<(usize, Image, u64, u64), Status> {
+            let image = load_elf(p, elf)?;
+            let stack_top = map_stack(p, &image)?;
+            let (rsp, block) = write_startup(p, &image, stack_top)?;
+            Ok((p.root(), image, rsp, block))
+        })()
     };
-    let (root, image, stack_top) = match prepared {
+    let (root, image, rsp, block) = match prepared {
         Ok(v) => v,
         Err(e) => {
             crate::proc::table().reap(pid);
@@ -151,14 +211,8 @@ pub fn spawn(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
         }
     };
 
-    let tid = match crate::thread::thread_create_user(
-        pid,
-        root,
-        name,
-        image.entry,
-        stack_top,
-        0,
-    ) {
+    // `rdi` = &StartupBlock (at the top of the stack, above rsp).
+    let tid = match crate::thread::thread_create_user(pid, root, name, image.entry, rsp, block) {
         Some(t) => t,
         None => {
             crate::proc::table().reap(pid);
@@ -171,73 +225,68 @@ pub fn spawn(name: &'static str, elf: &[u8]) -> Result<u32, Status> {
     }
 
     crate::serial_println!(
-        "exec: '{}' pid {} tid {} entry {:#x} {} segment(s) end {:#x} stack {:#x}",
+        "exec: '{}' pid {} tid {} entry {:#x} {} segment(s) end {:#x} rsp {:#x} startup {:#x}",
         name,
         pid,
         tid,
         image.entry,
         image.segments,
         image.end,
-        stack_top
+        rsp,
+        block
     );
     Ok(pid)
 }
 
-// ------------------------------------------------------------------ tarfs
-
-const TAR_BLOCK: usize = 512;
-
-fn tar_octal(field: &[u8]) -> Option<usize> {
-    let mut v = 0usize;
-    let mut seen = false;
-    for b in field {
-        match b {
-            b'0'..=b'7' => {
-                v = v.checked_mul(8)?.checked_add((b - b'0') as usize)?;
-                seen = true;
-            }
-            0 | b' ' if !seen => {}
-            0 | b' ' => break,
-            _ => return None,
-        }
+/// Read a tar entry into freshly allocated frames and spawn it.
+pub fn spawn_entry(entry: &Entry) -> Result<u32, Status> {
+    let fs = TarFs::root().ok_or(Status::NotFound)?;
+    let len = entry.len as usize;
+    if len == 0 || len > 16 * 1024 * 1024 {
+        return Err(Status::InvalidArgument);
     }
-    Some(v)
+    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let buf = crate::mm::page_alloc()
+        .get_page(pages)
+        .ok_or(Status::OutOfMemory)?;
+    let result = {
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        fs.read_all(entry, dst).and_then(|n| {
+            spawn_bytes(core::str::from_utf8(entry.name).unwrap_or("image"), &dst[..n])
+        })
+    };
+    crate::mm::page_alloc().free_page(buf, pages);
+    result
 }
 
-fn tar_name(field: &[u8]) -> &[u8] {
-    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
-    &field[..end]
+/// Look up `path` in the boot tar and spawn it.
+pub fn spawn_path(path: &[u8]) -> Result<u32, Status> {
+    let fs = TarFs::root().ok_or(Status::NotFound)?;
+    let entry = fs.find(path).ok_or(Status::NotFound)?;
+    spawn_entry(&entry)
 }
 
-/// Find `name` in an (uncompressed, ustar) tar image.  Only regular files.
-pub fn tar_find<'a>(tar: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut off = 0usize;
-    while off + TAR_BLOCK <= tar.len() {
-        let hdr = &tar[off..off + TAR_BLOCK];
-        if hdr.iter().all(|b| *b == 0) {
-            return None; // end-of-archive marker
+/// The `ExitStatus` of `pid` as an ABI struct (for `sys_proc_status`).
+pub fn exit_status(pid: u32) -> ExitStatus {
+    let mut out = ExitStatus {
+        hdr: StructHeader::new(size_of::<ExitStatus>() as u32),
+        ..Default::default()
+    };
+    match crate::proc::table().status_of(pid) {
+        None | Some(crate::proc::ExitStatus::Running) => {
+            out.kind = rondos_abi::exit_kind::RUNNING
         }
-        let size = tar_octal(&hdr[124..136])?;
-        let typeflag = hdr[156];
-        let data = off + TAR_BLOCK;
-        let data_end = data.checked_add(size)?;
-        if data_end > tar.len() {
-            return None;
+        Some(crate::proc::ExitStatus::Exited(code)) => {
+            out.kind = rondos_abi::exit_kind::EXITED;
+            out.code = code;
         }
-        if (typeflag == b'0' || typeflag == 0) && tar_name(&hdr[0..100]) == name {
-            return Some(&tar[data..data_end]);
+        Some(crate::proc::ExitStatus::Killed) => out.kind = rondos_abi::exit_kind::KILLED,
+        Some(crate::proc::ExitStatus::Fault { vector, rip, addr }) => {
+            out.kind = rondos_abi::exit_kind::FAULT;
+            out.vector = vector;
+            out.rip = rip;
+            out.addr = addr;
         }
-        off = data + (size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
     }
-    None
-}
-
-/// The boot tar as handed over by the UEFI stub, if present.
-pub fn boot_tar() -> Option<&'static [u8]> {
-    let bi = crate::bootinfo::get();
-    if bi.initrd_phys == 0 || bi.initrd_len == 0 {
-        return None;
-    }
-    let va = crate::arch::x86_64::paging::phys_to_virt(bi.initrd_phys as usize);
-    Some(unsafe { core::slice::from_raw_parts(va as *const u8, bi.initrd_len as usize) })
+    out
 }

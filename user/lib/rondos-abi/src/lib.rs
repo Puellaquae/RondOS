@@ -303,6 +303,135 @@ pub struct Info {
     pub _reserved: [u64; 4],
 }
 
+// -------------------------------------------------------------- startup block
+
+/// A borrowed string inside the caller's address space (`ptr`/`len_bytes`).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StrRef {
+    pub ptr: u64,
+    pub len_bytes: u64,
+}
+
+/// A borrowed array (`ptr`/`count`); element type depends on the field.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Slice {
+    pub ptr: u64,
+    pub count: u64,
+}
+
+/// One capability handed to a new process at startup.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CapDesc {
+    pub kind: u32,
+    pub _pad0: u32,
+    pub rights: u64,
+    pub handle: u64,
+}
+
+/// Written by the kernel at the top of a new process's stack; `rdi` points at
+/// it on entry (design §5.3).  Starts with a [`StructHeader`] so fields can be
+/// appended without breaking older programs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct StartupBlock {
+    pub hdr: StructHeader,
+    pub abi_version: u32,
+    pub _pad0: u32,
+    pub feature_bits: u64,
+    pub entry: u64,
+    pub image_base: u64,
+    /// `Slice<StrRef>` — empty in P1 (argv arrives with the manifest work).
+    pub argv: Slice,
+    pub envp: Slice,
+    /// `Slice<CapDesc>` — the capabilities actually granted.
+    pub caps: Slice,
+    /// Reserved for a display-server-created window handle.
+    pub window: Handle,
+    pub random_seed: u64,
+    pub _reserved: [u64; 4],
+}
+
+impl StartupBlock {
+    pub const MAGIC: u32 = 0x524E_4432; // "RND2"
+
+    /// The granted capabilities, if the block is big enough to contain them.
+    pub fn caps(&self) -> &[CapDesc] {
+        if self.caps.ptr == 0 || self.caps.count == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.caps.ptr as *const CapDesc, self.caps.count as usize) }
+    }
+
+    /// The first capability of `kind`, if any.
+    pub fn cap(&self, kind: ObjKind) -> Option<CapDesc> {
+        self.caps().iter().copied().find(|c| c.kind == kind as u32)
+    }
+}
+
+// --------------------------------------------------------------- exit status
+
+/// How a process ended.  `kind` is one of the [`exit_kind`] values.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExitStatus {
+    pub hdr: StructHeader,
+    /// [`exit_kind`] value.
+    pub kind: u32,
+    /// `sys_exit` status for `Exited`, otherwise 0.
+    pub code: u32,
+    /// Faulting vector for `Fault`, otherwise 0.
+    pub vector: u32,
+    pub _pad0: u32,
+    /// Faulting instruction pointer for `Fault`.
+    pub rip: u64,
+    /// Faulting address (`CR2` for `#PF`).
+    pub addr: u64,
+    pub _reserved: [u64; 2],
+}
+
+pub mod exit_kind {
+    pub const RUNNING: u32 = 0;
+    pub const EXITED: u32 = 1;
+    pub const FAULT: u32 = 2;
+    pub const KILLED: u32 = 3;
+}
+
+/// `sys_wait` return value: `index | (reason << 32)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WaitResult {
+    pub index: u32,
+    pub reason: u32,
+}
+
+impl WaitResult {
+    pub const fn pack(index: u32, reason: u32) -> u64 {
+        (index as u64) | ((reason as u64) << 32)
+    }
+
+    pub const fn unpack(value: u64) -> Self {
+        Self {
+            index: value as u32,
+            reason: (value >> 32) as u32,
+        }
+    }
+}
+
+/// Why a handle became ready (matches [`exit_kind`]).
+pub mod wait_reason {
+    pub const EXITED: u32 = 1;
+    pub const FAULT: u32 = 2;
+    pub const KILLED: u32 = 3;
+}
+
+/// Open flags for `sys_open`.
+pub mod open_flags {
+    pub const READ: u64 = 1 << 0;
+    pub const WRITE: u64 = 1 << 1;
+}
+
 // ------------------------------------------------------------------- layout
 
 // These assertions are the ABI freeze test (design §6.8).  They compile on the
@@ -324,6 +453,14 @@ const _: () = {
     assert!(core::mem::offset_of!(Info, fb) == 48);
     assert!(core::mem::size_of::<SyscallId>() == 4);
     assert!(core::mem::size_of::<Status>() == 4);
+    assert!(core::mem::size_of::<StrRef>() == 16);
+    assert!(core::mem::size_of::<Slice>() == 16);
+    assert!(core::mem::size_of::<CapDesc>() == 24);
+    assert!(core::mem::size_of::<StartupBlock>() == 136);
+    assert!(core::mem::offset_of!(StartupBlock, argv) == 40);
+    assert!(core::mem::offset_of!(StartupBlock, caps) == 72);
+    assert!(core::mem::size_of::<ExitStatus>() == 56);
+    assert!(core::mem::offset_of!(ExitStatus, rip) == 24);
 };
 
 // --------------------------------------------------------------- user stubs
@@ -404,4 +541,102 @@ pub fn yield_now() {
     unsafe {
         syscall(SyscallId::Yield, 0, 0, 0, 0, 0, 0);
     }
+}
+
+/// `0x50 sys_open(dir, path, flags) -> Handle<File>`
+#[cfg(feature = "user")]
+pub fn open(dir: Handle, path: &[u8], flags: u64) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Open,
+            dir.0,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            flags,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x51 sys_read(handle, buf, len) -> n`
+#[cfg(feature = "user")]
+pub fn read(handle: Handle, buf: &mut [u8]) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Read,
+            handle.0,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x52 sys_write(handle, buf, len) -> n`
+#[cfg(feature = "user")]
+pub fn write(handle: Handle, buf: &[u8]) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Write,
+            handle.0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x56 sys_close(handle)`
+#[cfg(feature = "user")]
+pub fn close(handle: Handle) -> SyscallResult {
+    unsafe { syscall(SyscallId::Close, handle.0, 0, 0, 0, 0, 0) }
+}
+
+/// `0x20 sys_spawn(image) -> Handle<Process>` (argv/envp/caps are P2).
+#[cfg(feature = "user")]
+pub fn spawn(image: Handle) -> SyscallResult {
+    unsafe { syscall(SyscallId::Spawn, image.0, 0, 0, 0, 0, 0) }
+}
+
+/// `0x21 sys_wait(handles, timeout_ns) -> index | (reason << 32)`
+#[cfg(feature = "user")]
+pub fn wait(handles: &[Handle], timeout_ns: u64) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Wait,
+            handles.as_ptr() as u64,
+            handles.len() as u64,
+            timeout_ns,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x22 sys_proc_status(handle, &mut ExitStatus)`
+#[cfg(feature = "user")]
+pub fn proc_status(handle: Handle, out: &mut ExitStatus) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::ProcStatus,
+            handle.0,
+            out as *mut ExitStatus as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x23 sys_kill(handle)`
+#[cfg(feature = "user")]
+pub fn kill(handle: Handle) -> SyscallResult {
+    unsafe { syscall(SyscallId::Kill, handle.0, 0, 0, 0, 0, 0) }
 }

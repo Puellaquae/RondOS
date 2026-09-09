@@ -28,3 +28,11 @@ version = "0.1.0"
 dependencies = [
  "rondos-abi",
 ]
+
+[[package]]
+name = "spin"
+version = "0.1.0"
+dependencies = [
+ "rondos-abi",
+ "rondos-rt",
+]

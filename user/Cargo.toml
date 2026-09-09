@@ -5,6 +5,7 @@ members = [
     "lib/rondos-rt",
     "apps/init",
     "apps/crash",
+    "apps/spin",
 ]
 
 [profile.dev]

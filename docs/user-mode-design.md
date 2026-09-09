@@ -564,6 +564,7 @@ syscall stub 是一个函数指针（快路径可用时指向 `syscall` 版本�
 | `handle-table` | handle 编码 `index:32\|generation:32`：close 后 generation+1，旧 handle 必 `BadHandle`；rights 不足 `Permission`；VMA 单区间/权限校验 |
 | `user-spawn` | 内核为两个进程建地址空间（`create_kernel_address_space`）+ VMA + 用户线程，`cs=0x1b ss=0x23`，`iretq` 进 ring3 |
 | `user-process` | 用户程序依次调 `sys_info`（写栈上的 `Info`，校验 `abi_version`）、`sys_clock_gettime`、`sys_yield`、`sys_log`（内核打印 `user: hello ring3`）、`sys_exit(0)`；任何一步失败就以非零状态退出 |
+| `elf-loader` | 内核从 `BootInfo.initrd` 的 boot tar 里取 `bin/init`，按 ELF 段权限装载（W+X 被拒）、写 `StartupBlock` + root 目录 capability；`init` 自己 `open`/`spawn`/`wait`/`proc_status`/`kill` 两个子进程并全部回收 |
 | `user-fault-isolation` | 另一个进程写未映射地址 → `#PF` → `ExitStatus::Fault{vector:14,addr:0x1234}`，**另一个进程照常跑完** |
 | `user-reclaim` | 两个进程死后，用户页、用户半区页表、内核栈全部归还分配器（`free_pages` 不下降） |
 
@@ -593,6 +594,8 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 * **`iretq` 不恢复 DS/ES**：它只从栈上恢复 CS/SS/RFLAGS/RIP/RSP，所以调度器第一次切进用户线程时 DS/ES 还是 `KERNEL_DATA`（DPL0），CPL3 下访问数据立刻 `#GP`。同一个修复点同时解决这两条；
 * **大结构体的 `Default` 会在内核栈上先造一个临时对象**：`ProcessTable`（16 个 `Process`，每个含 64 槽 handle 表）约 37 KiB，`Singleton::init` 的 `write_volatile(T::default())` 直接冲爆 64 KiB 引导栈/16 KiB 线程栈，表现为 `#PF` 落在 `.text` 里（`cr2` 看着莫名）。正解：给表一个 `const fn new()`，用 `UnsafeCell` 静态量直接落在 `.bss`（`[const { Process::new() }; N]`）；
 * **`pending_reap` 只能记一个线程是不够的**：同一 tick 内两个线程可能先后死亡（一个 `sys_exit`、一个缺页被杀），后者会覆盖前者的待回收索引，前者的内核栈和整个进程就永远泄漏了。正解：每 tick 扫一遍线程表，回收所有 `Dying` 且非当前线程的 TCB；
+* **`StartupBlock` 必须放在 `rsp` *上方***：第一版把它写在 `rsp` 下面（栈的生长方向），用户程序一压栈就把 `caps` 数组覆盖成垃圾，表现为「内核明明授予了 root 句柄，`init` 却说没有」。栈顶往下的顺序是 `StartupBlock` → capability 数组 → `rsp`；
+* **`sys_wait` 可以在 syscall 里直接 `thread::sleep`**：`int 0x81` 从 ring0 再压一层帧、调用调度器，被唤醒后从嵌套帧返回、继续跑完 syscall 处理函数，再回到最外层帧 `iretq`。这样 P1 不需要 §6.3 的续体机制就能实现阻塞式等待（真正的续体留给 P2 的 channel recv）；
 * `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单
@@ -607,9 +610,11 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 | `io/vga.rs` | 保留为 fallback，新增 `io/fb.rs`：`BootInfo` 取 fb 描述、写合并映射、帧缓冲控制台（**实机无串口时的唯一调试手段**） |
 | `io/input.rs`（新） | PS/2 键盘（+ 可选 aux 口）→ `InputEvent` 环形缓冲，作为可 `read` 的设备 handle |
 | `proc/mod.rs`（新 ✅ P0） | `Process`、`VmaList`、`HandleTable`、`ProcessTable`、`ExitStatus`、`copy_from_user/to_user` |
-| `exec.rs`（新 ✅ P1a） | ELF64 装载（按段权限映射、W^X）、固定用户栈、ustar 查找、`spawn` |
+| `exec.rs`（新 ✅ P1） | ELF64 装载（按段权限映射、W^X）、固定用户栈 + `StartupBlock`/capability、`spawn_path`/`spawn_entry`/`exit_status` |
+| `fs.rs`（新 ✅ P1） | boot tar 只读文件系统：`find`/`entries`/`read`/`read_all`（ustar，无 GNU 扩展） |
+| `proc/mod.rs` ✅ P1 | `ObjRef`（Dir/File/Device/Process）+ 句柄即权限；`sys_kill` 走 `thread::kill_pid` |
 | `user/lib/rondos-abi/`（新 ✅ P0） | 内核+用户共享的 ABI 定义（唯一真相源）：`SyscallId`/`Status`/`Handle`/`Rights`/`Info` + 布局断言 |
-| `syscall.rs`（新 ✅ P0） | `int 0x80` 分发；P0 实现 `0x00/0x10/0x11/0x13/0x15/0x16`，其余返回 `Status::Unsupported` |
+| `syscall.rs`（新 ✅ P0/P1） | `int 0x80` 分发；已实现 `0x00/0x10/0x11/0x13/0x14/0x15/0x16` + `0x20/0x21/0x22/0x23` + `0x50/0x51/0x52/0x56`，其余返回 `Status::Unsupported` |
 | `bootinfo.rs`（新） | `BootInfo` 版本化结构与校验 |
 | `boot/uefi/`（新） | `x86_64-unknown-uefi` stub，用 **`uefi-rs`**（已定：依赖不多、体积可控，省掉手写协议表） |
 
@@ -901,8 +906,7 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | --- | --- | --- |
 | **M0 迁移** | x86-64 + UEFI 单路径、4 级分页 + NX、64 位 trap/GDT/TSS、SSE 使能 + 每线程 FXSAVE、UEFI stub + `BootInfo`、帧缓冲控制台；删除 NASM loader | QEMU+OVMF 与**一台真机**都能启动并打印自检；现有调度/内存自检全过 |
 | **P0 内核地基 ✅** | `proc/`（`Process`/VMA/`HandleTable`/`ExitStatus`）、每线程地址空间随调度切换、`rondos-abi` 共享 crate、`int 0x80` v1 分发（`sys_info`/`sys_exit`/`sys_thread_exit`/`sys_yield`/`sys_clock_gettime`/`sys_log`）、`kill_current` + `request_resched` | ✅ 内核构造用户进程，ring3 跑完 `sys_info`→`sys_log`→`sys_exit(0)`；另一个进程非法写只杀自己；帧全部回收（`make test` 16/16） |
-| **P1a 装载与编译 ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器（`exec.rs`）、ustar 引导镜像、`init`/`crash` | ✅ `init: hello from ring 3` 出现在串口；`crash` 与 `init` 并发、缺页只杀自己；`make test` 17/17 |
-| **P1b 进程 API** | `sys_spawn`/`sys_wait` + 文件 handle（tarfs）、`init` 派生其他程序 | 待办 |
+| **P1 装载与进程 API ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器、tarfs（boot.tar）、`StartupBlock` + capability、`sys_open/read/write/close/spawn/wait/proc_status/kill/sleep_ns`、`init` 派生并回收子进程 | ✅ `init` 从 tar 打开 `bin/crash` 并 spawn → `sys_wait` 拿到 `FAULT{14,0xdeadbeef}`；再 spawn `bin/spin` → `sleep` → `sys_kill` → wait 拿到 `KILLED`；全部回收，`make test` 17/17 |
 | **P2 内存与 IPC** | `sys_mem_map/share`、用户堆、`chan_*`、`sys_wait` 多 handle、文件 handle、tmpfs 层、最小 C 支持 | echo 程序经 channel 回显；`/bin/*` 可读；一个 C 写的 hello 也能跑；`make test` grep `PASS` |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |

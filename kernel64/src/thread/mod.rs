@@ -396,6 +396,30 @@ pub fn kill_current() {
     intr::request_resched();
 }
 
+/// Kill the user thread of `pid` from another thread.
+///
+/// The target may be running, ready or blocked; `schedule` skips Dying threads
+/// in the ready queue and the reaper frees its stack and process next tick.
+pub fn kill_pid(pid: u32) -> bool {
+    crate::arch::x86_64::cli();
+    let s = sched();
+    for i in 0..MAX_THREADS {
+        if !s.threads[i].used {
+            continue;
+        }
+        if s.threads[i].kind == (ThreadKind::User { pid }) {
+            s.threads[i].state = ThreadState::Dying;
+            if i == s.current {
+                intr::request_resched();
+            }
+            crate::arch::x86_64::sti();
+            return true;
+        }
+    }
+    crate::arch::x86_64::sti();
+    false
+}
+
 /// `fn(frame, vector) -> next_frame` installed as the scheduler hook.
 fn sched_entry(frame: usize, vector: usize) -> usize {
     if vector == VECTOR_TIMER {
@@ -442,13 +466,14 @@ pub fn schedule(cur_frame: usize) -> usize {
         }
     }
 
-    let next = match s.dequeue() {
-        Some(h) => h,
-        None => {
-            if cur_is_idle {
-                cur
-            } else {
-                s.idle
+    // A thread can be marked Dying while it sits in the ready queue (another
+    // process called sys_kill).  Skip it: it must never run again.
+    let next = loop {
+        match s.dequeue() {
+            Some(h) if s.threads[h].state == ThreadState::Dying => continue,
+            Some(h) => break h,
+            None => {
+                break if cur_is_idle { cur } else { s.idle };
             }
         }
     };
