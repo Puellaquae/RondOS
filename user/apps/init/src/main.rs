@@ -10,8 +10,8 @@
 
 use rondos_abi::{exit_kind, mem_flags, wait_reason, CapDesc, Handle, ObjKind, StartupBlock};
 use rondos_rt::{
-    chan_create, chan_recv, chan_send, close, kill, mem_map, open_file, print, println,
-    proc_status, sleep_ns, spawn, spawn_with_caps, wait,
+    chan_create, chan_recv, chan_send, close, kill, mem_map, open_file, open_file_flags, print,
+    println, proc_status, readdir, sleep_ns, spawn, spawn_with_caps, wait, write_file,
 };
 
 /// Touch .data so the image carries a writable, non-executable segment: the
@@ -125,6 +125,46 @@ fn check_echo_child(root: Handle) -> i32 {
     0
 }
 
+/// tmpfs: create a file, write it, reopen and read it back, then list the
+/// directory (tar entries first, then tmpfs files).
+fn check_tmpfs(root: Handle) -> i32 {
+    let path = b"/tmp/note.txt";
+    let flags = rondos_abi::open_flags::READ
+        | rondos_abi::open_flags::WRITE
+        | rondos_abi::open_flags::CREATE;
+    let h = step!(60, open_file_flags(root, path, flags));
+    let msg = b"tmpfs says hi";
+    step!(61, write_file(h, msg));
+    step!(62, close(h));
+
+    // A fresh open starts at offset 0.
+    let h = step!(63, open_file(root, path));
+    let mut buf = [0u8; 32];
+    let n = step!(64, rondos_rt::read(h, &mut buf));
+    step!(65, close(h));
+    if &buf[..n] != msg {
+        println!("init: tmpfs read back {} bytes, expected {}", n, msg.len());
+        return 66;
+    }
+    println!("init: tmpfs file round-trips ({} bytes)", n);
+
+    let mut count = 0u32;
+    while let Ok(e) = readdir(root, count) {
+        if count == 0 {
+            println!(
+                "init: readdir[0] = {}",
+                core::str::from_utf8(e.name()).unwrap_or("?")
+            );
+        }
+        count += 1;
+    }
+    println!("init: readdir found {} entries", count);
+    if count < 6 {
+        return 67;
+    }
+    0
+}
+
 /// Run the C program (`bin/chello`, built by the host gcc from `user/c/`).
 fn check_c_program(root: Handle) -> i32 {
     let image = step!(50, open_file(root, b"/bin/chello"));
@@ -199,6 +239,10 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
         return rc;
     }
     let rc = check_c_program(root);
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_tmpfs(root);
     if rc != 0 {
         return rc;
     }

@@ -613,6 +613,7 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 * **回收线程前必须把它从就绪队列里摘掉**：`sys_kill` 会把一个还在队列里的线程标成 `Dying`，如果下一 tick 直接 `reclaim`（把 TCB 重置成 `frame = 0`），链表里就留下一个指向空槽的索引，`dequeue` 取出它、`isr_common` 执行 `mov rsp, rax` 得到 `rsp = 0`，下一条指令就是 `#DF`。`reclaim` 现在先 `unlink`；
 * **`MemObj` 里存的是物理地址**：页框分配器返回的是 physmap 视图（`0xFFFF_8000…`），直接当 `pa` 映射进用户页会指向不存在的物理地址（表现为用户一写就 `#PF`）。分配时 `virt_to_phys`，释放时 `phys_to_virt`；
 * **关闭句柄要释放对象引用**：`close` 只 bump generation 是不够的，`MemObj`/`ChanObj` 的引用计数不减就永远回收不了那一页；
+* **tmpfs 的存储别用页框分配器**：文件系统是长期存在的，用 `page_alloc` 会让「测试后页框数回到基线」这条断言失效（那正是 P0 以来抓内存泄漏的手段）。固定槽位 + `.bss` 数组既简单又不干扰该不变量；
 * `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单
@@ -927,7 +928,8 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | **P1 装载与进程 API ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器、tarfs（boot.tar）、`StartupBlock` + capability、`sys_open/read/write/close/spawn/wait/proc_status/kill/sleep_ns`、`init` 派生并回收子进程 | ✅ `init` 从 tar 打开 `bin/crash` 并 spawn → `sys_wait` 拿到 `FAULT{14,0xdeadbeef}`；再 spawn `bin/spin` → `sleep` → `sys_kill` → wait 拿到 `KILLED`；全部回收，`make test` 17/17 |
 | **P2a 内存与 IPC ✅** | `sys_mem_map/unmap/share/map_phys`（引用计数的 `MemObj`）、`chan_create/send/recv`（有界消息队列）、`sys_stat`、`sys_spawn` 的 capability 委托 | ✅ `init` 映射共享内存并回读、创建 channel 并把一端委托给 `bin/echo`，`echo` 收到后原样送回；全部回收，`make test` 17/17 |
 | **P2b C 支持 ✅** | `user/c/`：`crt0.S`（对齐栈 → `main` → `sys_exit`）、手写 `rondos.h`（`int $0x80` 包装 + `_Static_assert` 布局检查）、`hello.c`；Makefile 用宿主 gcc `-ffreestanding -nostdlib -no-pie` 直接链出用户态 ELF | ✅ `chello` 在 ring3 打印、打开 `/bin/hello.c` 读回自己的源码、exit 0；`make test` grep 到 |
-| **P2c 文件系统** | tmpfs 可写层、`sys_readdir`、channel 传递 handle、用户堆 allocator | 待办 |
+| **P2c 文件系统 ✅** | tmpfs 可写层（`open_flags::CREATE`、`sys_write` 落在 tmpfs 文件上）、`sys_readdir`（tar 条目在前、tmpfs 在后）、`DirEntry` | ✅ `init` 建 `/tmp/note.txt` 写入 13 字节、重新打开读回、`readdir` 数到 7 个条目 |
+| **P2d 收尾** | channel 传递 handle、用户堆 allocator、`sys_seek`/`sys_unlink` | 待办 |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |
 | **P5 打磨** | AHCI、APIC/IOAPIC、xHCI HID 鼠标、demand paging/COW、`ET_DYN`+ASLR、`syscall` 快路径、FAT 盘上 FS、wasm 前端 | 老 ABI 程序在新内核上照跑；实机可持久化存盘、可用真鼠标 |

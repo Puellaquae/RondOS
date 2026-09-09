@@ -455,6 +455,44 @@ pub struct Stat {
 pub mod open_flags {
     pub const READ: u64 = 1 << 0;
     pub const WRITE: u64 = 1 << 1;
+    /// Create the file if it does not exist (tmpfs layer).
+    pub const CREATE: u64 = 1 << 2;
+}
+
+/// One `sys_readdir` entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DirEntry {
+    pub hdr: StructHeader,
+    /// [`ObjKind`] value (File for regular files).
+    pub kind: u32,
+    pub _pad0: u32,
+    pub len_bytes: u64,
+    pub name_len: u32,
+    pub _pad1: u32,
+    pub name: [u8; 64],
+    pub _reserved: [u64; 2],
+}
+
+impl Default for DirEntry {
+    fn default() -> Self {
+        Self {
+            hdr: StructHeader::default(),
+            kind: 0,
+            _pad0: 0,
+            len_bytes: 0,
+            name_len: 0,
+            _pad1: 0,
+            name: [0; 64],
+            _reserved: [0; 2],
+        }
+    }
+}
+
+impl DirEntry {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(self.name.len())]
+    }
 }
 
 // ------------------------------------------------------------------- layout
@@ -488,6 +526,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ExitStatus, rip) == 24);
     assert!(core::mem::size_of::<Stat>() == 56);
     assert!(core::mem::offset_of!(Stat, va) == 24);
+    assert!(core::mem::size_of::<DirEntry>() == 112);
+    assert!(core::mem::offset_of!(DirEntry, name) == 32);
 };
 
 // --------------------------------------------------------------- user stubs
@@ -747,6 +787,22 @@ pub fn chan_recv(handle: Handle, buf: &mut [u8]) -> SyscallResult {
             handle.0,
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x55 sys_readdir(dir, index, &mut DirEntry)`
+#[cfg(feature = "user")]
+pub fn readdir(dir: Handle, index: u32, out: &mut DirEntry) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Readdir,
+            dir.0,
+            index as u64,
+            out as *mut DirEntry as u64,
             0,
             0,
             0,

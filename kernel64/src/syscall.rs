@@ -24,7 +24,7 @@ use crate::proc::{self, ExitStatus, ObjRef};
 use crate::thread;
 use rondos_abi::{
     feature, mem_flags, open_flags, rights, wait_reason, CapDesc, Clock, Handle, Info, LogLevel,
-    ObjKind, Slice, Stat, Status, StructHeader, SyscallId, WaitResult, ABI_VERSION,
+    DirEntry, ObjKind, Slice, Stat, Status, StructHeader, SyscallId, WaitResult, ABI_VERSION,
 };
 
 /// Largest `sys_log` payload accepted in one call (keeps the copy on-stack).
@@ -96,6 +96,7 @@ pub fn dispatch(f: &mut TrapFrame) {
         SyscallId::ChanSend => sys_chan_send(f),
         SyscallId::ChanRecv => sys_chan_recv(f),
         SyscallId::Stat => sys_stat(f),
+        SyscallId::Readdir => sys_readdir(f),
         // Everything else is declared in the frozen v1 table but lands in P1+.
         _ => f.set_result(Status::Unsupported as u64, 0),
     }
@@ -232,8 +233,37 @@ fn sys_open(f: &mut TrapFrame) {
     if let Err(s) = p.copy_from_user(&mut path[..path_len], path_ptr) {
         return err(f, s);
     }
-    if flags & open_flags::WRITE != 0 {
-        return err(f, Status::Permission); // tarfs is read-only
+    let want_write = flags & open_flags::WRITE != 0;
+    let create = flags & open_flags::CREATE != 0;
+
+    // tmpfs shadows the tar for names it holds; otherwise the boot tar is the
+    // read-only fallback.
+    if let Some(id) = fs::tmp().find(&path[..path_len]) {
+        let mut r = rights::READ;
+        if want_write {
+            r |= rights::WRITE;
+        }
+        return match p.handles_mut().insert(ObjRef::TmpFile { id, pos: 0 }, r) {
+            Some(h) => ok(f, h.0),
+            None => err(f, Status::OutOfMemory),
+        };
+    }
+    if create {
+        let id = match fs::tmp().create(&path[..path_len]) {
+            Ok(id) => id,
+            Err(s) => return err(f, s),
+        };
+        let mut r = rights::READ;
+        if want_write {
+            r |= rights::WRITE;
+        }
+        return match p.handles_mut().insert(ObjRef::TmpFile { id, pos: 0 }, r) {
+            Some(h) => ok(f, h.0),
+            None => err(f, Status::OutOfMemory),
+        };
+    }
+    if want_write {
+        return err(f, Status::Permission); // the boot tar is read-only
     }
     let Some(entry) = fs::TarFs::root().and_then(|t| t.find(&path[..path_len])) else {
         return err(f, Status::NotFound);
@@ -260,6 +290,36 @@ fn sys_read(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
+    // tmpfs first: a different object, but the same read contract.
+    let tmp_src = match p.handles().resolve(h, rights::READ) {
+        Ok(slot) => match slot.obj {
+            ObjRef::TmpFile { id, pos } => Some((id, pos)),
+            _ => None,
+        },
+        Err(s) => return err(f, s),
+    };
+    if let Some((id, pos)) = tmp_src {
+        let mut chunk = [0u8; 256];
+        let mut total = 0usize;
+        while total < len {
+            let want = (len - total).min(chunk.len());
+            let n = fs::tmp().read(id, pos + total as u64, &mut chunk[..want]);
+            if n == 0 {
+                break;
+            }
+            if let Err(s) = p.copy_to_user(dst + total as u64, &chunk[..n]) {
+                return err(f, s);
+            }
+            total += n;
+        }
+        let _ = p.handles_mut().with_mut(h, |slot| {
+            if let ObjRef::TmpFile { pos, .. } = &mut slot.obj {
+                *pos += total as u64;
+            }
+        });
+        return ok(f, total as u64);
+    }
+
     let (off, file_len, pos) = match p.handles().resolve(h, rights::READ) {
         Ok(slot) => match slot.obj {
             ObjRef::File { off, len, pos } => (off, len, pos),
@@ -310,17 +370,32 @@ fn sys_write(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
-    match p.handles().resolve(h, rights::WRITE) {
+    let tmp_dst = match p.handles().resolve(h, rights::WRITE) {
         Ok(slot) => match slot.obj {
-            ObjRef::Device { node: 0 } => {}
+            ObjRef::TmpFile { id, pos } => Some((id, pos)),
+            ObjRef::Device { node: 0 } => None,
             ObjRef::Device { .. } => return err(f, Status::NotFound),
             _ => return err(f, Status::Permission),
         },
         Err(s) => return err(f, s),
-    }
+    };
+
     let mut buf = [0u8; MAX_LOG_LEN];
     if let Err(s) = p.copy_from_user(&mut buf[..len], f.rsi) {
         return err(f, s);
+    }
+    if let Some((id, pos)) = tmp_dst {
+        return match fs::tmp().write(id, pos, &buf[..len]) {
+            Ok(n) => {
+                let _ = p.handles_mut().with_mut(h, |slot| {
+                    if let ObjRef::TmpFile { pos, .. } = &mut slot.obj {
+                        *pos += n as u64;
+                    }
+                });
+                ok(f, n as u64)
+            }
+            Err(s) => err(f, s),
+        };
     }
     log_bytes(&buf[..len]);
     ok(f, len as u64)
@@ -813,6 +888,7 @@ fn sys_stat(f: &mut TrapFrame) {
             out.rights = slot.rights;
             match slot.obj {
                 ObjRef::File { len, .. } => out.len_bytes = len as u64,
+                ObjRef::TmpFile { id, .. } => out.len_bytes = fs::tmp().len(id),
                 ObjRef::Memory { va, len, .. } => {
                     out.len_bytes = len;
                     out.va = va;
@@ -824,6 +900,62 @@ fn sys_stat(f: &mut TrapFrame) {
     }
     let bytes = unsafe {
         core::slice::from_raw_parts(&out as *const Stat as *const u8, size_of::<Stat>())
+    };
+    match p.copy_to_user(out_ptr, bytes) {
+        Ok(()) => ok(f, bytes.len() as u64),
+        Err(s) => err(f, s),
+    }
+}
+
+/// `0x55 sys_readdir(dir, index, &mut DirEntry)`
+///
+/// v1 has one flat namespace: the tar entries first, then tmpfs files.  Index
+/// past the end returns `NotFound`, which the caller reads as end-of-directory.
+fn sys_readdir(f: &mut TrapFrame) {
+    let dir = Handle(f.rdi);
+    let index = f.rsi as usize;
+    let out_ptr = f.rdx;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    match p.handles().resolve(dir, rights::READ) {
+        Ok(slot) if matches!(slot.obj, ObjRef::Dir { .. }) => {}
+        Ok(_) => return err(f, Status::InvalidArgument),
+        Err(s) => return err(f, s),
+    }
+
+    let mut out = DirEntry {
+        hdr: StructHeader::new(size_of::<DirEntry>() as u32),
+        ..Default::default()
+    };
+    let mut found = false;
+    if let Some(tar) = fs::TarFs::root() {
+        if let Some(e) = tar.entry(index) {
+            out.kind = ObjKind::File as u32;
+            out.len_bytes = e.len as u64;
+            let n = e.name.len().min(out.name.len());
+            out.name[..n].copy_from_slice(&e.name[..n]);
+            out.name_len = n as u32;
+            found = true;
+        }
+    }
+    if !found {
+        let tar_count = fs::TarFs::root().map(|t| t.count()).unwrap_or(0);
+        if let Some(fe) = fs::tmp().entry(index - tar_count.min(index)) {
+            out.kind = ObjKind::File as u32;
+            out.len_bytes = fe.len as u64;
+            let name = fe.name();
+            let n = name.len().min(out.name.len());
+            out.name[..n].copy_from_slice(&name[..n]);
+            out.name_len = n as u32;
+            found = true;
+        }
+    }
+    if !found {
+        return err(f, Status::NotFound);
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(&out as *const DirEntry as *const u8, size_of::<DirEntry>())
     };
     match p.copy_to_user(out_ptr, bytes) {
         Ok(()) => ok(f, bytes.len() as u64),

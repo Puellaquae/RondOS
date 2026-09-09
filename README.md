@@ -17,7 +17,8 @@
     每个线程带自己的页表根，切换线程即切换地址空间
   - `src/proc/`         `Process`/VMA/`HandleTable`/`ExitStatus`、用户指针校验
   - `src/syscall.rs`    `int 0x80` v1 分发（info/exit/yield/clock/log/sleep + 文件与进程组）
-  - `src/fs.rs`         boot tar 只读文件系统（ustar，`bin/init` 等）
+  - `src/fs.rs`         boot tar 只读文件系统（ustar）+ tmpfs 可写层（固定槽位，
+    存储是 `.bss` 数组，不占页框）
   - `src/obj.rs`        共享内存对象 + channel（引用计数、全局表）
   - `src/exec.rs`       ELF64 装载、`StartupBlock` + capability、`spawn_path`/`spawn_entry`
   - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version），内核唯一的引导契约
@@ -95,6 +96,7 @@ OVMF 路径用 `OVMF=/path/to/OVMF.fd` 覆盖（默认 `/usr/share/ovmf/OVMF.fd`
 channel IPC（`chan_create/send/recv`）、`sys_spawn` 的 capability 委托、
 每线程 FXSAVE（M0.9） | ✅ |
 | P2b | 最小 C 支持（`crt0.S` + `rondos.h` + 宿主 gcc 直接出 ELF） | ✅ |
+| P2c | tmpfs 可写层（`O_CREATE`/`sys_write`）+ `sys_readdir` | ✅ |
 
 `make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (17/17)`（另有 4 条
 串口断言：init 进 ring3、派生/回收子进程、channel 往返、C 程序跑通）：

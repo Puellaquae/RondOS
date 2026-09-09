@@ -182,3 +182,137 @@ impl TarFs {
         Ok(n)
     }
 }
+
+// ------------------------------------------------------------------- tmpfs
+
+/// A writable in-memory layer above the (immutable) boot tar — P2c.
+///
+/// Deliberately tiny: fixed slots, fixed name length, one 4 KiB page per file,
+/// and the storage is a `.bss` array rather than allocated frames.  That keeps
+/// tmpfs out of the frame allocator entirely, so "no page leaks after the smoke
+/// test" stays a meaningful invariant.  v1 has no `unlink`, so a file lives
+/// until shutdown — the same lifetime model a ramdisk wants.
+pub const MAX_TMP_FILES: usize = 8;
+pub const TMP_NAME_MAX: usize = 32;
+pub const TMP_FILE_CAP: usize = 4096;
+
+pub struct TmpFile {
+    pub used: bool,
+    pub len: u32,
+    name: [u8; TMP_NAME_MAX],
+    name_len: u8,
+    data: [u8; TMP_FILE_CAP],
+}
+
+impl TmpFile {
+    const fn new() -> Self {
+        Self {
+            used: false,
+            len: 0,
+            name: [0; TMP_NAME_MAX],
+            name_len: 0,
+            data: [0; TMP_FILE_CAP],
+        }
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
+pub struct TmpFs {
+    files: [TmpFile; MAX_TMP_FILES],
+}
+
+impl TmpFs {
+    pub const fn new() -> Self {
+        Self {
+            files: [const { TmpFile::new() }; MAX_TMP_FILES],
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.files.iter().filter(|f| f.used).count()
+    }
+
+    pub fn get(&self, id: u32) -> Option<&TmpFile> {
+        self.files.get(id as usize).filter(|f| f.used)
+    }
+
+    pub fn find(&self, name: &[u8]) -> Option<u32> {
+        let name = name.strip_prefix(b"/").unwrap_or(name);
+        self.files
+            .iter()
+            .position(|f| f.used && f.name() == name)
+            .map(|i| i as u32)
+    }
+
+    /// Create an empty file; fails when it already exists or the table is full.
+    pub fn create(&mut self, name: &[u8]) -> Result<u32, Status> {
+        let name = name.strip_prefix(b"/").unwrap_or(name);
+        if name.is_empty() || name.len() > TMP_NAME_MAX {
+            return Err(Status::InvalidArgument);
+        }
+        if self.find(name).is_some() {
+            return Err(Status::InvalidArgument);
+        }
+        let slot = self
+            .files
+            .iter()
+            .position(|f| !f.used)
+            .ok_or(Status::OutOfMemory)?;
+        let f = &mut self.files[slot];
+        *f = TmpFile::new();
+        f.used = true;
+        f.name[..name.len()].copy_from_slice(name);
+        f.name_len = name.len() as u8;
+        Ok(slot as u32)
+    }
+
+    pub fn len(&self, id: u32) -> u64 {
+        self.get(id).map(|f| f.len as u64).unwrap_or(0)
+    }
+
+    pub fn read(&self, id: u32, pos: u64, buf: &mut [u8]) -> usize {
+        let Some(f) = self.get(id) else { return 0 };
+        if pos >= f.len as u64 {
+            return 0;
+        }
+        let n = (f.len as u64 - pos).min(buf.len() as u64) as usize;
+        buf[..n].copy_from_slice(&f.data[pos as usize..pos as usize + n]);
+        n
+    }
+
+    /// Write at `pos`, extending the file; never past `TMP_FILE_CAP`.
+    pub fn write(&mut self, id: u32, pos: u64, buf: &[u8]) -> Result<usize, Status> {
+        let Some(f) = self.files.get_mut(id as usize).filter(|f| f.used) else {
+            return Err(Status::BadHandle);
+        };
+        let pos = pos as usize;
+        if pos >= TMP_FILE_CAP {
+            return Err(Status::OutOfMemory);
+        }
+        let n = buf.len().min(TMP_FILE_CAP - pos);
+        f.data[pos..pos + n].copy_from_slice(&buf[..n]);
+        if (pos + n) as u32 > f.len {
+            f.len = (pos + n) as u32;
+        }
+        Ok(n)
+    }
+
+    pub fn entry(&self, index: usize) -> Option<&TmpFile> {
+        self.files.iter().filter(|f| f.used).nth(index)
+    }
+}
+
+#[repr(transparent)]
+struct TmpCell(core::cell::UnsafeCell<TmpFs>);
+
+unsafe impl Sync for TmpCell {}
+
+static TMPFS: TmpCell = TmpCell(core::cell::UnsafeCell::new(TmpFs::new()));
+
+/// The writable layer, mounted at `/tmp` (paths are flat in v1).
+pub fn tmp() -> &'static mut TmpFs {
+    unsafe { &mut *TMPFS.0.get() }
+}

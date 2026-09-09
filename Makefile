@@ -119,6 +119,9 @@ test: esp
 	@grep -q "user: chello: hello from C on RondOS" $(SERIAL_LOG) \
 	  && echo "==> C program ran" \
 	  || (echo "==> C program failed"; exit 1)
+	@grep -q "user: init: tmpfs file round-trips" $(SERIAL_LOG) \
+	  && echo "==> tmpfs round-trip + readdir" \
+	  || (echo "==> tmpfs failed"; exit 1)
 
 clean:
 	rm -rf build

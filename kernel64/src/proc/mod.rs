@@ -173,6 +173,8 @@ pub enum ObjRef {
     Dir { node: u32 },
     /// A tarfs regular file: `(offset, length)` into the boot tar plus a cursor.
     File { off: u32, len: u32, pos: u64 },
+    /// A tmpfs (writable) file: slot id plus a cursor.
+    TmpFile { id: u32, pos: u64 },
     /// A device node: 0 = console (`sys_write` -> the kernel log).
     Device { node: u32 },
     /// A shared memory object, mapped in this process at `va`.
@@ -188,7 +190,7 @@ impl ObjRef {
         match self {
             ObjRef::None => ObjKind::None,
             ObjRef::Dir { .. } => ObjKind::Dir,
-            ObjRef::File { .. } => ObjKind::File,
+            ObjRef::File { .. } | ObjRef::TmpFile { .. } => ObjKind::File,
             ObjRef::Device { .. } => ObjKind::Device,
             ObjRef::Memory { .. } => ObjKind::Memory,
             ObjRef::Chan { .. } => ObjKind::Chan,

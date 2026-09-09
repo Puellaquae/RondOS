@@ -66,9 +66,24 @@ pub fn sleep_ns(ns: u64) {
 // ------------------------------------------------------- typed syscall sugar
 
 pub fn open_file(dir: Handle, path: &[u8]) -> Result<Handle, Status> {
-    let r = abi::open(dir, path, abi::open_flags::READ);
+    open_file_flags(dir, path, abi::open_flags::READ)
+}
+
+pub fn open_file_flags(dir: Handle, path: &[u8], flags: u64) -> Result<Handle, Status> {
+    let r = abi::open(dir, path, flags);
     if r.status.is_ok() {
         Ok(Handle(r.value))
+    } else {
+        Err(r.status)
+    }
+}
+
+/// Read one directory entry; `Err(NotFound)` means end of directory.
+pub fn readdir(dir: Handle, index: u32) -> Result<abi::DirEntry, Status> {
+    let mut out = abi::DirEntry::default();
+    let r = abi::readdir(dir, index, &mut out);
+    if r.status.is_ok() {
+        Ok(out)
     } else {
         Err(r.status)
     }
