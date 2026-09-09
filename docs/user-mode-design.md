@@ -638,6 +638,7 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 | `proc/mod.rs` ✅ P1/P2 | `ObjRef`（Dir/File/Device/Memory/Chan/Process）+ 句柄即权限；共享 VMA 只解映射不释放帧；`sys_kill` 走 `thread::kill_pid` |
 | `obj.rs`（新 ✅ P2a） | `MemObj`（页帧 + 引用计数 + 设备物理页）与 `ChanObj`（有界消息队列）全局表 |
 | `user/lib/rondos-abi/`（新 ✅ P0） | 内核+用户共享的 ABI 定义（唯一真相源）：`SyscallId`/`Status`/`Handle`/`Rights`/`Info` + 布局断言 |
+| `tests/`（新 ✅） | 内核态测试程序：`tests/mod.rs` 是 harness（`Case { name, run }` + `Verdict` + `report`），`mm.rs`/`elf.rs`/`ring3.rs`/`sched.rs`/`user.rs` 各是一组程序；`main.rs` 只剩引导与 trap 入口 |
 | `syscall.rs`（新 ✅ P0/P1/P2a） | `int 0x80` 分发；已实现 `0x00/0x10/0x11/0x13/0x14/0x15/0x16`、`0x20/0x21/0x22/0x23`、`0x30/0x31/0x32/0x33`、`0x40/0x41/0x42`、`0x50/0x51/0x52/0x54/0x56`，其余返回 `Status::Unsupported` |
 | `bootinfo.rs`（新） | `BootInfo` 版本化结构与校验 |
 | `boot/uefi/`（新） | `x86_64-unknown-uefi` stub，用 **`uefi-rs`**（已定：依赖不多、体积可控，省掉手写协议表） |

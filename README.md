@@ -22,6 +22,8 @@
   - `src/obj.rs`        共享内存对象 + channel（引用计数、全局表）
   - `src/exec.rs`       ELF64 装载、`StartupBlock` + capability、`spawn_path`/`spawn_entry`
   - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version），内核唯一的引导契约
+  - `src/tests/`        内核态测试程序（harness + mm/elf/ring3/sched/user 五组），
+    `main.rs` 只保留引导流程与 trap 入口
 - `boot/uefi/`  UEFI 引导 stub，目标 `x86_64-unknown-uefi`，基于 `uefi-rs`
   - GOP 选 32bpp 模式 → 读 ESP 上的 `\rondos\kernel.elf` → 按 `p_paddr` 装载
     → 填 `BootInfo`（内存图 + framebuffer + initrd）→ 建页表 →
