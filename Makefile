@@ -32,6 +32,8 @@ ESP_KERNEL := $(ESP)/rondos/kernel.elf
 ESP_STUB   := $(ESP)/EFI/BOOT/BOOTX64.EFI
 ESP_TAR    := $(ESP)/rondos/boot.tar
 ESP_TMP    := build/tmp
+ESP_IMG    := build/rondos-esp.img
+ESP_MB     ?= 64
 BOOT_TAR   := build/boot.tar
 USER_BIN   = $(USER_DIR)/target/$(USER_TARGET)/$(PROFILE)
 C_BUILD    := build/c
@@ -55,11 +57,14 @@ endif
 # Display is chosen per target: `run`/`test` are headless (serial only),
 # `run-gui` opens a window so the framebuffer console and the shell are usable.
 QEMU_FLAGS := -bios $(OVMF) -m 512 \
-              -drive file=fat:rw:$(ESP),format=raw \
+              -drive file=$(ESP_IMG),format=raw,snapshot=on \
               -no-reboot
 QEMU_DISPLAY ?= gtk
+USB_DEV    ?=
+USB_PART   ?=
+USB_MNT    ?= /mnt/rondos-usb
 
-.PHONY: all release user kernel boot cprogram esp run run-gui test clean
+.PHONY: all release user kernel boot cprogram esp esp-img usb usb-copy run run-gui test clean
 
 all: esp
 
@@ -110,15 +115,45 @@ esp: kernel boot $(BOOT_TAR)
 	cp $(BOOT_DIR)/target/$(UEFI_TARGET)/$(PROFILE)/rondos-boot.efi $(ESP_STUB)
 	cp $(BOOT_TAR) $(ESP_TAR)
 
-run: esp
+run: esp-img
 	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -display none -serial stdio
 
 # Interactive: the kernel's framebuffer console + shell in a QEMU window.
 # (Use `QEMU_DISPLAY=sdl` or `QEMU_DISPLAY=vnc=:0` if gtk is unavailable.)
-run-gui: esp
+run-gui: esp-img
 	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -serial mon:stdio
 
-test: esp
+# A real bootable disk image (MBR + FAT16 ESP), built without mtools/mkfs.
+esp-img: esp
+	python3 tools/mkesp.py $(ESP) $(ESP_IMG) $(ESP_MB)
+	python3 tools/verify_esp.py $(ESP_IMG) $(ESP)
+
+# Write the whole image to a USB device: `sudo make usb USB_DEV=/dev/sdX`.
+# Destructive — the device's partition table and everything on it are lost.
+usb: esp-img
+	@test -n "$(USB_DEV)" || (echo "usage: sudo make usb USB_DEV=/dev/sdX  (destroys the device)"; exit 1)
+	@test -b "$(USB_DEV)" || (echo "$(USB_DEV) is not a block device"; exit 1)
+	@echo "About to overwrite $(USB_DEV) with $(ESP_IMG)"; \
+	  lsblk -o NAME,SIZE,TRAN,MODEL "$(USB_DEV)" 2>/dev/null || true; \
+	  echo "Ctrl-C to abort..."; sleep 5
+	dd if=$(ESP_IMG) of=$(USB_DEV) bs=4M status=progress conv=fsync
+	sync
+
+# Copy the ESP onto an existing FAT partition, keeping its other files:
+# `sudo make usb-copy USB_PART=/dev/sdX1`.
+usb-copy: esp
+	@test -n "$(USB_PART)" || (echo "usage: sudo make usb-copy USB_PART=/dev/sdX1"; exit 1)
+	@test -b "$(USB_PART)" || (echo "$(USB_PART) is not a block device"; exit 1)
+	mkdir -p $(USB_MNT)
+	mount $(USB_PART) $(USB_MNT)
+	mkdir -p $(USB_MNT)/EFI/BOOT $(USB_MNT)/rondos
+	cp $(ESP)/EFI/BOOT/BOOTX64.EFI $(USB_MNT)/EFI/BOOT/
+	cp $(ESP)/rondos/kernel.elf $(ESP)/rondos/boot.tar $(USB_MNT)/rondos/
+	sync
+	umount $(USB_MNT)
+	@echo "done - disable Secure Boot and boot the USB device"
+
+test: esp-img
 	@command -v $(CC) >/dev/null || (echo "==> missing C compiler: $(CC)"; exit 1)
 	@command -v python3 >/dev/null || (echo "==> missing python3 (tools/mktar.py)"; exit 1)
 	@rm -f $(SERIAL_LOG)

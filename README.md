@@ -64,10 +64,33 @@ rustup component add rust-src --toolchain nightly
 make            # 构建用户程序 + 内核 + UEFI stub，打包 boot.tar，组装 build/esp/
 make run        # 正常启动（只跑必要的引导自检，然后拉起 /bin/init 并 idle）
 make run-gui    # 同上，但开 QEMU 窗口：帧缓冲控制台 + shell 可直接交互
+make esp-img    # 生成可启动的磁盘镜像 build/rondos-esp.img（MBR + FAT16 ESP）
+make usb USB_DEV=/dev/sdX        # 整盘写入（破坏性，需 root）
+make usb-copy USB_PART=/dev/sdX1 # 只把 ESP 文件拷进现有 FAT 分区（保留其他文件，需 root）
 make test       # 无头启动 + 跑完整测试套件，检查结果
 make release    # release 构建
 make clean
 ```
+
+`make esp-img` 不需要 `mtools`/`mkfs.vfat`：`tools/mkesp.py` 直接写出 FAT16
+（MBR + 类型 0xEF 的 ESP 分区，文件都用 8.3 短名），`tools/verify_esp.py` 再把镜像
+读回来逐文件比对。`make test` 就是从这个镜像启动的（`snapshot=on`，不污染镜像）。
+
+**写到 U 盘**（Secure Boot 必须关闭）：
+
+```bash
+lsblk -o NAME,SIZE,TRAN,MODEL,LABEL /dev/sdX      # 先确认设备，别写错盘
+make esp-img
+
+# 方式 A（推荐，非破坏性）：把 ESP 文件拷进现有 FAT 分区
+sudo make usb-copy USB_PART=/dev/sdX1
+
+# 方式 B（破坏性）：整盘覆盖成 64 MiB 镜像
+sudo make usb USB_DEV=/dev/sdX
+```
+
+方式 A 保留 U 盘上的其他文件，用完整容量；方式 B 把整盘变成我们的镜像（64 MiB
+之后的空间未使用）。两种方式都不需要 `mtools`。
 
 `make run-gui` 里能直接看到 P3 的界面：内核把日志同时写到串口和帧缓冲控制台，
 `init`（PID 1）把 console/keyboard 能力委托给 `bin/shell`，于是可以敲 `help`、`ls`、
