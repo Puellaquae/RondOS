@@ -125,7 +125,12 @@ pub fn load_elf(p: &mut Process, elf: &[u8]) -> Result<Image, Status> {
         let filesz = u64_at(elf, ph + 32)? as usize;
         let memsz = u64_at(elf, ph + 40)? as usize;
 
-        if vaddr % PAGE_SIZE as u64 != 0 || memsz == 0 {
+        // `ld` emits an empty RW PT_LOAD (vaddr 0, memsz 0) when a program has
+        // no .data/.bss at all — nothing to map, skip it.
+        if memsz == 0 {
+            continue;
+        }
+        if vaddr % PAGE_SIZE as u64 != 0 {
             return Err(Status::InvalidArgument);
         }
         if offset.checked_add(filesz).map_or(true, |e| e > elf.len()) || filesz > memsz {

@@ -125,6 +125,26 @@ fn check_echo_child(root: Handle) -> i32 {
     0
 }
 
+/// Run the C program (`bin/chello`, built by the host gcc from `user/c/`).
+fn check_c_program(root: Handle) -> i32 {
+    let image = step!(50, open_file(root, b"/bin/chello"));
+    let child = step!(51, spawn(image));
+    let _ = close(image);
+    let w = step!(52, wait(&[child], 5_000_000_000));
+    if w.reason != wait_reason::EXITED {
+        println!("init: chello ended with reason {}", w.reason);
+        return 53;
+    }
+    let st = step!(54, proc_status(child));
+    if st.kind != exit_kind::EXITED || st.code != 0 {
+        println!("init: chello exit kind {} code {}", st.kind, st.code);
+        return 55;
+    }
+    println!("init: C program exited 0");
+    let _ = close(child);
+    0
+}
+
 /// Shared memory: map an object, write a pattern, read it back.
 fn check_shared_memory() -> i32 {
     let (h, va) = step!(40, mem_map(4096, mem_flags::READ | mem_flags::WRITE));
@@ -175,6 +195,10 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
         return rc;
     }
     let rc = check_echo_child(root);
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_c_program(root);
     if rc != 0 {
         return rc;
     }

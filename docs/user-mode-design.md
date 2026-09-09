@@ -229,7 +229,17 @@ unsafe extern "C" fn rt_init(sb: *const StartupBlock) -> ! {
 - 全局分配器：先「bump + 大块释放」，之后换 `talc`（no_std、无锁）；
 - 无 libc。C 支持见 §4.5。
 
-### 4.5 C 程序支持（P2）
+### 4.5 C 程序支持（P2）—— ✅ 已落地最小版本
+
+`user/c/` 里是 v1 的 C 路径：`crt0.S` 把 `rdi`（`StartupBlock*`）原样传给 `main`，
+`main` 返回后由 crt0 直接发 `sys_exit`；`rondos.h` 用 `int $0x80` 包装 syscall，
+并用 `_Static_assert` 检查 `StartupBlock`/`CapDesc` 的布局与 ABI crate 一致。
+构建不需要交叉编译器：宿主 gcc 以 `-ffreestanding -nostdlib -static -no-pie
+-fno-pic -mno-red-zone -mcmodel=small` 编译，再用 `ld -T user/user.ld` 链接。
+`rondos.h` 最终会由 `xtask` 从 `rondos-abi` 生成（design §6.8），现在的
+`_Static_assert` 就是防漂移的那道闸。
+
+
 
 提供 `rondos-libc` shim（`malloc/free/memcpy/printf/open/read/write/...` 薄封装 + `crt0`），
 用 `clang --target=x86_64-unknown-none-elf -nostdlib` 或 `zig cc -target x86_64-freestanding` 交叉编译，
@@ -916,7 +926,8 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | **P0 内核地基 ✅** | `proc/`（`Process`/VMA/`HandleTable`/`ExitStatus`）、每线程地址空间随调度切换、`rondos-abi` 共享 crate、`int 0x80` v1 分发（`sys_info`/`sys_exit`/`sys_thread_exit`/`sys_yield`/`sys_clock_gettime`/`sys_log`）、`kill_current` + `request_resched` | ✅ 内核构造用户进程，ring3 跑完 `sys_info`→`sys_log`→`sys_exit(0)`；另一个进程非法写只杀自己；帧全部回收（`make test` 16/16） |
 | **P1 装载与进程 API ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器、tarfs（boot.tar）、`StartupBlock` + capability、`sys_open/read/write/close/spawn/wait/proc_status/kill/sleep_ns`、`init` 派生并回收子进程 | ✅ `init` 从 tar 打开 `bin/crash` 并 spawn → `sys_wait` 拿到 `FAULT{14,0xdeadbeef}`；再 spawn `bin/spin` → `sleep` → `sys_kill` → wait 拿到 `KILLED`；全部回收，`make test` 17/17 |
 | **P2a 内存与 IPC ✅** | `sys_mem_map/unmap/share/map_phys`（引用计数的 `MemObj`）、`chan_create/send/recv`（有界消息队列）、`sys_stat`、`sys_spawn` 的 capability 委托 | ✅ `init` 映射共享内存并回读、创建 channel 并把一端委托给 `bin/echo`，`echo` 收到后原样送回；全部回收，`make test` 17/17 |
-| **P2b 文件与 C** | tmpfs 可写层、`sys_readdir`、channel 传递 handle、用户堆（`sys_mem_map` 之上的 allocator）、最小 C（`rondos.h` + crt0） | 待办 |
+| **P2b C 支持 ✅** | `user/c/`：`crt0.S`（对齐栈 → `main` → `sys_exit`）、手写 `rondos.h`（`int $0x80` 包装 + `_Static_assert` 布局检查）、`hello.c`；Makefile 用宿主 gcc `-ffreestanding -nostdlib -no-pie` 直接链出用户态 ELF | ✅ `chello` 在 ring3 打印、打开 `/bin/hello.c` 读回自己的源码、exit 0；`make test` grep 到 |
+| **P2c 文件系统** | tmpfs 可写层、`sys_readdir`、channel 传递 handle、用户堆 allocator | 待办 |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |
 | **P5 打磨** | AHCI、APIC/IOAPIC、xHCI HID 鼠标、demand paging/COW、`ET_DYN`+ASLR、`syscall` 快路径、FAT 盘上 FS、wasm 前端 | 老 ABI 程序在新内核上照跑；实机可持久化存盘、可用真鼠标 |

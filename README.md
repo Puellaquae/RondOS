@@ -34,6 +34,8 @@
   - `apps/init/`、`apps/crash/`、`apps/spin/`、`apps/echo/`  首批用户程序：`init` 用
     root 能力打开并 `spawn` 它们，`wait`/`proc_status` 拿结果、`kill` 长跑的那个、
     映射共享内存回读、建 channel 并把一端委托给 `echo` 做往返
+- `user/c/`  最小 C 支持：`crt0.S` + `rondos.h`（手写的 ABI 头，带 `_Static_assert`）
+  + `hello.c`，用宿主 `gcc -ffreestanding -nostdlib` 直接编出用户态 ELF
 - `tools/mktar.py`  确定性 ustar 打包器（生成 `build/boot.tar`）
 - `files/`      启动 tar 镜像内容（将来的用户程序与资源）
 - `docs/user-mode-design.md`  用户态完整设计（迁移、ring 3、编译支持、可执行文件格式、
@@ -92,8 +94,10 @@ OVMF 路径用 `OVMF=/path/to/OVMF.fd` 覆盖（默认 `/usr/share/ovmf/OVMF.fd`
 | P2a | 共享内存对象（`sys_mem_map/unmap/share/map_phys` + `sys_stat`）、
 channel IPC（`chan_create/send/recv`）、`sys_spawn` 的 capability 委托、
 每线程 FXSAVE（M0.9） | ✅ |
+| P2b | 最小 C 支持（`crt0.S` + `rondos.h` + 宿主 gcc 直接出 ELF） | ✅ |
 
-`make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (17/17)`：
+`make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (17/17)`（另有 4 条
+串口断言：init 进 ring3、派生/回收子进程、channel 往返、C 程序跑通）：
 分页/physmap/大页拆分/地址空间隔离/W^X/设备映射、ring3 系统调用往返、
 用户态缺页隔离、抢占、睡眠唤醒、线程退出，以及 P0 的进程生命周期
 （handle 表、用户进程跑完 `sys_info`/`sys_clock_gettime`/`sys_yield`/`sys_log`/`sys_exit`、

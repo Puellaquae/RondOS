@@ -13,6 +13,12 @@
 QEMU       ?= qemu-system-x86_64
 CARGO      ?= $(HOME)/.cargo/bin/cargo
 OVMF       ?= /usr/share/ovmf/OVMF.fd
+CC         ?= gcc
+LD         ?= ld
+
+# Minimal C support (P2b): freestanding, no libc, no PIE, our own crt0 + user.ld.
+CFLAGS     := -ffreestanding -nostdlib -static -no-pie -fno-stack-protector \
+              -fno-pic -mno-red-zone -mcmodel=small -O2 -Wall -Wextra
 
 KERNEL_DIR := kernel64
 BOOT_DIR   := boot/uefi
@@ -28,6 +34,8 @@ ESP_TAR    := $(ESP)/rondos/boot.tar
 ESP_TMP    := build/tmp
 BOOT_TAR   := build/boot.tar
 USER_BIN   = $(USER_DIR)/target/$(USER_TARGET)/$(PROFILE)
+C_BUILD    := build/c
+C_ELF      := $(C_BUILD)/chello.elf
 SERIAL_LOG := build/uefi-serial.log
 
 CARGO_FLAG ?=
@@ -41,7 +49,7 @@ QEMU_FLAGS := -bios $(OVMF) -m 512 \
               -drive file=fat:rw:$(ESP),format=raw \
               -display none -no-reboot
 
-.PHONY: all release user kernel boot esp run test clean
+.PHONY: all release user kernel boot cprogram esp run test clean
 
 all: esp
 
@@ -50,21 +58,32 @@ release: all
 user:
 	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin -p echo
 
+cprogram: $(C_ELF)
+
 kernel:
 	cd $(KERNEL_DIR) && $(CARGO) build $(CARGO_FLAG)
 
 boot:
 	cd $(BOOT_DIR) && $(CARGO) build $(CARGO_FLAG)
 
+# A C program: crt0.S + hello.c + rondos.h, linked with the same user.ld.
+$(C_ELF): $(USER_DIR)/c/crt0.S $(USER_DIR)/c/hello.c $(USER_DIR)/c/rondos.h $(USER_DIR)/user.ld
+	@mkdir -p $(C_BUILD)
+	$(CC) -c -o $(C_BUILD)/crt0.o $(USER_DIR)/c/crt0.S
+	$(CC) $(CFLAGS) -I $(USER_DIR)/c -c $(USER_DIR)/c/hello.c -o $(C_BUILD)/hello.o
+	$(LD) -T $(USER_DIR)/user.ld --no-pie -o $@ $(C_BUILD)/crt0.o $(C_BUILD)/hello.o
+
 # The boot tar is what the UEFI stub hands over as BootInfo.initrd: the kernel
 # finds /bin/* inside it (ustar, flat names).
-$(BOOT_TAR): user
+$(BOOT_TAR): user $(C_ELF)
 	@mkdir -p build
 	python3 tools/mktar.py $@ \
 	  bin/init=$(USER_BIN)/init \
 	  bin/crash=$(USER_BIN)/crash \
 	  bin/spin=$(USER_BIN)/spin \
-	  bin/echo=$(USER_BIN)/echo
+	  bin/echo=$(USER_BIN)/echo \
+	  bin/chello=$(C_ELF) \
+	  bin/hello.c=$(USER_DIR)/c/hello.c
 
 # The ESP is a directory; QEMU's vvfat exposes it as a FAT drive, so testing
 # needs neither mkfs.vfat nor mtools.  TMPDIR is pinned inside the tree because
@@ -97,6 +116,9 @@ test: esp
 	@grep -q "user: init: channel echoed" $(SERIAL_LOG) \
 	  && echo "==> channel round-trip through a delegated capability" \
 	  || (echo "==> channel echo failed"; exit 1)
+	@grep -q "user: chello: hello from C on RondOS" $(SERIAL_LOG) \
+	  && echo "==> C program ran" \
+	  || (echo "==> C program failed"; exit 1)
 
 clean:
 	rm -rf build
