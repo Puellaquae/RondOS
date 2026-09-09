@@ -100,6 +100,10 @@ extern "C" fn kmain(boot: u64) -> ! {
     X86_64Paging::switch_to(root);
     serial_println!("paging: kernel-owned root {:#x}", root);
 
+    // P3: the framebuffer console is the only output channel on the target
+    // machine, so bring it up before anything else can fail.
+    boot::init_fb_console();
+
     // Necessary invariants: a broken physmap/kernel window/allocator makes the
     // kernel unusable, so fail loudly here in every boot mode.
     boot::self_check();
@@ -119,6 +123,9 @@ extern "C" fn kmain(boot: u64) -> ! {
     intr::set_handler(intr::VECTOR_PAGE_FAULT, page_fault_handler);
     intr::set_handler(6, invalid_opcode_handler);
     intr::set_handler(intr::VECTOR_DOUBLE_FAULT, double_fault_handler);
+    // P3: PS/2 keyboard (IRQ1 is already unmasked by pic::init).
+    intr::set_handler(intr::VECTOR_KEYBOARD, keyboard_handler);
+    io::input::init();
 
     #[cfg(feature = "kernel-tests")]
     {
@@ -186,6 +193,14 @@ fn page_fault_handler(f: &mut TrapFrame) {
     serial_println!("kernel #PF cr2 {:#x} err {:#x}", cr2, f.error);
     f.dump("page fault");
     halt_loop();
+}
+
+/// IRQ1: one PS/2 scancode -> the input queue.
+fn keyboard_handler(_f: &mut TrapFrame) {
+    let status = arch::x86_64::inb(0x64);
+    if status & 1 != 0 {
+        io::input::handle_scancode(arch::x86_64::inb(0x60));
+    }
 }
 
 fn invalid_opcode_handler(f: &mut TrapFrame) {

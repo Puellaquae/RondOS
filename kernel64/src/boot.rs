@@ -53,6 +53,17 @@ pub fn self_check() {
     crate::serial_println!("self-check: physmap, kernel window, allocator ok");
 }
 
+/// Bring up the framebuffer console (design §8.2): the kernel's own output
+/// channel on machines without serial.  Safe to call with no framebuffer.
+pub fn init_fb_console() {
+    let fb = crate::bootinfo::get().fb;
+    if crate::bootinfo::get().fb_present == 0 {
+        crate::serial_println!("fb: BootInfo has no framebuffer");
+        return;
+    }
+    crate::io::fb::init(&fb);
+}
+
 /// Start the timer and the scheduler.  GDT/IDT must already be loaded.
 pub fn bring_up_scheduler() {
     pic::init();
@@ -62,6 +73,7 @@ pub fn bring_up_scheduler() {
 }
 
 /// Normal boot: scheduler up, `/bin/init` running, boot thread idle.
+#[cfg_attr(feature = "kernel-tests", allow(dead_code))]
 pub fn normal_boot() -> ! {
     bring_up_scheduler();
     match crate::exec::spawn_path(b"/bin/init") {

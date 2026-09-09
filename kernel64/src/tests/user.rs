@@ -16,7 +16,62 @@ pub static CASES: &[Case] = &[
     Case { name: "handle-table", run: handle_table },
     Case { name: "user-p0", run: user_p0 },
     Case { name: "elf-loader", run: elf_loader },
+    Case { name: "shell", run: shell },
 ];
+
+/// End-to-end P3: start `bin/shell`, type into the keyboard queue and require
+/// its answers on the framebuffer console.
+fn shell() -> Verdict {
+    let pid = match exec::spawn_path(b"/bin/shell") {
+        Ok(p) => p,
+        Err(e) => {
+            serial_println!("shell: cannot spawn bin/shell: {:?}", e);
+            return Verdict::Fail;
+        }
+    };
+    // Let it print its banner and prompt.
+    for _ in 0..50 {
+        if crate::io::fb::contains("rondos> ") {
+            break;
+        }
+        thread::sleep(10);
+    }
+    let mut ok = crate::io::fb::contains("rondos> ");
+
+    // `echo`: proves keys reach the shell and its output reaches the console.
+    crate::io::input::inject(b"echo hello-from-shell\r");
+    ok &= wait_for_fb("hello-from-shell", 200);
+
+    // `ls`: proves the built-in reaches the file system.
+    crate::io::input::inject(b"ls\r");
+    ok &= wait_for_fb("bin/selftest", 200);
+
+    // `run`: spawn a child program from the shell and reap it.
+    crate::io::input::inject(b"run /bin/chello\r");
+    ok &= wait_for_fb("C program", 400);
+
+    if !ok {
+        serial_println!("shell: console state:\n{}", crate::io::fb::row(0).len());
+    }
+    proc::kill(pid).ok();
+    thread::sleep(50);
+    if ok {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    }
+}
+
+fn wait_for_fb(needle: &str, ticks: u64) -> bool {
+    for _ in 0..ticks {
+        if crate::io::fb::contains(needle) {
+            return true;
+        }
+        thread::sleep(10);
+    }
+    serial_println!("shell: never saw {:?}", needle);
+    false
+}
 
 /// Handle-table unit checks (encoding, generations, rights, VMA ranges).
 fn handle_table() -> Verdict {
@@ -66,14 +121,18 @@ fn user_p0() -> Verdict {
     }
     report("user-process", hello_ok);
 
+    // Give the reaper a few ticks: the *status* is recorded as soon as the
+    // process dies, but the slot (and its frames) are freed on the next tick.
+    thread::sleep(50);
+    let live = proc::table().live();
+
     let fault_ok = matches!(fault_status, Some(ExitStatus::Fault { vector: 14, .. }));
-    if !fault_ok {
-        serial_println!("user: fault status {:?}", fault_status);
+    if !fault_ok || live != 0 {
+        serial_println!("user: fault status {:?}, {} live", fault_status, live);
     }
-    report("user-fault-isolation", fault_ok && proc::table().live() == 0);
+    report("user-fault-isolation", fault_ok && live == 0);
 
     // Every frame the two processes owned must be back in the allocator.
-    thread::sleep(50);
     let free_after = mm::page_alloc().free_pages();
     if free_after < free_before {
         serial_println!("user: frames leaked: {} -> {}", free_before, free_after);

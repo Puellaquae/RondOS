@@ -62,6 +62,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell"
+version = "0.1.0"
+dependencies = [
+ "rondos-abi",
+ "rondos-rt",
+]
+
+[[package]]
 name = "spin"
 version = "0.1.0"
 dependencies = [

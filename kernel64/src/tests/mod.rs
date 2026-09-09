@@ -24,6 +24,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod console;
 pub mod elf;
 pub mod mm;
 pub mod ring3;
@@ -80,6 +81,7 @@ pub fn run_cases(cases: &[Case]) {
 pub fn run_early() {
     run_cases(mm::CASES);
     run_cases(elf::CASES);
+    run_cases(console::CASES);
 }
 
 /// Bring up the scheduler and run the remaining programs.

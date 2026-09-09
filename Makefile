@@ -52,18 +52,21 @@ ifeq ($(filter release,$(MAKECMDGOALS)),release)
     PROFILE    := release
 endif
 
+# Display is chosen per target: `run`/`test` are headless (serial only),
+# `run-gui` opens a window so the framebuffer console and the shell are usable.
 QEMU_FLAGS := -bios $(OVMF) -m 512 \
               -drive file=fat:rw:$(ESP),format=raw \
-              -display none -no-reboot
+              -no-reboot
+QEMU_DISPLAY ?= gtk
 
-.PHONY: all release user kernel boot cprogram esp run test clean
+.PHONY: all release user kernel boot cprogram esp run run-gui test clean
 
 all: esp
 
 release: all
 
 user:
-	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p selftest -p crash -p spin -p echo -p heap -p physcheck
+	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p selftest -p crash -p spin -p echo -p heap -p physcheck -p shell
 
 cprogram: $(C_ELF)
 
@@ -94,6 +97,7 @@ $(BOOT_TAR): user $(C_ELF)
 	  bin/echo=$(USER_BIN)/echo \
 	  bin/heap=$(USER_BIN)/heap \
 	  bin/physcheck=$(USER_BIN)/physcheck \
+	  bin/shell=$(USER_BIN)/shell \
 	  bin/chello=$(C_ELF) \
 	  bin/hello.c=$(USER_DIR)/c/hello.c
 
@@ -107,7 +111,12 @@ esp: kernel boot $(BOOT_TAR)
 	cp $(BOOT_TAR) $(ESP_TAR)
 
 run: esp
-	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -serial stdio
+	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -display none -serial stdio
+
+# Interactive: the kernel's framebuffer console + shell in a QEMU window.
+# (Use `QEMU_DISPLAY=sdl` or `QEMU_DISPLAY=vnc=:0` if gtk is unavailable.)
+run-gui: esp
+	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -serial mon:stdio
 
 test: esp
 	@command -v $(CC) >/dev/null || (echo "==> missing C compiler: $(CC)"; exit 1)
@@ -115,7 +124,7 @@ test: esp
 	@rm -f $(SERIAL_LOG)
 	@# The kernel halts on purpose, so QEMU is always killed by the timeout;
 	@# correctness is judged from the log below, not from the exit status.
-	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 40 $(QEMU) $(QEMU_FLAGS) \
+	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 40 $(QEMU) $(QEMU_FLAGS) -display none \
 	  -serial file:$(SERIAL_LOG) >/dev/null 2>&1 || true
 	@grep -v '^\[2J' $(SERIAL_LOG)
 	@! grep -qE "PANIC:|kernel #PF|kernel #GP|DOUBLE FAULT|\[FAIL\]" $(SERIAL_LOG) \
@@ -123,7 +132,7 @@ test: esp
 	@grep -qE "smoke: ALL PASS \([0-9]+/[0-9]+\)" $(SERIAL_LOG) \
 	  || (echo "==> smoke tests FAIL"; exit 1)
 	@total=$$(grep -oE "smoke: ALL PASS \(([0-9]+)/" $(SERIAL_LOG) | grep -oE "[0-9]+" | head -1); \
-	  if [ "$$total" -lt 21 ]; then echo "==> only $$total smoke reports ran"; exit 1; fi
+	  if [ "$$total" -lt 25 ]; then echo "==> only $$total smoke reports ran"; exit 1; fi
 	@grep -q "bootinfo: adopted UEFI structure" $(SERIAL_LOG) \
 	  || (echo "==> booted, but not through the UEFI stub"; exit 1)
 	@echo "==> smoke tests PASS (UEFI)"
@@ -154,6 +163,12 @@ test: esp
 	  && grep -q "user: chello: malloc/free ok" $(SERIAL_LOG) \
 	  && echo "==> user heap (Rust alloc + C malloc)" \
 	  || (echo "==> heap failed"; exit 1)
+	@grep -q "\[ ok \] fb-console" $(SERIAL_LOG) \
+	  && grep -q "\[ ok \] kbd-map" $(SERIAL_LOG) \
+	  && grep -q "\[ ok \] input-queue" $(SERIAL_LOG) \
+	  && grep -q "\[ ok \] shell" $(SERIAL_LOG) \
+	  && echo "==> framebuffer console + keyboard + shell" \
+	  || (echo "==> P3 console/shell failed"; exit 1)
 
 clean:
 	rm -rf build

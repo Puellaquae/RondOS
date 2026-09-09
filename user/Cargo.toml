@@ -10,6 +10,7 @@ members = [
     "apps/echo",
     "apps/heap",
     "apps/physcheck",
+    "apps/shell",
 ]
 
 [profile.dev]

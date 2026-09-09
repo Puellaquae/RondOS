@@ -322,6 +322,34 @@ fn sys_read(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
+    // Input devices: drain the PS/2 queue, blocking briefly when empty.
+    let input_dev = match p.handles().resolve(h, rights::READ) {
+        Ok(slot) => match slot.obj {
+            ObjRef::Device { node: 1 } => true,
+            ObjRef::Device { .. } => return err(f, Status::Permission),
+            _ => false,
+        },
+        Err(s) => return err(f, s),
+    };
+    if input_dev {
+        let mut buf = [0u8; 64];
+        let want = len.min(buf.len());
+        let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
+        loop {
+            let n = crate::io::input::read(&mut buf[..want]);
+            if n > 0 {
+                if let Err(s) = p.copy_to_user(dst, &buf[..n]) {
+                    return err(f, s);
+                }
+                return ok(f, n as u64);
+            }
+            if thread::ticks() >= deadline {
+                return err(f, Status::NotReady);
+            }
+            thread::sleep(thread::TICK_MS);
+        }
+    }
+
     // tmpfs first: a different object, but the same read contract.
     let tmp_src = match p.handles().resolve(h, rights::READ) {
         Ok(slot) => match slot.obj {
@@ -524,6 +552,15 @@ fn sys_spawn(f: &mut TrapFrame) {
                         kind: ObjKind::Chan,
                         id,
                         len: end as u64,
+                        flags: 0,
+                        rights: desc.rights,
+                    };
+                }
+                ObjRef::Device { node } => {
+                    pending[n_caps] = PendingCap {
+                        kind: ObjKind::Device,
+                        id: node,
+                        len: 0,
                         flags: 0,
                         rights: desc.rights,
                     };

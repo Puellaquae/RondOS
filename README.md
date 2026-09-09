@@ -63,10 +63,15 @@ rustup component add rust-src --toolchain nightly
 ```bash
 make            # 构建用户程序 + 内核 + UEFI stub，打包 boot.tar，组装 build/esp/
 make run        # 正常启动（只跑必要的引导自检，然后拉起 /bin/init 并 idle）
+make run-gui    # 同上，但开 QEMU 窗口：帧缓冲控制台 + shell 可直接交互
 make test       # 无头启动 + 跑完整测试套件，检查结果
 make release    # release 构建
 make clean
 ```
+
+`make run-gui` 里能直接看到 P3 的界面：内核把日志同时写到串口和帧缓冲控制台，
+`init`（PID 1）把 console/keyboard 能力委托给 `bin/shell`，于是可以敲 `help`、`ls`、
+`cat`、`run /bin/chello`、`clear`、`uptime`。无窗口环境用 `QEMU_DISPLAY=vnc=:0`。
 
 `make test` 会以 `--features kernel-tests` 重新编译内核（`kernel64/Cargo.toml`），
 把 `src/tests/` 里的内核态测试程序编进去；`make run` 用不带该 feature 的内核，

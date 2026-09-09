@@ -254,6 +254,7 @@ fn write_startup(
                     end: c.len as u8,
                 }
             }
+            ObjKind::Device => ObjRef::Device { node: c.id },
             _ => return Err(Status::Unsupported),
         };
         let handle = match p.handles_mut().insert(obj, c.rights) {
@@ -284,15 +285,29 @@ fn write_startup(
     // device capability so it can map the framebuffer; children must be given
     // one explicitly.
     if p.parent() == 0 {
+        // Device 0: the console (write text) with MAP for the framebuffer.
         if let Some(dev) = p
             .handles_mut()
-            .insert(ObjRef::Device { node: 0 }, rights::MAP)
+            .insert(ObjRef::Device { node: 0 }, rights::MAP | rights::WRITE | rights::SHARE)
         {
             caps[n_caps] = CapDesc {
                 kind: ObjKind::Device as u32,
                 _pad0: 0,
-                rights: rights::MAP,
+                rights: rights::MAP | rights::WRITE | rights::SHARE,
                 handle: dev.0,
+            };
+            n_caps += 1;
+        }
+        // Device 1: the keyboard (read key bytes).
+        if let Some(kbd) = p
+            .handles_mut()
+            .insert(ObjRef::Device { node: 1 }, rights::READ | rights::SHARE)
+        {
+            caps[n_caps] = CapDesc {
+                kind: ObjKind::Device as u32,
+                _pad0: 0,
+                rights: rights::READ | rights::SHARE,
+                handle: kbd.0,
             };
             n_caps += 1;
         }

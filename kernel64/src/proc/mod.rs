@@ -608,6 +608,7 @@ impl Process {
                 len: d.aux,
                 pos: 0,
             },
+            k if k == rondos_abi::ObjKind::Device as u32 => ObjRef::Device { node: d.id },
             // Unknown descriptor kinds own no reference in this process.
             _ => return Err(Status::Unsupported),
         };

@@ -191,6 +191,12 @@ pub fn _serial_print(args: fmt::Arguments) {
     // deadlock on a single CPU).
     let if_set = crate::arch::x86_64::interrupts_enabled();
     crate::arch::x86_64::cli();
+    // Mirror to the framebuffer console as well: on the target machine there is
+    // no serial port, so this is the only way to see kernel output.
+    if crate::io::fb::is_ready() {
+        let mut sink = crate::io::fb::Writer;
+        let _ = fmt::Write::write_fmt(&mut sink, args);
+    }
     SERIAL_IO.get_mut().write_fmt(args).unwrap();
     if if_set {
         crate::arch::x86_64::sti();

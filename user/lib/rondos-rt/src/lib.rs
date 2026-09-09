@@ -294,6 +294,16 @@ pub fn cap(kind: abi::ObjKind) -> Option<Handle> {
     startup().and_then(|b| b.cap(kind)).map(|c| Handle(c.handle))
 }
 
+/// The first capability of `kind` that carries at least `rights`.
+pub fn cap_with(kind: abi::ObjKind, rights: u64) -> Option<Handle> {
+    startup().and_then(|b| {
+        b.caps()
+            .iter()
+            .find(|c| c.kind == kind as u32 && c.rights & rights == rights)
+            .map(|c| Handle(c.handle))
+    })
+}
+
 pub fn yield_now() {
     unsafe {
         syscall(SyscallId::Yield, 0, 0, 0, 0, 0, 0);

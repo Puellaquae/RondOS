@@ -950,7 +950,8 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | **P2b C 支持 ✅** | `user/c/`：`crt0.S`（对齐栈 → `main` → `sys_exit`）、手写 `rondos.h`（`int $0x80` 包装 + `_Static_assert` 布局检查）、`hello.c`；Makefile 用宿主 gcc `-ffreestanding -nostdlib -no-pie` 直接链出用户态 ELF | ✅ `chello` 在 ring3 打印、打开 `/bin/hello.c` 读回自己的源码、exit 0；`make test` grep 到 |
 | **P2c 文件系统 ✅** | tmpfs 可写层（`open_flags::CREATE`、`sys_write` 落在 tmpfs 文件上）、`sys_readdir`（tar 条目在前、tmpfs 在后）、`DirEntry` | ✅ `init` 建 `/tmp/note.txt` 写入 13 字节、重新打开读回、`readdir` 数到 7 个条目 |
 | **P2d 收尾 ✅** | channel 传递 handle（`ObjDesc` 随消息走，接收方拿到新句柄、Memory 自动重映射）、`sys_seek`、`sys_unlink`（新号 `0x57`，追加而非改 v1）、用户堆（`rondos-rt::heap` 的 `#[global_allocator]` + C 的 `malloc/free`） | ✅ `init` 把 memory handle 过 channel 后在新地址读到同样的内容；`seek` 从 offset 4 读到 `456789`；`unlink` 后打不开；`bin/heap` 的 2000 元素 `Vec` 与 64 次 256B 分配/释放全过；`chello` 的 `malloc/free` 复用同一块 |
-| **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
+| **P3a 控制台 ✅** | 帧缓冲文本控制台（8×16 位图字体、滚动、光标、内核日志镜像）、PS/2 键盘（IRQ1 + scancode set 1 → 字节队列 + 箭头键 ANSI 序列）、console/keyboard 设备能力、`apps/shell`（行编辑 + `help/echo/ls/cat/run/clear/uptime/exit`）、`init` 委托能力并监督 shell | ✅ 内核测试 `fb-console`（逐像素比对字形 + 滚动）、`kbd-map`、`input-queue`、`shell`（注入按键 → 校验帧缓冲内容）；`make run-gui` 里用 QEMU monitor `sendkey` 真的敲 `ls` 得到文件列表 |
+| **P3b 显示服务** | 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 待办 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |
 | **P5 打磨** | AHCI、APIC/IOAPIC、xHCI HID 鼠标、demand paging/COW、`ET_DYN`+ASLR、`syscall` 快路径、FAT 盘上 FS、wasm 前端 | 老 ABI 程序在新内核上照跑；实机可持久化存盘、可用真鼠标 |
 

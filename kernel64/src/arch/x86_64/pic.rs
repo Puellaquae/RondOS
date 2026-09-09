@@ -38,8 +38,9 @@ pub fn init() {
     outb(PIC2_DATA, ICW4_8086);
     
     // Mask everything but IRQ0 and IRQ1 on the master, everything on the
-    // slave (bit set = masked).
-    outb(PIC1_DATA, 0b1111_1110);
+    // slave (bit set = masked).  Bit 1 must be 0 for the keyboard: `0b1111_1110`
+    // masks it and IRQ1 never arrives.
+    outb(PIC1_DATA, 0b1111_1100);
     outb(PIC2_DATA, 0b1111_1111);
 }
 
