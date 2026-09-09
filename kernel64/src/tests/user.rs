@@ -235,10 +235,10 @@ fn test_user_images() -> Verdict {
     // The boot tar is the root FS and `bin/init` is the first process.  It
     // spawns `bin/crash` and `bin/spin` itself through sys_open/sys_spawn, so
     // this one spawn exercises the whole P1b path.
-    let init_pid = match exec::spawn_path(b"bin/init") {
+    let init_pid = match exec::spawn_path(b"bin/selftest") {
         Ok(p) => p,
         Err(e) => {
-            serial_println!("exec: cannot spawn bin/init: {:?}", e);
+            serial_println!("exec: cannot spawn bin/selftest: {:?}", e);
             return Verdict::Fail;
         }
     };

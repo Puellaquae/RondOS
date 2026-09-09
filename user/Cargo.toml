@@ -4,6 +4,7 @@ members = [
     "lib/rondos-abi",
     "lib/rondos-rt",
     "apps/init",
+    "apps/selftest",
     "apps/crash",
     "apps/spin",
     "apps/echo",

@@ -349,8 +349,13 @@ macro_rules! print {
 macro_rules! println {
     () => { $crate::print!("\n") };
     ($($arg:tt)*) => {{
-        $crate::print!($($arg)*);
-        $crate::print!("\n");
+        use core::fmt::Write as _;
+        // One logger for the whole line: two `print!` calls would flush the
+        // text and the newline separately, producing a stray empty log line.
+        let mut logger = ::rondos_rt::Logger::new();
+        let _ = write!(logger, $($arg)*);
+        let _ = write!(logger, "\n");
+        logger.finish();
     }};
 }
 

@@ -30,11 +30,8 @@ pub mod ring3;
 pub mod sched;
 pub mod user;
 
-use crate::arch::x86_64::{halt_loop, pic};
-use crate::thread;
-
-/// PIT frequency used by the scheduler tests.
-pub const TIMER_HZ: u32 = 200;
+use crate::arch::x86_64::halt_loop;
+use crate::boot;
 
 static REPORTS: AtomicUsize = AtomicUsize::new(0);
 static FAILS: AtomicUsize = AtomicUsize::new(0);
@@ -90,10 +87,7 @@ pub fn run_early() {
 /// Called by the ring3 continuation, i.e. after the probes have come back to
 /// ring0.  It is `-> !` because it ends with the summary and `halt_loop`.
 pub fn boot_ready() -> ! {
-    pic::init();
-    pic::configure_pit(0, 2, TIMER_HZ);
-    thread::init();
-    crate::arch::x86_64::sti();
+    boot::bring_up_scheduler();
 
     run_cases(sched::CASES);
     run_cases(user::CASES);

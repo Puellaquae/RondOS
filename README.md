@@ -62,11 +62,25 @@ rustup component add rust-src --toolchain nightly
 
 ```bash
 make            # 构建用户程序 + 内核 + UEFI stub，打包 boot.tar，组装 build/esp/
-make run        # 用 QEMU + OVMF 启动 build/esp/（串口输出到 stdio）
-make test       # 无头启动，检查冒烟测试结果
+make run        # 正常启动（只跑必要的引导自检，然后拉起 /bin/init 并 idle）
+make test       # 无头启动 + 跑完整测试套件，检查结果
 make release    # release 构建
 make clean
 ```
+
+`make test` 会以 `--features kernel-tests` 重新编译内核（`kernel64/Cargo.toml`），
+把 `src/tests/` 里的内核态测试程序编进去；`make run` 用不带该 feature 的内核，
+只做**必要的自检**：
+
+```
+self-check: physmap, kernel window, allocator ok
+exec: 'bin/init' pid 1 ...
+boot: /bin/init is pid 1
+user: init: pid 1 up (abi 1, 2 capabilities)
+```
+
+自检失败直接 panic（physmap 别名、内核窗口、页框分配器往返各一条），因为这几条
+不成立内核就没法运行。其余 21 个测试程序只在 `make test` 里跑。
 
 `make run` 把 `build/esp/` 当作 FAT 盘直接喂给 QEMU（`-drive file=fat:rw:...`），
 所以不需要 `mkfs.vfat`/`mtools`：

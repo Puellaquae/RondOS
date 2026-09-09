@@ -16,6 +16,7 @@
 #![no_main]
 
 mod arch;
+mod boot;
 mod bootinfo;
 mod exec;
 mod fs;
@@ -99,7 +100,13 @@ extern "C" fn kmain(boot: u64) -> ! {
     X86_64Paging::switch_to(root);
     serial_println!("paging: kernel-owned root {:#x}", root);
 
-    // Programs that must not be preempted: mm/elf checks run with IF clear.
+    // Necessary invariants: a broken physmap/kernel window/allocator makes the
+    // kernel unusable, so fail loudly here in every boot mode.
+    boot::self_check();
+
+    // The test programs must not be preempted while they hold kernel tables,
+    // so the mm/elf group runs with interrupts still off.
+    #[cfg(feature = "kernel-tests")]
     tests::run_early();
 
     gdt::init();
@@ -113,8 +120,14 @@ extern "C" fn kmain(boot: u64) -> ! {
     intr::set_handler(6, invalid_opcode_handler);
     intr::set_handler(intr::VECTOR_DOUBLE_FAULT, double_fault_handler);
 
-    // Ring3 probes never return; their continuation resumes the harness.
-    tests::ring3::start()
+    #[cfg(feature = "kernel-tests")]
+    {
+        // Ring3 probes never return; their continuation resumes the harness.
+        tests::ring3::start()
+    }
+
+    #[cfg(not(feature = "kernel-tests"))]
+    boot::normal_boot()
 }
 
 // ------------------------------------------------------------ trap handlers

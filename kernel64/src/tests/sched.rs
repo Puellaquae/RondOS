@@ -5,7 +5,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::x86_64;
 use crate::thread;
 
-use super::{report, Case, Verdict, TIMER_HZ};
+use super::{report, Case, Verdict};
+use crate::boot::TIMER_HZ;
 use crate::serial_println;
 
 static BUSY_A: AtomicUsize = AtomicUsize::new(0);

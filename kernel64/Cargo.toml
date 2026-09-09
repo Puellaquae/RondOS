@@ -20,5 +20,10 @@ lto = true
 codegen-units = 1
 debug = false
 
+[features]
+default = []
+# Compile the kernel-mode test suite (`make test`); `make run` boots without it.
+kernel-tests = []
+
 [dependencies]
 rondos-abi = { path = "../user/lib/rondos-abi", default-features = false, features = ["kernel"] }

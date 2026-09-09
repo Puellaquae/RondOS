@@ -38,6 +38,13 @@ C_BUILD    := build/c
 C_ELF      := $(C_BUILD)/chello.elf
 SERIAL_LOG := build/uefi-serial.log
 
+# `make test` compiles the kernel-mode test suite in; `make run` boots the
+# normal kernel (boot self-checks only, then /bin/init).
+KERNEL_FEATURES :=
+ifeq ($(filter test,$(MAKECMDGOALS)),test)
+    KERNEL_FEATURES := --features kernel-tests
+endif
+
 CARGO_FLAG ?=
 PROFILE    := debug
 ifeq ($(filter release,$(MAKECMDGOALS)),release)
@@ -56,12 +63,12 @@ all: esp
 release: all
 
 user:
-	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin -p echo -p heap -p physcheck
+	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p selftest -p crash -p spin -p echo -p heap -p physcheck
 
 cprogram: $(C_ELF)
 
 kernel:
-	cd $(KERNEL_DIR) && $(CARGO) build $(CARGO_FLAG)
+	cd $(KERNEL_DIR) && $(CARGO) build $(CARGO_FLAG) $(KERNEL_FEATURES)
 
 boot:
 	cd $(BOOT_DIR) && $(CARGO) build $(CARGO_FLAG)
@@ -81,6 +88,7 @@ $(BOOT_TAR): user $(C_ELF)
 	@mkdir -p build
 	python3 tools/mktar.py $@ \
 	  bin/init=$(USER_BIN)/init \
+	  bin/selftest=$(USER_BIN)/selftest \
 	  bin/crash=$(USER_BIN)/crash \
 	  bin/spin=$(USER_BIN)/spin \
 	  bin/echo=$(USER_BIN)/echo \
@@ -119,27 +127,27 @@ test: esp
 	@grep -q "bootinfo: adopted UEFI structure" $(SERIAL_LOG) \
 	  || (echo "==> booted, but not through the UEFI stub"; exit 1)
 	@echo "==> smoke tests PASS (UEFI)"
-	@grep -q "user: init: hello from ring 3" $(SERIAL_LOG) \
-	  && echo "==> init reached ring 3" \
-	  || (echo "==> init did not run"; exit 1)
-	@grep -q "user: init: all children reaped, exiting" $(SERIAL_LOG) \
-	  && echo "==> init spawned, waited for and killed its children" \
-	  || (echo "==> init child handling failed"; exit 1)
-	@grep -q "user: init: channel echoed" $(SERIAL_LOG) \
+	@grep -q "user: selftest: hello from ring 3" $(SERIAL_LOG) \
+	  && echo "==> selftest reached ring 3" \
+	  || (echo "==> selftest did not run"; exit 1)
+	@grep -q "user: selftest: all children reaped, exiting" $(SERIAL_LOG) \
+	  && echo "==> selftest spawned, waited for and killed its children" \
+	  || (echo "==> selftest child handling failed"; exit 1)
+	@grep -q "user: selftest: channel echoed" $(SERIAL_LOG) \
 	  && echo "==> channel round-trip through a delegated capability" \
 	  || (echo "==> channel echo failed"; exit 1)
 	@grep -q "user: chello: hello from C on RondOS" $(SERIAL_LOG) \
 	  && echo "==> C program ran" \
 	  || (echo "==> C program failed"; exit 1)
-	@grep -q "user: init: tmpfs file round-trips" $(SERIAL_LOG) \
+	@grep -q "user: selftest: tmpfs file round-trips" $(SERIAL_LOG) \
 	  && echo "==> tmpfs round-trip + readdir" \
 	  || (echo "==> tmpfs failed"; exit 1)
-	@grep -q "user: init: device capability enforced" $(SERIAL_LOG) \
+	@grep -q "user: selftest: device capability enforced" $(SERIAL_LOG) \
 	  && grep -q "user: physcheck: mem_map_phys denied" $(SERIAL_LOG) \
 	  && echo "==> device capability enforced" \
 	  || (echo "==> device capability check failed"; exit 1)
-	@grep -q "user: init: handle passing ok" $(SERIAL_LOG) \
-	  && grep -q "user: init: unlink ok" $(SERIAL_LOG) \
+	@grep -q "user: selftest: handle passing ok" $(SERIAL_LOG) \
+	  && grep -q "user: selftest: unlink ok" $(SERIAL_LOG) \
 	  && echo "==> handle passing over a channel + seek/unlink" \
 	  || (echo "==> P2d checks failed"; exit 1)
 	@grep -q "user: heap: 2000-element Vec ok" $(SERIAL_LOG) \

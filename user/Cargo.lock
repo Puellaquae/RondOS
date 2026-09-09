@@ -54,6 +54,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "selftest"
+version = "0.1.0"
+dependencies = [
+ "rondos-abi",
+ "rondos-rt",
+]
+
+[[package]]
 name = "spin"
 version = "0.1.0"
 dependencies = [
