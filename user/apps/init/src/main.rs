@@ -293,12 +293,37 @@ fn check_p2_rest(root: Handle) -> i32 {
     step!(86, close(h));
     println!("init: seek ok ({} bytes after offset 4)", n);
 
-    step!(87, rondos_rt::unlink(root, path));
+    // A handle opened before unlink must not read whatever reuses the slot.
+    let h = step!(87, open_file_flags(root, path, flags));
+    step!(88, write_file(h, b"before unlink"));
+    step!(89, rondos_rt::unlink(root, path));
+    let mut stale = [0u8; 16];
+    match rondos_rt::read(h, &mut stale) {
+        Ok(_) => {
+            println!("init: stale handle still readable after unlink");
+            return 90;
+        }
+        Err(e) if e == rondos_abi::Status::BadHandle => {}
+        Err(e) => {
+            println!("init: stale handle gave {:?}, expected BadHandle", e);
+            return 91;
+        }
+    }
     if open_file(root, path).is_ok() {
         println!("init: unlink did not remove the file");
-        return 88;
+        return 92;
     }
-    println!("init: unlink ok");
+    println!("init: unlink ok (stale handle rejected)");
+
+    // Creating over a boot-tar name must not shadow it.
+    let shadow = rondos_abi::open_flags::READ
+        | rondos_abi::open_flags::WRITE
+        | rondos_abi::open_flags::CREATE;
+    if open_file_flags(root, b"/bin/init", shadow).is_ok() {
+        println!("init: CREATE shadowed a boot-tar file");
+        return 93;
+    }
+    println!("init: CREATE refuses to shadow the boot tar");
     0
 }
 

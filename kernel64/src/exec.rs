@@ -217,7 +217,7 @@ fn write_startup(
     let mut caps = [CapDesc::default(); 1 + MAX_EXTRA_CAPS];
     let root_dir = p
         .handles_mut()
-        .insert(ObjRef::Dir { node: 0 }, rights::ALL)
+        .insert(ObjRef::Dir, rights::ALL)
         .ok_or(Status::OutOfMemory)?;
     caps[0] = CapDesc {
         kind: ObjKind::Dir as u32,

@@ -244,7 +244,7 @@ fn sys_open(f: &mut TrapFrame) {
         return err(f, Status::BadAddress);
     };
     match p.handles().resolve(dir, rights::READ) {
-        Ok(slot) if matches!(slot.obj, ObjRef::Dir { .. }) => {}
+        Ok(slot) if matches!(slot.obj, ObjRef::Dir) => {}
         Ok(_) => return err(f, Status::InvalidArgument),
         Err(s) => return err(f, s),
     }
@@ -262,12 +262,21 @@ fn sys_open(f: &mut TrapFrame) {
         if want_write {
             r |= rights::WRITE;
         }
-        return match p.handles_mut().insert(ObjRef::TmpFile { id, pos: 0 }, r) {
+        let gen = fs::tmp().generation(id);
+        return match p
+            .handles_mut()
+            .insert(ObjRef::TmpFile { id, gen, pos: 0 }, r)
+        {
             Some(h) => ok(f, h.0),
             None => err(f, Status::OutOfMemory),
         };
     }
     if create {
+        // Stopgap until a real namespace: creating over a name that already
+        // exists in the read-only boot tar would silently shadow it.
+        if fs::TarFs::root().is_some_and(|t| t.find(&path[..path_len]).is_some()) {
+            return err(f, Status::Permission);
+        }
         let id = match fs::tmp().create(&path[..path_len]) {
             Ok(id) => id,
             Err(s) => return err(f, s),
@@ -276,7 +285,11 @@ fn sys_open(f: &mut TrapFrame) {
         if want_write {
             r |= rights::WRITE;
         }
-        return match p.handles_mut().insert(ObjRef::TmpFile { id, pos: 0 }, r) {
+        let gen = fs::tmp().generation(id);
+        return match p
+            .handles_mut()
+            .insert(ObjRef::TmpFile { id, gen, pos: 0 }, r)
+        {
             Some(h) => ok(f, h.0),
             None => err(f, Status::OutOfMemory),
         };
@@ -312,17 +325,22 @@ fn sys_read(f: &mut TrapFrame) {
     // tmpfs first: a different object, but the same read contract.
     let tmp_src = match p.handles().resolve(h, rights::READ) {
         Ok(slot) => match slot.obj {
-            ObjRef::TmpFile { id, pos } => Some((id, pos)),
+            ObjRef::TmpFile { id, gen, pos } => Some((id, gen, pos)),
             _ => None,
         },
         Err(s) => return err(f, s),
     };
-    if let Some((id, pos)) = tmp_src {
+    if let Some((id, gen, pos)) = tmp_src {
+        // The file may have been unlinked since it was opened: a revoked
+        // handle must fail, not read whatever reused the slot.
+        if fs::tmp().get_gen(id, gen).is_none() {
+            return err(f, Status::BadHandle);
+        }
         let mut chunk = [0u8; 256];
         let mut total = 0usize;
         while total < len {
             let want = (len - total).min(chunk.len());
-            let n = fs::tmp().read(id, pos + total as u64, &mut chunk[..want]);
+            let n = fs::tmp().read(id, gen, pos + total as u64, &mut chunk[..want]);
             if n == 0 {
                 break;
             }
@@ -391,7 +409,7 @@ fn sys_write(f: &mut TrapFrame) {
     };
     let tmp_dst = match p.handles().resolve(h, rights::WRITE) {
         Ok(slot) => match slot.obj {
-            ObjRef::TmpFile { id, pos } => Some((id, pos)),
+            ObjRef::TmpFile { id, gen, pos } => Some((id, gen, pos)),
             ObjRef::Device { node: 0 } => None,
             ObjRef::Device { .. } => return err(f, Status::NotFound),
             _ => return err(f, Status::Permission),
@@ -403,8 +421,11 @@ fn sys_write(f: &mut TrapFrame) {
     if let Err(s) = p.copy_from_user(&mut buf[..len], f.rsi) {
         return err(f, s);
     }
-    if let Some((id, pos)) = tmp_dst {
-        return match fs::tmp().write(id, pos, &buf[..len]) {
+    if let Some((id, gen, pos)) = tmp_dst {
+        if fs::tmp().get_gen(id, gen).is_none() {
+            return err(f, Status::BadHandle);
+        }
+        return match fs::tmp().write(id, gen, pos, &buf[..len]) {
             Ok(n) => {
                 let _ = p.handles_mut().with_mut(h, |slot| {
                     if let ObjRef::TmpFile { pos, .. } = &mut slot.obj {
@@ -1063,7 +1084,12 @@ fn sys_seek(f: &mut TrapFrame) {
     let (cur, end) = match p.handles().resolve(h, rights::READ) {
         Ok(slot) => match slot.obj {
             ObjRef::File { pos, len, .. } => (pos, len as u64),
-            ObjRef::TmpFile { id, pos } => (pos, fs::tmp().len(id)),
+            ObjRef::TmpFile { id, gen, pos } => {
+                if fs::tmp().get_gen(id, gen).is_none() {
+                    return err(f, Status::BadHandle);
+                }
+                (pos, fs::tmp().len(id, gen))
+            }
             _ => return err(f, Status::InvalidArgument),
         },
         Err(s) => return err(f, s),
@@ -1097,7 +1123,7 @@ fn sys_unlink(f: &mut TrapFrame) {
         return err(f, Status::BadAddress);
     };
     match p.handles().resolve(dir, rights::READ) {
-        Ok(slot) if matches!(slot.obj, ObjRef::Dir { .. }) => {}
+        Ok(slot) if matches!(slot.obj, ObjRef::Dir) => {}
         Ok(_) => return err(f, Status::InvalidArgument),
         Err(s) => return err(f, s),
     }
@@ -1132,7 +1158,12 @@ fn sys_stat(f: &mut TrapFrame) {
             out.rights = slot.rights;
             match slot.obj {
                 ObjRef::File { len, .. } => out.len_bytes = len as u64,
-                ObjRef::TmpFile { id, .. } => out.len_bytes = fs::tmp().len(id),
+                ObjRef::TmpFile { id, gen, .. } => {
+                    if fs::tmp().get_gen(id, gen).is_none() {
+                        return err(f, Status::BadHandle);
+                    }
+                    out.len_bytes = fs::tmp().len(id, gen);
+                }
                 ObjRef::Memory { va, len, .. } => {
                     out.len_bytes = len;
                     out.va = va;
@@ -1161,7 +1192,7 @@ fn sys_readdir(f: &mut TrapFrame) {
         return err(f, Status::BadAddress);
     };
     match p.handles().resolve(dir, rights::READ) {
-        Ok(slot) if matches!(slot.obj, ObjRef::Dir { .. }) => {}
+        Ok(slot) if matches!(slot.obj, ObjRef::Dir) => {}
         Ok(_) => return err(f, Status::InvalidArgument),
         Err(s) => return err(f, s),
     }

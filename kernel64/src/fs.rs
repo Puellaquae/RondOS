@@ -212,6 +212,10 @@ pub const TMP_FILE_CAP: usize = 4096;
 pub struct TmpFile {
     pub used: bool,
     pub len: u32,
+    /// Bumped on every create *and* remove.  A handle stores the generation it
+    /// was opened with, so a slot reused after `unlink` can never be read
+    /// through a stale handle (ABA).
+    pub generation: u32,
     name: [u8; TMP_NAME_MAX],
     name_len: u8,
     data: [u8; TMP_FILE_CAP],
@@ -222,6 +226,7 @@ impl TmpFile {
         Self {
             used: false,
             len: 0,
+            generation: 0,
             name: [0; TMP_NAME_MAX],
             name_len: 0,
             data: [0; TMP_FILE_CAP],
@@ -252,6 +257,13 @@ impl TmpFs {
         self.files.get(id as usize).filter(|f| f.used)
     }
 
+    /// Resolve a slot *and* generation: a stale handle fails here.
+    pub fn get_gen(&self, id: u32, gen: u32) -> Option<&TmpFile> {
+        self.files
+            .get(id as usize)
+            .filter(|f| f.used && f.generation == gen)
+    }
+
     pub fn find(&self, name: &[u8]) -> Option<u32> {
         let name = name.strip_prefix(b"/").unwrap_or(name);
         self.files
@@ -274,27 +286,43 @@ impl TmpFs {
             .iter()
             .position(|f| !f.used)
             .ok_or(Status::OutOfMemory)?;
+        let generation = self.files[slot].generation.wrapping_add(1);
         let f = &mut self.files[slot];
         *f = TmpFile::new();
         f.used = true;
+        f.generation = generation;
         f.name[..name.len()].copy_from_slice(name);
         f.name_len = name.len() as u8;
         Ok(slot as u32)
     }
 
-    /// Drop a file (v1 has no open-file refcount: the slot is simply reused).
+    pub fn generation(&self, id: u32) -> u32 {
+        self.files
+            .get(id as usize)
+            .map(|f| f.generation)
+            .unwrap_or(0)
+    }
+
+    /// Drop a file.  The slot is reused, but its generation is bumped so every
+    /// handle that still points at it becomes `BadHandle`.
     pub fn remove(&mut self, name: &[u8]) -> Result<(), Status> {
         let id = self.find(name).ok_or(Status::NotFound)?;
-        self.files[id as usize] = TmpFile::new();
+        let f = &mut self.files[id as usize];
+        f.used = false;
+        f.len = 0;
+        f.name_len = 0;
+        f.generation = f.generation.wrapping_add(1);
         Ok(())
     }
 
-    pub fn len(&self, id: u32) -> u64 {
-        self.get(id).map(|f| f.len as u64).unwrap_or(0)
+    pub fn len(&self, id: u32, gen: u32) -> u64 {
+        self.get_gen(id, gen).map(|f| f.len as u64).unwrap_or(0)
     }
 
-    pub fn read(&self, id: u32, pos: u64, buf: &mut [u8]) -> usize {
-        let Some(f) = self.get(id) else { return 0 };
+    pub fn read(&self, id: u32, gen: u32, pos: u64, buf: &mut [u8]) -> usize {
+        let Some(f) = self.get_gen(id, gen) else {
+            return 0;
+        };
         if pos >= f.len as u64 {
             return 0;
         }
@@ -304,8 +332,12 @@ impl TmpFs {
     }
 
     /// Write at `pos`, extending the file; never past `TMP_FILE_CAP`.
-    pub fn write(&mut self, id: u32, pos: u64, buf: &[u8]) -> Result<usize, Status> {
-        let Some(f) = self.files.get_mut(id as usize).filter(|f| f.used) else {
+    pub fn write(&mut self, id: u32, gen: u32, pos: u64, buf: &[u8]) -> Result<usize, Status> {
+        let Some(f) = self
+            .files
+            .get_mut(id as usize)
+            .filter(|f| f.used && f.generation == gen)
+        else {
             return Err(Status::BadHandle);
         };
         let pos = pos as usize;

@@ -178,12 +178,16 @@ impl VmaList {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjRef {
     None,
-    /// A tarfs directory node (0 = root).
-    Dir { node: u32 },
+    /// A directory capability.  v1 has a single flat namespace, so every
+    /// directory handle is the root; the field is a unit today and will grow a
+    /// node id when directories land.
+    Dir,
     /// A tarfs regular file: `(offset, length)` into the boot tar plus a cursor.
     File { off: u32, len: u32, pos: u64 },
-    /// A tmpfs (writable) file: slot id plus a cursor.
-    TmpFile { id: u32, pos: u64 },
+    /// A tmpfs (writable) file: slot id + generation + cursor.  The generation
+    /// makes a handle opened before `unlink` fail instead of reading whatever
+    /// file reused the slot.
+    TmpFile { id: u32, gen: u32, pos: u64 },
     /// A device node: 0 = console (`sys_write` -> the kernel log).
     Device { node: u32 },
     /// A shared memory object, mapped in this process at `va`.
@@ -198,7 +202,7 @@ impl ObjRef {
     pub const fn kind(self) -> ObjKind {
         match self {
             ObjRef::None => ObjKind::None,
-            ObjRef::Dir { .. } => ObjKind::Dir,
+            ObjRef::Dir => ObjKind::Dir,
             ObjRef::File { .. } | ObjRef::TmpFile { .. } => ObjKind::File,
             ObjRef::Device { .. } => ObjKind::Device,
             ObjRef::Memory { .. } => ObjKind::Memory,
@@ -921,7 +925,7 @@ pub fn selftest_handles() -> bool {
     ok &= t.close(a).is_ok();
     // Same index, bumped generation: the old handle must be dead.
     ok &= t.get(a).err() == Some(Status::BadHandle);
-    let b = t.insert(ObjRef::Dir { node: 0 }, rondos_abi::rights::READ).unwrap();
+    let b = t.insert(ObjRef::Dir, rondos_abi::rights::READ).unwrap();
     ok &= b.index() == 0 && b.generation() == 1;
     ok &= t.get(b).is_ok() && t.get(a).is_err();
     ok &= t.resolve(Handle::new(0, 7), rondos_abi::rights::READ).err() == Some(Status::BadHandle);
