@@ -93,6 +93,8 @@ pub enum SyscallId {
     Stat = 0x54,
     Readdir = 0x55,
     Close = 0x56,
+    /// Appended after the v1 freeze (ids are never reused).
+    Unlink = 0x57,
 }
 
 impl SyscallId {
@@ -127,6 +129,7 @@ impl SyscallId {
             0x54 => SyscallId::Stat,
             0x55 => SyscallId::Readdir,
             0x56 => SyscallId::Close,
+            0x57 => SyscallId::Unlink,
             _ => return None,
         })
     }
@@ -762,15 +765,68 @@ pub fn chan_create(out: &mut [Handle; 2]) -> SyscallResult {
     unsafe { syscall(SyscallId::ChanCreate, out.as_mut_ptr() as u64, 0, 0, 0, 0, 0) }
 }
 
-/// `0x41 sys_chan_send(handle, buf, len) -> n`
+/// `0x41 sys_chan_send(handle, buf, len, handles) -> n`
 #[cfg(feature = "user")]
-pub fn chan_send(handle: Handle, buf: &[u8]) -> SyscallResult {
+pub fn chan_send(handle: Handle, buf: &[u8], handles: &[Handle]) -> SyscallResult {
+    let slice = Slice {
+        // An empty slice must pass a null pointer: a dangling one would make
+        // the kernel try to copy_from_user() a bogus address.
+        ptr: if handles.is_empty() {
+            0
+        } else {
+            handles.as_ptr() as u64
+        },
+        count: handles.len() as u64,
+    };
     unsafe {
         syscall(
             SyscallId::ChanSend,
             handle.0,
             buf.as_ptr() as u64,
             buf.len() as u64,
+            core::ptr::addr_of!(slice) as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x42 sys_chan_recv(handle, buf, out_handles) -> n | (n_handles << 32)`
+///
+/// `out_handles` is a `[Handle; N]` whose first slot is the capacity on the
+/// kernel side; it is rewritten with the received handles.
+#[cfg(feature = "user")]
+pub fn chan_recv(handle: Handle, buf: &mut [u8], out_handles: &mut [Handle]) -> SyscallResult {
+    let slice = Slice {
+        ptr: if out_handles.is_empty() {
+            0
+        } else {
+            out_handles.as_mut_ptr() as u64
+        },
+        count: out_handles.len() as u64,
+    };
+    unsafe {
+        syscall(
+            SyscallId::ChanRecv,
+            handle.0,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            core::ptr::addr_of!(slice) as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// `0x53 sys_seek(handle, offset, whence) -> new offset`
+#[cfg(feature = "user")]
+pub fn seek(handle: Handle, offset: i64, whence: u32) -> SyscallResult {
+    unsafe {
+        syscall(
+            SyscallId::Seek,
+            handle.0,
+            offset as u64,
+            whence as u64,
             0,
             0,
             0,
@@ -778,15 +834,15 @@ pub fn chan_send(handle: Handle, buf: &[u8]) -> SyscallResult {
     }
 }
 
-/// `0x42 sys_chan_recv(handle, buf, len) -> n`
+/// `0x57 sys_unlink(dir, path)`
 #[cfg(feature = "user")]
-pub fn chan_recv(handle: Handle, buf: &mut [u8]) -> SyscallResult {
+pub fn unlink(dir: Handle, path: &[u8]) -> SyscallResult {
     unsafe {
         syscall(
-            SyscallId::ChanRecv,
-            handle.0,
-            buf.as_mut_ptr() as u64,
-            buf.len() as u64,
+            SyscallId::Unlink,
+            dir.0,
+            path.as_ptr() as u64,
+            path.len() as u64,
             0,
             0,
             0,

@@ -614,6 +614,8 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 * **`MemObj` 里存的是物理地址**：页框分配器返回的是 physmap 视图（`0xFFFF_8000…`），直接当 `pa` 映射进用户页会指向不存在的物理地址（表现为用户一写就 `#PF`）。分配时 `virt_to_phys`，释放时 `phys_to_virt`；
 * **关闭句柄要释放对象引用**：`close` 只 bump generation 是不够的，`MemObj`/`ChanObj` 的引用计数不减就永远回收不了那一页；
 * **tmpfs 的存储别用页框分配器**：文件系统是长期存在的，用 `page_alloc` 会让「测试后页框数回到基线」这条断言失效（那正是 P0 以来抓内存泄漏的手段）。固定槽位 + `.bss` 数组既简单又不干扰该不变量；
+* **用户态堆不能靠自旋锁**：用户态没有 `cli`，单 CPU 上「持锁被抢占 → 抢占者自旋」必然死锁。v1 一个进程只有一个线程，所以堆天然无并发、不需要锁；等 `sys_thread_spawn` 到位必须换成真正的锁或无锁设计；
+* **空 slice 要传空指针**：Rust 的 `&[]` 取 `as_ptr()` 会给出一个非空的对齐哨兵地址，内核 `copy_from_user` 它就会 `BadAddress`。凡是「指针 + 数量」的 ABI 参数，数量为 0 时必须传 0；
 * `uefi-rs` 0.40 的坑：`no_std` 目标必须 `panic = "abort"`；`.cargo/config.toml` 要 `target = "x86_64-unknown-uefi"` + `build-std = ["core"]` + `build-std-features = ["compiler-builtins-mem"]`；`get_image_file_system(image_handle)` 直接返回 `ScopedProtocol<SimpleFileSystem>`（不要再 `open_protocol_exclusive`）；读文件要先 `FileHandle::into_regular_file()` 再 `get_info::<FileInfo>(...).file_size()` / `read()`。
 
 ### 7.2 文件级清单
@@ -929,7 +931,7 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | **P2a 内存与 IPC ✅** | `sys_mem_map/unmap/share/map_phys`（引用计数的 `MemObj`）、`chan_create/send/recv`（有界消息队列）、`sys_stat`、`sys_spawn` 的 capability 委托 | ✅ `init` 映射共享内存并回读、创建 channel 并把一端委托给 `bin/echo`，`echo` 收到后原样送回；全部回收，`make test` 17/17 |
 | **P2b C 支持 ✅** | `user/c/`：`crt0.S`（对齐栈 → `main` → `sys_exit`）、手写 `rondos.h`（`int $0x80` 包装 + `_Static_assert` 布局检查）、`hello.c`；Makefile 用宿主 gcc `-ffreestanding -nostdlib -no-pie` 直接链出用户态 ELF | ✅ `chello` 在 ring3 打印、打开 `/bin/hello.c` 读回自己的源码、exit 0；`make test` grep 到 |
 | **P2c 文件系统 ✅** | tmpfs 可写层（`open_flags::CREATE`、`sys_write` 落在 tmpfs 文件上）、`sys_readdir`（tar 条目在前、tmpfs 在后）、`DirEntry` | ✅ `init` 建 `/tmp/note.txt` 写入 13 字节、重新打开读回、`readdir` 数到 7 个条目 |
-| **P2d 收尾** | channel 传递 handle、用户堆 allocator、`sys_seek`/`sys_unlink` | 待办 |
+| **P2d 收尾 ✅** | channel 传递 handle（`ObjDesc` 随消息走，接收方拿到新句柄、Memory 自动重映射）、`sys_seek`、`sys_unlink`（新号 `0x57`，追加而非改 v1）、用户堆（`rondos-rt::heap` 的 `#[global_allocator]` + C 的 `malloc/free`） | ✅ `init` 把 memory handle 过 channel 后在新地址读到同样的内容；`seek` 从 offset 4 读到 `456789`；`unlink` 后打不开；`bin/heap` 的 2000 元素 `Vec` 与 64 次 256B 分配/释放全过；`chello` 的 `malloc/free` 复用同一块 |
 | **P3 显示** | GOP 640×480×32bpp + LFB 设备映射、PS/2 键盘 + 键盘合成指针、`display-server`、surface 共享、Win3.1 窗口装饰、控制台窗口 | 光标能拖动/聚焦窗口；控制台窗口里能跑 shell 命令 |
 | **P4 控件与程序** | 声明式 `libui`（`view`/`update`）、`libgfx`、字体、主题、progman / notepad / calc / paint / minesweeper | 截图与 Win3.1 截图并排看「像」；ProgMan 双击图标启动程序 |
 | **P5 打磨** | AHCI、APIC/IOAPIC、xHCI HID 鼠标、demand paging/COW、`ET_DYN`+ASLR、`syscall` 快路径、FAT 盘上 FS、wasm 前端 | 老 ABI 程序在新内核上照跑；实机可持久化存盘、可用真鼠标 |

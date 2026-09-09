@@ -202,7 +202,12 @@ pub fn chan_create() -> Result<(Handle, Handle), Status> {
 }
 
 pub fn chan_send(handle: Handle, buf: &[u8]) -> Result<usize, Status> {
-    let r = abi::chan_send(handle, buf);
+    chan_send_with(handle, buf, &[])
+}
+
+/// Send a message carrying capabilities.
+pub fn chan_send_with(handle: Handle, buf: &[u8], handles: &[Handle]) -> Result<usize, Status> {
+    let r = abi::chan_send(handle, buf, handles);
     if r.status.is_ok() {
         Ok(r.value as usize)
     } else {
@@ -211,13 +216,38 @@ pub fn chan_send(handle: Handle, buf: &[u8]) -> Result<usize, Status> {
 }
 
 pub fn chan_recv(handle: Handle, buf: &mut [u8]) -> Result<usize, Status> {
-    let r = abi::chan_recv(handle, buf);
+    let mut none: [Handle; 0] = [];
+    chan_recv_with(handle, buf, &mut none).map(|(n, _)| n)
+}
+
+/// Receive a message plus up to `out.len()` handles.  Returns
+/// `(bytes, handles_received)`.
+pub fn chan_recv_with(
+    handle: Handle,
+    buf: &mut [u8],
+    out: &mut [Handle],
+) -> Result<(usize, usize), Status> {
+    let r = abi::chan_recv(handle, buf, out);
     if r.status.is_ok() {
-        Ok(r.value as usize)
+        Ok((r.value as u32 as usize, (r.value >> 32) as usize))
     } else {
         Err(r.status)
     }
 }
+
+pub fn seek(handle: Handle, offset: i64, whence: u32) -> Result<u64, Status> {
+    let r = abi::seek(handle, offset, whence);
+    if r.status.is_ok() {
+        Ok(r.value)
+    } else {
+        Err(r.status)
+    }
+}
+
+pub fn unlink(dir: Handle, path: &[u8]) -> Result<(), Status> {
+    abi::unlink(dir, path).status.is_ok().then_some(()).ok_or(Status::Broken)
+}
+
 
 /// `sys_spawn` with delegated capabilities.
 pub fn spawn_with_caps(image: Handle, caps: &[abi::CapDesc]) -> Result<Handle, Status> {
@@ -338,4 +368,143 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let mut logger = Logger;
     let _ = core::fmt::write(&mut logger, format_args!("panic: {}\n", info.message()));
     exit(101)
+}
+
+// ---------------------------------------------------------------- user heap
+
+/// A first-fit free-list allocator over one `sys_mem_map` region.
+///
+/// v1 has **one thread per process**, so a process's heap is never touched
+/// concurrently and needs no lock — an interrupt never re-enters user code.
+/// When `sys_thread_spawn` lands, this must grow a real lock (or a lock-free
+/// design), because spinning on a single CPU while preempted deadlocks.
+pub mod heap {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::UnsafeCell;
+    use core::ptr;
+
+    use crate::abi::{self, mem_flags};
+
+    const HEAP_SIZE: u64 = 64 * 1024;
+    /// Payload alignment; larger alignments are refused.
+    const ALIGN: usize = 16;
+    /// `FreeBlock { size, next }`.
+    const HEADER: usize = 16;
+
+    struct FreeBlock {
+        /// Usable bytes after this header (allocated blocks: their own size).
+        size: usize,
+        next: *mut FreeBlock,
+    }
+
+    struct HeapState {
+        head: *mut FreeBlock,
+        /// Handle of the backing memory object, kept for the process's life.
+        handle: u64,
+    }
+
+    struct Heap(UnsafeCell<HeapState>);
+
+    unsafe impl Sync for Heap {}
+
+    static HEAP: Heap = Heap(UnsafeCell::new(HeapState {
+        head: ptr::null_mut(),
+        handle: u64::MAX,
+    }));
+
+    /// `#[global_allocator]` for Rust user programs.
+    pub struct RondosAlloc;
+
+    unsafe fn init(st: &mut HeapState) -> bool {
+        let r = abi::mem_map(HEAP_SIZE, mem_flags::READ | mem_flags::WRITE);
+        if !r.status.is_ok() {
+            return false;
+        }
+        let mut stat = abi::Stat::default();
+        if !abi::stat(abi::Handle(r.value), &mut stat).status.is_ok() || stat.va == 0 {
+            return false;
+        }
+        st.handle = r.value;
+        st.head = stat.va as *mut FreeBlock;
+        (*st.head).size = HEAP_SIZE as usize - HEADER;
+        (*st.head).next = ptr::null_mut();
+        true
+    }
+
+    unsafe impl GlobalAlloc for RondosAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.align() > ALIGN || layout.size() == 0 {
+                return ptr::null_mut();
+            }
+            let st = &mut *HEAP.0.get();
+            if st.head.is_null() && !init(st) {
+                return ptr::null_mut();
+            }
+            let need = (layout.size() + ALIGN - 1) & !(ALIGN - 1);
+
+            let mut prev: *mut FreeBlock = ptr::null_mut();
+            let mut cur = st.head;
+            while !cur.is_null() {
+                let b = &mut *cur;
+                if b.size >= need {
+                    if b.size >= need + HEADER {
+                        // Split: the tail stays free.
+                        let rest = (cur as usize + HEADER + need) as *mut FreeBlock;
+                        (*rest).size = b.size - need - HEADER;
+                        (*rest).next = b.next;
+                        b.size = need;
+                        b.next = rest;
+                        if prev.is_null() {
+                            st.head = rest;
+                        } else {
+                            (*prev).next = rest;
+                        }
+                    } else {
+                        // Consume the whole block.
+                        if prev.is_null() {
+                            st.head = b.next;
+                        } else {
+                            (*prev).next = b.next;
+                        }
+                    }
+                    return (cur as usize + HEADER) as *mut u8;
+                }
+                prev = cur;
+                cur = b.next;
+            }
+            ptr::null_mut()
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            if ptr.is_null() {
+                return;
+            }
+            let st = &mut *HEAP.0.get();
+            let blk = (ptr as usize - HEADER) as *mut FreeBlock;
+            let size = (*blk).size;
+
+            // Insert in address order so neighbours can be coalesced.
+            let mut prev: *mut FreeBlock = ptr::null_mut();
+            let mut cur = st.head;
+            while !cur.is_null() && (cur as usize) < (blk as usize) {
+                prev = cur;
+                cur = (*cur).next;
+            }
+            (*blk).next = cur;
+            if prev.is_null() {
+                st.head = blk;
+            } else {
+                (*prev).next = blk;
+            }
+
+            if !cur.is_null() && blk as usize + HEADER + size == cur as usize {
+                (*blk).size += HEADER + (*cur).size;
+                (*blk).next = (*cur).next;
+            }
+            if !prev.is_null() && prev as usize + HEADER + (*prev).size == blk as usize {
+                (*prev).size += HEADER + (*blk).size;
+                (*prev).next = (*blk).next;
+            }
+        }
+    }
 }

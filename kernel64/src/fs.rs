@@ -269,6 +269,13 @@ impl TmpFs {
         Ok(slot as u32)
     }
 
+    /// Drop a file (v1 has no open-file refcount: the slot is simply reused).
+    pub fn remove(&mut self, name: &[u8]) -> Result<(), Status> {
+        let id = self.find(name).ok_or(Status::NotFound)?;
+        self.files[id as usize] = TmpFile::new();
+        Ok(())
+    }
+
     pub fn len(&self, id: u32) -> u64 {
         self.get(id).map(|f| f.len as u64).unwrap_or(0)
     }

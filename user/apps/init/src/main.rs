@@ -125,6 +125,26 @@ fn check_echo_child(root: Handle) -> i32 {
     0
 }
 
+/// Spawn `bin/heap` and require a clean exit: it exercises the Rust allocator.
+fn check_heap_program(root: Handle) -> i32 {
+    let image = step!(90, open_file(root, b"/bin/heap"));
+    let child = step!(91, spawn(image));
+    let _ = close(image);
+    let w = step!(92, wait(&[child], 5_000_000_000));
+    if w.reason != wait_reason::EXITED {
+        println!("init: heap child ended with reason {}", w.reason);
+        return 93;
+    }
+    let st = step!(94, proc_status(child));
+    if st.kind != exit_kind::EXITED || st.code != 0 {
+        println!("init: heap child exit kind {} code {}", st.kind, st.code);
+        return 95;
+    }
+    println!("init: Rust heap program exited 0");
+    let _ = close(child);
+    0
+}
+
 /// tmpfs: create a file, write it, reopen and read it back, then list the
 /// directory (tar entries first, then tmpfs files).
 fn check_tmpfs(root: Handle) -> i32 {
@@ -162,6 +182,67 @@ fn check_tmpfs(root: Handle) -> i32 {
     if count < 6 {
         return 67;
     }
+    0
+}
+
+/// P2d: handle passing over a channel, seek, unlink.
+fn check_p2_rest(root: Handle) -> i32 {
+    // 1. A memory object sent through a channel comes back as a *new* handle
+    //    mapped at a *new* address, and the contents survive.
+    let (a, b) = step!(70, chan_create());
+    let (mem, va) = step!(71, mem_map(4096, mem_flags::READ | mem_flags::WRITE));
+    unsafe { (va as *mut u64).write_volatile(0x5150_5150_5150_5150) };
+    step!(72, rondos_rt::chan_send_with(a, b"mem", &[mem]));
+    let mut buf = [0u8; 8];
+    let mut got = [rondos_abi::Handle::INVALID; 1];
+    let (n, nh) = step!(73, rondos_rt::chan_recv_with(b, &mut buf, &mut got));
+    if n != 3 || nh != 1 || buf[..3] != *b"mem" {
+        println!("init: handle message malformed ({} bytes, {} handles)", n, nh);
+        return 74;
+    }
+    let st = step!(75, rondos_rt::stat(got[0]));
+    if st.va == 0 || st.va == va {
+        println!("init: shared object not remapped (old {:#x}, new {:#x})", va, st.va);
+        return 76;
+    }
+    let v = unsafe { (st.va as *const u64).read_volatile() };
+    if v != 0x5150_5150_5150_5150 {
+        println!("init: shared contents lost: {:#x}", v);
+        return 77;
+    }
+    println!("init: handle passing ok (remapped {:#x} -> {:#x})", va, st.va);
+    let _ = close(got[0]);
+    let _ = close(mem);
+    let _ = close(a);
+    let _ = close(b);
+
+    // 2. seek + unlink on a tmpfs file.
+    let path = b"/tmp/seek.txt";
+    let flags = rondos_abi::open_flags::READ
+        | rondos_abi::open_flags::WRITE
+        | rondos_abi::open_flags::CREATE;
+    let h = step!(80, open_file_flags(root, path, flags));
+    step!(81, write_file(h, b"0123456789"));
+    let pos = step!(82, rondos_rt::seek(h, 4, 0));
+    if pos != 4 {
+        println!("init: seek returned {}", pos);
+        return 83;
+    }
+    let mut b2 = [0u8; 6];
+    let n = step!(84, rondos_rt::read(h, &mut b2));
+    if &b2[..n] != b"456789" {
+        println!("init: seek/read got {:?}", core::str::from_utf8(&b2[..n]));
+        return 85;
+    }
+    step!(86, close(h));
+    println!("init: seek ok ({} bytes after offset 4)", n);
+
+    step!(87, rondos_rt::unlink(root, path));
+    if open_file(root, path).is_ok() {
+        println!("init: unlink did not remove the file");
+        return 88;
+    }
+    println!("init: unlink ok");
     0
 }
 
@@ -243,6 +324,14 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
         return rc;
     }
     let rc = check_tmpfs(root);
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_p2_rest(root);
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_heap_program(root);
     if rc != 0 {
         return rc;
     }

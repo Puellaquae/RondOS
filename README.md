@@ -31,10 +31,12 @@
   - `user.ld`  固定地址（0x400000）ELF64 链接脚本，段页对齐、`.text` R+X、数据 RW+NX
   - `lib/rondos-abi/`  内核与用户程序共享的 ABI crate（syscall 号、`Status`、
     handle 编码、`Info` 等结构体 + 编译期布局断言）
-  - `lib/rondos-rt/`  `_start`、`panic`、`println!`（走 `sys_log`）
-  - `apps/init/`、`apps/crash/`、`apps/spin/`、`apps/echo/`  首批用户程序：`init` 用
-    root 能力打开并 `spawn` 它们，`wait`/`proc_status` 拿结果、`kill` 长跑的那个、
-    映射共享内存回读、建 channel 并把一端委托给 `echo` 做往返
+  - `lib/rondos-rt/`  `_start`、`panic`、`println!`（走 `sys_log`）、用户堆
+    （`#[global_allocator]`，first-fit + 合并）
+  - `apps/init/`、`apps/crash/`、`apps/spin/`、`apps/echo/`、`apps/heap/`  首批用户程序：
+    `init` 用 root 能力打开并 `spawn` 它们，`wait`/`proc_status` 拿结果、`kill` 长跑的
+    那个、映射共享内存回读、建 channel 把一端委托给 `echo`、把 memory handle 过
+    channel 传给自己的另一端、tmpfs 读写/seek/unlink/readdir
 - `user/c/`  最小 C 支持：`crt0.S` + `rondos.h`（手写的 ABI 头，带 `_Static_assert`）
   + `hello.c`，用宿主 `gcc -ffreestanding -nostdlib` 直接编出用户态 ELF
 - `tools/mktar.py`  确定性 ustar 打包器（生成 `build/boot.tar`）
@@ -97,6 +99,7 @@ channel IPC（`chan_create/send/recv`）、`sys_spawn` 的 capability 委托、
 每线程 FXSAVE（M0.9） | ✅ |
 | P2b | 最小 C 支持（`crt0.S` + `rondos.h` + 宿主 gcc 直接出 ELF） | ✅ |
 | P2c | tmpfs 可写层（`O_CREATE`/`sys_write`）+ `sys_readdir` | ✅ |
+| P2d | channel 传递 handle、`sys_seek`/`sys_unlink`、用户堆（Rust `alloc` + C `malloc`） | ✅ |
 
 `make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (17/17)`（另有 4 条
 串口断言：init 进 ring3、派生/回收子进程、channel 往返、C 程序跑通）：

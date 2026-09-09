@@ -14,6 +14,10 @@ static size_t strlen_(const char *s)
     return n;
 }
 
+/* malloc/free live in rondos.c, which is linked next to crt0.S. */
+extern void *malloc(size_t);
+extern void free(void *);
+
 int main(const struct rondos_startup_block *block)
 {
     puts_raw("chello: hello from C on RondOS\n", 31);
@@ -40,5 +44,22 @@ int main(const struct rondos_startup_block *block)
     puts_raw("chello: read back its own source: ", 33);
     puts_raw(buf, (size_t)(n < 32 ? n : 32));
     puts_raw("\n", 1);
+
+    /* The heap: allocate, use, free, and allocate again from the freed space. */
+    char *heap = malloc(1024);
+    if (!heap) {
+        puts_raw("chello: malloc failed\n", 22);
+        return 4;
+    }
+    for (int i = 0; i < 1024; i++)
+        heap[i] = (char)(i & 0x7f);
+    free(heap);
+    char *again = malloc(1024);
+    if (again != heap) {
+        puts_raw("chello: malloc did not reuse the freed block\n", 44);
+        return 5;
+    }
+    free(again);
+    puts_raw("chello: malloc/free ok\n", 22);
     return 0;
 }

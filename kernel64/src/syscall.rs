@@ -97,6 +97,8 @@ pub fn dispatch(f: &mut TrapFrame) {
         SyscallId::ChanRecv => sys_chan_recv(f),
         SyscallId::Stat => sys_stat(f),
         SyscallId::Readdir => sys_readdir(f),
+        SyscallId::Seek => sys_seek(f),
+        SyscallId::Unlink => sys_unlink(f),
         // Everything else is declared in the frozen v1 table but lands in P1+.
         _ => f.set_result(Status::Unsupported as u64, 0),
     }
@@ -798,13 +800,15 @@ fn sys_chan_create(f: &mut TrapFrame) {
     }
 }
 
-/// `0x41 sys_chan_send(handle, buf, len) -> n`
+/// `0x41 sys_chan_send(handle, buf, len, handles: Slice<Handle>, 0) -> n`
 ///
-/// Blocks (up to ~1 s) while the queue is full.
+/// Up to two handles travel with the message; the kernel takes over one
+/// reference each and the receiver gets fresh handles.
 fn sys_chan_send(f: &mut TrapFrame) {
     let h = Handle(f.rdi);
     let len = f.rdx as usize;
-    if len == 0 || len > obj::CHAN_MSG_BYTES {
+    let handles_ptr = f.r10;
+    if len > obj::CHAN_MSG_BYTES {
         return err(f, Status::InvalidArgument);
     }
     let Some(p) = proc::current() else {
@@ -817,27 +821,117 @@ fn sys_chan_send(f: &mut TrapFrame) {
         },
         Err(s) => return err(f, s),
     };
+
     let mut buf = [0u8; obj::CHAN_MSG_BYTES];
-    if let Err(s) = p.copy_from_user(&mut buf[..len], f.rsi) {
-        return err(f, s);
+    if len > 0 {
+        if let Err(s) = p.copy_from_user(&mut buf[..len], f.rsi) {
+            return err(f, s);
+        }
+    }
+
+    // Collect the object references that travel with the message.
+    let mut descs = [obj::ObjDesc::default(); obj::CHAN_MSG_HANDLES];
+    let mut n_desc = 0usize;
+    if handles_ptr != 0 {
+        let mut slice = Slice::default();
+        if let Err(s) = p.copy_from_user(as_bytes_mut(&mut slice), handles_ptr) {
+            return err(f, s);
+        }
+        if slice.count as usize > obj::CHAN_MSG_HANDLES {
+            return err(f, Status::InvalidArgument);
+        }
+        for i in 0..slice.count as usize {
+            let mut raw = [0u8; 8];
+            if let Err(s) = p.copy_from_user(&mut raw, slice.ptr + i as u64 * 8) {
+                return err(f, s);
+            }
+            let uh = Handle(u64::from_ne_bytes(raw));
+            let (desc, retain) = match p.handles().resolve(uh, rights::NONE) {
+                Ok(slot) => match slot.obj {
+                    ObjRef::Memory { id, .. } => {
+                        let flags = obj::mem().get(id).map(|o| o.flags).unwrap_or(0);
+                        (
+                            obj::ObjDesc {
+                                kind: ObjKind::Memory as u32,
+                                id,
+                                aux: 0,
+                                _pad0: 0,
+                                flags,
+                                rights: slot.rights,
+                            },
+                            Some((ObjKind::Memory, id)),
+                        )
+                    }
+                    ObjRef::Chan { id } => (
+                        obj::ObjDesc {
+                            kind: ObjKind::Chan as u32,
+                            id,
+                            aux: 0,
+                            _pad0: 0,
+                            flags: 0,
+                            rights: slot.rights,
+                        },
+                        Some((ObjKind::Chan, id)),
+                    ),
+                    ObjRef::File { off, len, .. } => (
+                        obj::ObjDesc {
+                            kind: ObjKind::File as u32,
+                            id: off,
+                            aux: len,
+                            _pad0: 0,
+                            flags: 0,
+                            rights: slot.rights,
+                        },
+                        None,
+                    ),
+                    _ => return err(f, Status::Unsupported),
+                },
+                Err(s) => return err(f, s),
+            };
+            // The message holds its own reference.
+            if let Some((k, id)) = retain {
+                let ok = match k {
+                    ObjKind::Memory => obj::mem().retain(id),
+                    ObjKind::Chan => obj::chans().retain(id),
+                    _ => true,
+                };
+                if !ok {
+                    return err(f, Status::BadHandle);
+                }
+            }
+            descs[n_desc] = desc;
+            n_desc += 1;
+        }
     }
 
     let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
     loop {
-        match obj::chans().send(id, &buf[..len]) {
+        match obj::chans().send(id, &buf[..len], &descs[..n_desc]) {
             Ok(n) => return ok(f, n as u64),
             Err(Status::NotReady) if thread::ticks() < deadline => {
                 thread::sleep(thread::TICK_MS);
             }
-            Err(s) => return err(f, s),
+            Err(s) => {
+                // Give the references back if the message never left.
+                for d in descs[..n_desc].iter() {
+                    match d.kind {
+                        k if k == ObjKind::Memory as u32 => obj::mem().release(d.id),
+                        k if k == ObjKind::Chan as u32 => obj::chans().release(d.id),
+                        _ => {}
+                    }
+                }
+                return err(f, s);
+            }
         }
     }
 }
 
-/// `0x42 sys_chan_recv(handle, buf, len) -> n`
+/// `0x42 sys_chan_recv(handle, buf, len, out_handles: Slice<Handle>, 0)
+///   -> n | (n_handles << 32)`
 fn sys_chan_recv(f: &mut TrapFrame) {
     let h = Handle(f.rdi);
     let len = f.rdx as usize;
+    let out_ptr = f.r10;
     if len == 0 {
         return err(f, Status::InvalidArgument);
     }
@@ -851,23 +945,120 @@ fn sys_chan_recv(f: &mut TrapFrame) {
         },
         Err(s) => return err(f, s),
     };
+    // The caller passes a Slice<Handle>: `ptr` is where the received handles
+    // go, `count` is how many it can take (0 = do not accept handles).
+    let mut out_arr = 0u64;
+    let mut capacity = 0usize;
+    if out_ptr != 0 {
+        let mut slice = Slice::default();
+        if let Err(s) = p.copy_from_user(as_bytes_mut(&mut slice), out_ptr) {
+            return err(f, s);
+        }
+        out_arr = slice.ptr;
+        capacity = (slice.count as usize).min(obj::CHAN_MSG_HANDLES);
+    }
+
     let mut buf = [0u8; obj::CHAN_MSG_BYTES];
     let want = len.min(obj::CHAN_MSG_BYTES);
+    let mut descs = [obj::ObjDesc::default(); obj::CHAN_MSG_HANDLES];
 
     let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
     loop {
-        match obj::chans().recv(id, &mut buf[..want]) {
-            Ok(n) => {
+        match obj::chans().recv(id, &mut buf[..want], &mut descs) {
+            Ok((n, nh)) => {
                 if let Err(s) = p.copy_to_user(f.rsi, &buf[..n]) {
                     return err(f, s);
                 }
-                return ok(f, n as u64);
+                let mut installed = 0usize;
+                for d in descs[..nh].iter() {
+                    if installed >= capacity {
+                        // No room: drop the reference we just received.
+                        match d.kind {
+                            k if k == ObjKind::Memory as u32 => obj::mem().release(d.id),
+                            k if k == ObjKind::Chan as u32 => obj::chans().release(d.id),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    match p.install_obj(d) {
+                        Ok(handle) => {
+                            if out_arr != 0 {
+                                let at = out_arr + installed as u64 * 8;
+                                if let Err(s) = p.copy_to_user(at, &handle.0.to_ne_bytes()) {
+                                    return err(f, s);
+                                }
+                            }
+                            installed += 1;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                return ok(f, (n as u64) | ((installed as u64) << 32));
             }
             Err(Status::NotReady) if thread::ticks() < deadline => {
                 thread::sleep(thread::TICK_MS);
             }
             Err(s) => return err(f, s),
         }
+    }
+}
+
+/// `0x53 sys_seek(handle, offset, whence) -> new offset`
+fn sys_seek(f: &mut TrapFrame) {
+    let h = Handle(f.rdi);
+    let offset = f.rsi as i64;
+    let whence = f.rdx;
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    let (cur, end) = match p.handles().resolve(h, rights::READ) {
+        Ok(slot) => match slot.obj {
+            ObjRef::File { pos, len, .. } => (pos, len as u64),
+            ObjRef::TmpFile { id, pos } => (pos, fs::tmp().len(id)),
+            _ => return err(f, Status::InvalidArgument),
+        },
+        Err(s) => return err(f, s),
+    };
+    let base = match whence {
+        0 => 0i64,
+        1 => cur as i64,
+        2 => end as i64,
+        _ => return err(f, Status::InvalidArgument),
+    };
+    let new = match base.checked_add(offset) {
+        Some(v) if v >= 0 => v as u64,
+        _ => return err(f, Status::InvalidArgument),
+    };
+    let _ = p.handles_mut().with_mut(h, |slot| match &mut slot.obj {
+        ObjRef::File { pos, .. } => *pos = new,
+        ObjRef::TmpFile { pos, .. } => *pos = new,
+        _ => {}
+    });
+    ok(f, new)
+}
+
+/// `0x57 sys_unlink(dir, path, len)` — tmpfs only (v1 has no directories).
+fn sys_unlink(f: &mut TrapFrame) {
+    let dir = Handle(f.rdi);
+    let path_len = f.rdx as usize;
+    if path_len == 0 || path_len > 128 {
+        return err(f, Status::InvalidArgument);
+    }
+    let Some(p) = proc::current() else {
+        return err(f, Status::BadAddress);
+    };
+    match p.handles().resolve(dir, rights::READ) {
+        Ok(slot) if matches!(slot.obj, ObjRef::Dir { .. }) => {}
+        Ok(_) => return err(f, Status::InvalidArgument),
+        Err(s) => return err(f, s),
+    }
+    let mut path = [0u8; 128];
+    if let Err(s) = p.copy_from_user(&mut path[..path_len], f.rsi) {
+        return err(f, s);
+    }
+    match fs::tmp().remove(&path[..path_len]) {
+        Ok(()) => ok(f, 0),
+        Err(s) => err(f, s),
     }
 }
 

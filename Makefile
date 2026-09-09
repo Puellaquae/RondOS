@@ -56,7 +56,7 @@ all: esp
 release: all
 
 user:
-	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin -p echo
+	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin -p echo -p heap
 
 cprogram: $(C_ELF)
 
@@ -67,11 +67,13 @@ boot:
 	cd $(BOOT_DIR) && $(CARGO) build $(CARGO_FLAG)
 
 # A C program: crt0.S + hello.c + rondos.h, linked with the same user.ld.
-$(C_ELF): $(USER_DIR)/c/crt0.S $(USER_DIR)/c/hello.c $(USER_DIR)/c/rondos.h $(USER_DIR)/user.ld
+$(C_ELF): $(USER_DIR)/c/crt0.S $(USER_DIR)/c/hello.c $(USER_DIR)/c/rondos.c \
+           $(USER_DIR)/c/rondos.h $(USER_DIR)/user.ld
 	@mkdir -p $(C_BUILD)
 	$(CC) -c -o $(C_BUILD)/crt0.o $(USER_DIR)/c/crt0.S
 	$(CC) $(CFLAGS) -I $(USER_DIR)/c -c $(USER_DIR)/c/hello.c -o $(C_BUILD)/hello.o
-	$(LD) -T $(USER_DIR)/user.ld --no-pie -o $@ $(C_BUILD)/crt0.o $(C_BUILD)/hello.o
+	$(CC) $(CFLAGS) -I $(USER_DIR)/c -c $(USER_DIR)/c/rondos.c -o $(C_BUILD)/rondos.o
+	$(LD) -T $(USER_DIR)/user.ld --no-pie -o $@ $(C_BUILD)/crt0.o $(C_BUILD)/hello.o $(C_BUILD)/rondos.o
 
 # The boot tar is what the UEFI stub hands over as BootInfo.initrd: the kernel
 # finds /bin/* inside it (ustar, flat names).
@@ -82,6 +84,7 @@ $(BOOT_TAR): user $(C_ELF)
 	  bin/crash=$(USER_BIN)/crash \
 	  bin/spin=$(USER_BIN)/spin \
 	  bin/echo=$(USER_BIN)/echo \
+	  bin/heap=$(USER_BIN)/heap \
 	  bin/chello=$(C_ELF) \
 	  bin/hello.c=$(USER_DIR)/c/hello.c
 
@@ -122,6 +125,14 @@ test: esp
 	@grep -q "user: init: tmpfs file round-trips" $(SERIAL_LOG) \
 	  && echo "==> tmpfs round-trip + readdir" \
 	  || (echo "==> tmpfs failed"; exit 1)
+	@grep -q "user: init: handle passing ok" $(SERIAL_LOG) \
+	  && grep -q "user: init: unlink ok" $(SERIAL_LOG) \
+	  && echo "==> handle passing over a channel + seek/unlink" \
+	  || (echo "==> P2d checks failed"; exit 1)
+	@grep -q "user: heap: 2000-element Vec ok" $(SERIAL_LOG) \
+	  && grep -q "user: chello: malloc/free ok" $(SERIAL_LOG) \
+	  && echo "==> user heap (Rust alloc + C malloc)" \
+	  || (echo "==> heap failed"; exit 1)
 
 clean:
 	rm -rf build

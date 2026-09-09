@@ -29,6 +29,22 @@ pub const MAX_MEM_PAGES: usize = 16;
 pub const MAX_CHANS: usize = 8;
 pub const CHAN_SLOTS: usize = 8;
 pub const CHAN_MSG_BYTES: usize = 128;
+/// Handles that can travel with one message.
+pub const CHAN_MSG_HANDLES: usize = 2;
+
+/// A portable object reference: everything needed to rebuild the handle in
+/// another process's table (no process-local state such as a mapping VA).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjDesc {
+    pub kind: u32,
+    /// Object id (memory/chan/tmpfs slot) or tar offset (file).
+    pub id: u32,
+    /// Tar length for files, 0 otherwise.
+    pub aux: u32,
+    pub _pad0: u32,
+    pub flags: u64,
+    pub rights: u64,
+}
 
 // ------------------------------------------------------------ memory objects
 
@@ -162,14 +178,38 @@ impl MemTable {
 #[derive(Clone, Copy)]
 pub struct ChanMsg {
     pub len: u16,
+    pub n_handles: u8,
+    pub _pad0: u8,
     pub bytes: [u8; CHAN_MSG_BYTES],
+    pub handles: [ObjDesc; CHAN_MSG_HANDLES],
 }
 
 impl ChanMsg {
     const fn empty() -> Self {
         Self {
             len: 0,
+            n_handles: 0,
+            _pad0: 0,
             bytes: [0; CHAN_MSG_BYTES],
+            handles: [ObjDesc {
+                kind: 0,
+                id: 0,
+                aux: 0,
+                _pad0: 0,
+                flags: 0,
+                rights: 0,
+            }; CHAN_MSG_HANDLES],
+        }
+    }
+}
+
+/// Drop the object references a queued message still holds.
+fn release_msg(msg: &ChanMsg) {
+    for d in msg.handles[..msg.n_handles as usize].iter() {
+        match d.kind {
+            3 => mem().release(d.id),      // ObjKind::Memory
+            4 => chans().release(d.id),    // ObjKind::Chan
+            _ => {}
         }
     }
 }
@@ -245,14 +285,26 @@ impl ChanTable {
         }
         c.refs -= 1;
         if c.refs == 0 {
+            // Undelivered messages still hold object references.
+            for i in 0..CHAN_SLOTS {
+                release_msg(&c.msgs[i]);
+            }
             *c = ChanObj::new();
         }
     }
 
-    /// Push one message.  `NotReady` when the queue is full (the caller sleeps
-    /// and retries).
-    pub fn send(&mut self, id: u32, bytes: &[u8]) -> Result<usize, Status> {
-        if bytes.len() > CHAN_MSG_BYTES {
+    /// Push one message (plus up to [`CHAN_MSG_HANDLES`] object references).
+    /// `NotReady` when the queue is full (the caller sleeps and retries).
+    ///
+    /// The caller must already hold one reference per `handles` entry; the
+    /// message takes it over.
+    pub fn send(
+        &mut self,
+        id: u32,
+        bytes: &[u8],
+        handles: &[ObjDesc],
+    ) -> Result<usize, Status> {
+        if bytes.len() > CHAN_MSG_BYTES || handles.len() > CHAN_MSG_HANDLES {
             return Err(Status::InvalidArgument);
         }
         let c = match self.chans.get_mut(id as usize) {
@@ -265,13 +317,21 @@ impl ChanTable {
         let idx = c.tail as usize;
         c.msgs[idx].len = bytes.len() as u16;
         c.msgs[idx].bytes[..bytes.len()].copy_from_slice(bytes);
+        c.msgs[idx].n_handles = handles.len() as u8;
+        c.msgs[idx].handles[..handles.len()].copy_from_slice(handles);
         c.tail = ((idx + 1) % CHAN_SLOTS) as u8;
         c.count += 1;
         Ok(bytes.len())
     }
 
-    /// Pop one message into `dst`; `NotReady` when the queue is empty.
-    pub fn recv(&mut self, id: u32, dst: &mut [u8]) -> Result<usize, Status> {
+    /// Pop one message: `(bytes copied, object references)`.  The references
+    /// are handed to the caller, which installs them in the receiver's table.
+    pub fn recv(
+        &mut self,
+        id: u32,
+        dst: &mut [u8],
+        out: &mut [ObjDesc; CHAN_MSG_HANDLES],
+    ) -> Result<(usize, usize), Status> {
         let c = match self.chans.get_mut(id as usize) {
             Some(c) if c.used => c,
             _ => return Err(Status::BadHandle),
@@ -285,10 +345,13 @@ impl ChanTable {
             return Err(Status::InvalidArgument); // leave the message in place
         }
         dst[..n].copy_from_slice(&c.msgs[idx].bytes[..n]);
+        let nh = c.msgs[idx].n_handles as usize;
+        out[..nh].copy_from_slice(&c.msgs[idx].handles[..nh]);
         c.msgs[idx].len = 0;
+        c.msgs[idx].n_handles = 0;
         c.head = ((idx + 1) % CHAN_SLOTS) as u8;
         c.count -= 1;
-        Ok(n)
+        Ok((n, nh))
     }
 }
 

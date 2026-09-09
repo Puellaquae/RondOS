@@ -528,6 +528,43 @@ impl Process {
         Ok(va)
     }
 
+    /// Install an object that arrived over a channel (or any other delegation
+    /// path): the reference travels with it, so this either returns a handle or
+    /// releases the reference on failure.
+    pub fn install_obj(&mut self, d: &crate::obj::ObjDesc) -> Result<Handle, Status> {
+        let obj = match d.kind {
+            k if k == rondos_abi::ObjKind::Memory as u32 => {
+                let va = self.map_memobj(d.id, d.flags)?;
+                let len = crate::obj::mem().get(d.id).map(|o| o.len).unwrap_or(0);
+                ObjRef::Memory { id: d.id, va, len }
+            }
+            k if k == rondos_abi::ObjKind::Chan as u32 => ObjRef::Chan { id: d.id },
+            k if k == rondos_abi::ObjKind::File as u32 => ObjRef::File {
+                off: d.id,
+                len: d.aux,
+                pos: 0,
+            },
+            _ => {
+                release_obj(match d.kind {
+                    k if k == rondos_abi::ObjKind::Memory as u32 => ObjRef::Memory {
+                        id: d.id,
+                        va: 0,
+                        len: 0,
+                    },
+                    _ => ObjRef::Chan { id: d.id },
+                });
+                return Err(Status::Unsupported);
+            }
+        };
+        match self.handles_mut().insert(obj, d.rights) {
+            Some(h) => Ok(h),
+            None => {
+                release_obj(obj);
+                Err(Status::OutOfMemory)
+            }
+        }
+    }
+
     /// Unmap a shared object: drop the VMA and remove its mappings, keeping the
     /// frames (the object still owns them).
     pub fn unmap_memobj(&mut self, va: u64) -> Result<(), Status> {
