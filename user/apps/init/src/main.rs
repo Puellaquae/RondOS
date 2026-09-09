@@ -86,7 +86,10 @@ fn check_killed_child(root: Handle) -> i32 {
     0
 }
 
-/// Channel round-trip: delegate one end to `bin/echo`, send, receive it back.
+/// Channel round-trip: delegate end `b` to `bin/echo`, send on `a`, and require
+/// the child's *prefixed* answer back on `a`.  A shared-mailbox channel would
+/// return our own bytes and the child would never see the message, so the
+/// prefix is what makes this test real.
 fn check_echo_child(root: Handle) -> i32 {
     let (a, b) = step!(30, chan_create());
     let image = step!(31, open_file(root, b"/bin/echo"));
@@ -97,30 +100,76 @@ fn check_echo_child(root: Handle) -> i32 {
             &[CapDesc {
                 kind: ObjKind::Chan as u32,
                 _pad0: 0,
-                rights: rondos_abi::rights::READ | rondos_abi::rights::WRITE,
+                rights: rondos_abi::rights::READ
+                    | rondos_abi::rights::WRITE
+                    | rondos_abi::rights::SHARE,
                 handle: b.0,
             }]
         )
     );
     let _ = close(image);
-    let _ = close(b);
 
     let msg = b"ping through a channel";
     step!(33, chan_send(a, msg));
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 80];
     let n = step!(34, chan_recv(a, &mut buf));
-    if &buf[..n] != msg {
-        println!("init: channel echoed the wrong bytes");
+    if !buf[..n].starts_with(b"echo:") || &buf[5..n] != msg {
+        println!(
+            "init: channel reply was not the child's echo ({} bytes)",
+            n
+        );
         return 35;
     }
-    println!("init: channel echoed {} bytes", n);
+    println!("init: channel echoed {} bytes from the child", n);
 
     let w = step!(36, wait(&[child], 5_000_000_000));
     if w.reason != wait_reason::EXITED {
         println!("init: echo child ended with reason {}", w.reason);
         return 37;
     }
+    let st = step!(38, proc_status(child));
+    if st.kind != exit_kind::EXITED || st.code != 0 {
+        println!("init: echo child exit kind {} code {}", st.kind, st.code);
+        return 39;
+    }
     let _ = close(a);
+    let _ = close(b);
+    let _ = close(child);
+    0
+}
+
+/// Device capability: `init` (kernel-spawned root) may map the framebuffer, a
+/// child without the capability must be refused.
+fn check_device_cap(root: Handle) -> i32 {
+    if let Ok(info) = rondos_rt::info() {
+        if info.fb_present != 0 && info.fb.phys != 0 {
+            match rondos_rt::mem_map_phys(info.fb.phys, 4096, 0) {
+                Ok((h, va)) => {
+                    println!("init: framebuffer mapped at {:#x}", va);
+                    let _ = rondos_rt::mem_unmap(h);
+                }
+                Err(e) => {
+                    println!("init: framebuffer map failed: {:?}", e);
+                    return 96;
+                }
+            }
+        }
+    }
+
+    let image = step!(97, open_file(root, b"/bin/physcheck"));
+    let child = step!(98, spawn(image));
+    let _ = close(image);
+    let w = step!(99, wait(&[child], 5_000_000_000));
+    if w.reason != wait_reason::EXITED {
+        println!("init: physcheck ended with reason {}", w.reason);
+        return 100;
+    }
+    let st = step!(101, proc_status(child));
+    if st.kind != exit_kind::EXITED || st.code != 0 {
+        println!("init: physcheck exit kind {} code {}", st.kind, st.code);
+        return 102;
+    }
+    println!("init: device capability enforced");
     let _ = close(child);
     0
 }
@@ -190,7 +239,14 @@ fn check_p2_rest(root: Handle) -> i32 {
     // 1. A memory object sent through a channel comes back as a *new* handle
     //    mapped at a *new* address, and the contents survive.
     let (a, b) = step!(70, chan_create());
-    let (mem, va) = step!(71, mem_map(4096, mem_flags::READ | mem_flags::WRITE));
+    // SHARE is required to hand the object to another holder.
+    let (mem, va) = step!(
+        71,
+        mem_map(
+            4096,
+            mem_flags::READ | mem_flags::WRITE | mem_flags::SHARE
+        )
+    );
     unsafe { (va as *mut u64).write_volatile(0x5150_5150_5150_5150) };
     step!(72, rondos_rt::chan_send_with(a, b"mem", &[mem]));
     let mut buf = [0u8; 8];
@@ -332,6 +388,10 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
         return rc;
     }
     let rc = check_heap_program(root);
+    if rc != 0 {
+        return rc;
+    }
+    let rc = check_device_cap(root);
     if rc != 0 {
         return rc;
     }

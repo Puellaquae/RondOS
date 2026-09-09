@@ -20,9 +20,14 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
             return 2;
         }
     };
-    match rondos_rt::chan_send(chan, &buf[..n]) {
-        Ok(_) => {
-            rondos_rt::println!("echo: returned {} bytes", n);
+    // Reply with a prefix: the parent must be able to tell the child's answer
+    // apart from its own message (a channel is a pipe, not a shared mailbox).
+    let mut reply = [0u8; 80];
+    reply[..5].copy_from_slice(b"echo:");
+    reply[5..5 + n].copy_from_slice(&buf[..n]);
+    match rondos_rt::chan_send(chan, &reply[..5 + n]) {
+        Ok(m) => {
+            rondos_rt::println!("echo: returned {} bytes", m);
             0
         }
         Err(e) => {

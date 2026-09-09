@@ -259,6 +259,29 @@ pub fn spawn_with_caps(image: Handle, caps: &[abi::CapDesc]) -> Result<Handle, S
     }
 }
 
+/// `sys_info`: ABI version, feature bits, timer and framebuffer description.
+pub fn info() -> Result<abi::Info, Status> {
+    let mut out = abi::Info::default();
+    out.hdr.size = core::mem::size_of::<abi::Info>() as u32;
+    out.hdr.version = abi::STRUCT_VERSION;
+    let r = unsafe {
+        abi::syscall(
+            abi::SyscallId::Info,
+            &mut out as *mut abi::Info as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    if r.status.is_ok() {
+        Ok(out)
+    } else {
+        Err(r.status)
+    }
+}
+
 /// The first capability of `kind` in the `StartupBlock`.
 pub fn cap(kind: abi::ObjKind) -> Option<Handle> {
     startup().and_then(|b| b.cap(kind)).map(|c| Handle(c.handle))

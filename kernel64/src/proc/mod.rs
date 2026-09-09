@@ -188,8 +188,8 @@ pub enum ObjRef {
     Device { node: u32 },
     /// A shared memory object, mapped in this process at `va`.
     Memory { id: u32, va: u64, len: u64 },
-    /// One end of a message channel.
-    Chan { id: u32 },
+    /// One end of a message channel (`end` 0 or 1).
+    Chan { id: u32, end: u8 },
     /// Another process, addressable for `sys_wait`/`sys_proc_status`/`sys_kill`.
     Process { pid: u32 },
 }
@@ -240,7 +240,7 @@ impl HandleSlot {
 fn release_obj(obj: ObjRef) {
     match obj {
         ObjRef::Memory { id, .. } => crate::obj::mem().release(id),
-        ObjRef::Chan { id } => crate::obj::chans().release(id),
+        ObjRef::Chan { id, .. } => crate::obj::chans().release(id),
         _ => {}
     }
 }
@@ -595,7 +595,10 @@ impl Process {
                 let len = crate::obj::mem().get(d.id).map(|o| o.len).unwrap_or(0);
                 ObjRef::Memory { id: d.id, va, len }
             }
-            k if k == rondos_abi::ObjKind::Chan as u32 => ObjRef::Chan { id: d.id },
+            k if k == rondos_abi::ObjKind::Chan as u32 => ObjRef::Chan {
+                id: d.id,
+                end: d.aux as u8,
+            },
             k if k == rondos_abi::ObjKind::File as u32 => ObjRef::File {
                 off: d.id,
                 len: d.aux,

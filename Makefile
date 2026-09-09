@@ -56,7 +56,7 @@ all: esp
 release: all
 
 user:
-	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin -p echo -p heap
+	cd $(USER_DIR) && $(CARGO) +nightly build $(CARGO_FLAG) -p init -p crash -p spin -p echo -p heap -p physcheck
 
 cprogram: $(C_ELF)
 
@@ -85,6 +85,7 @@ $(BOOT_TAR): user $(C_ELF)
 	  bin/spin=$(USER_BIN)/spin \
 	  bin/echo=$(USER_BIN)/echo \
 	  bin/heap=$(USER_BIN)/heap \
+	  bin/physcheck=$(USER_BIN)/physcheck \
 	  bin/chello=$(C_ELF) \
 	  bin/hello.c=$(USER_DIR)/c/hello.c
 

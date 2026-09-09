@@ -35,6 +35,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "physcheck"
+version = "0.1.0"
+dependencies = [
+ "rondos-abi",
+ "rondos-rt",
+]
+
+[[package]]
 name = "rondos-abi"
 version = "0.1.0"
 

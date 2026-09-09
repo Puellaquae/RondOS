@@ -45,7 +45,7 @@ pub const MAX_EXTRA_CAPS: usize = 4;
 pub struct PendingCap {
     pub kind: ObjKind,
     pub id: u32,
-    /// Object length (memory objects) / 0.
+    /// Object length (memory objects) / channel end.
     pub len: u64,
     /// Object flags (memory objects) / 0.
     pub flags: u64,
@@ -249,7 +249,10 @@ fn write_startup(
                 if !crate::obj::chans().retain(c.id) {
                     return Err(Status::BadHandle);
                 }
-                ObjRef::Chan { id: c.id }
+                ObjRef::Chan {
+                    id: c.id,
+                    end: c.len as u8,
+                }
             }
             _ => return Err(Status::Unsupported),
         };
@@ -262,7 +265,7 @@ fn write_startup(
                 }
                 match obj {
                     ObjRef::Memory { id, .. } => crate::obj::mem().release(id),
-                    ObjRef::Chan { id } => crate::obj::chans().release(id),
+                    ObjRef::Chan { id, .. } => crate::obj::chans().release(id),
                     _ => {}
                 }
                 return Err(Status::OutOfMemory);

@@ -461,7 +461,9 @@ fn sys_spawn(f: &mut TrapFrame) {
             if let Err(s) = p.copy_from_user(as_bytes_mut(&mut desc), at) {
                 return err(f, s);
             }
-            let slot = match p.handles().resolve(Handle(desc.handle), rights::NONE) {
+            // Delegation needs the SHARE right: a capability that cannot be
+            // passed on must not be passed on.
+            let slot = match p.handles().resolve(Handle(desc.handle), rights::SHARE) {
                 Ok(slot) => slot,
                 Err(s) => return err(f, s),
             };
@@ -479,11 +481,11 @@ fn sys_spawn(f: &mut TrapFrame) {
                         rights: desc.rights,
                     };
                 }
-                ObjRef::Chan { id } => {
+                ObjRef::Chan { id, end } => {
                     pending[n_caps] = PendingCap {
                         kind: ObjKind::Chan,
                         id,
-                        len: 0,
+                        len: end as u64,
                         flags: 0,
                         rights: desc.rights,
                     };
@@ -791,11 +793,12 @@ fn sys_chan_create(f: &mut TrapFrame) {
     let Some(id) = obj::chans().create() else {
         return err(f, Status::OutOfMemory);
     };
-    let rw = rights::READ | rights::WRITE;
-    let a = p.handles_mut().insert(ObjRef::Chan { id }, rw);
+    // SHARE so the ends can be delegated to children/services.
+    let rw = rights::READ | rights::WRITE | rights::SHARE;
+    let a = p.handles_mut().insert(ObjRef::Chan { id, end: 0 }, rw);
     let b = a.and_then(|_| {
         obj::chans().retain(id);
-        p.handles_mut().insert(ObjRef::Chan { id }, rw)
+        p.handles_mut().insert(ObjRef::Chan { id, end: 1 }, rw)
     });
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -831,9 +834,9 @@ fn sys_chan_send(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
-    let id = match p.handles().resolve(h, rights::WRITE) {
+    let (id, end) = match p.handles().resolve(h, rights::WRITE) {
         Ok(slot) => match slot.obj {
-            ObjRef::Chan { id } => id,
+            ObjRef::Chan { id, end } => (id, end),
             _ => return err(f, Status::InvalidArgument),
         },
         Err(s) => return err(f, s),
@@ -863,7 +866,8 @@ fn sys_chan_send(f: &mut TrapFrame) {
                 return err(f, s);
             }
             let uh = Handle(u64::from_ne_bytes(raw));
-            let (desc, retain) = match p.handles().resolve(uh, rights::NONE) {
+            // Handles travel only with the SHARE right.
+            let (desc, retain) = match p.handles().resolve(uh, rights::SHARE) {
                 Ok(slot) => match slot.obj {
                     ObjRef::Memory { id, .. } => {
                         let flags = obj::mem().get(id).map(|o| o.flags).unwrap_or(0);
@@ -879,11 +883,11 @@ fn sys_chan_send(f: &mut TrapFrame) {
                             Some((ObjKind::Memory, id)),
                         )
                     }
-                    ObjRef::Chan { id } => (
+                    ObjRef::Chan { id, end } => (
                         obj::ObjDesc {
                             kind: ObjKind::Chan as u32,
                             id,
-                            aux: 0,
+                            aux: end as u32,
                             _pad0: 0,
                             flags: 0,
                             rights: slot.rights,
@@ -923,7 +927,7 @@ fn sys_chan_send(f: &mut TrapFrame) {
 
     let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
     loop {
-        match obj::chans().send(id, &buf[..len], &descs[..n_desc]) {
+        match obj::chans().send(id, end, &buf[..len], &descs[..n_desc]) {
             Ok(n) => return ok(f, n as u64),
             Err(Status::NotReady) if thread::ticks() < deadline => {
                 thread::sleep(thread::TICK_MS);
@@ -955,9 +959,9 @@ fn sys_chan_recv(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
-    let id = match p.handles().resolve(h, rights::READ) {
+    let (id, end) = match p.handles().resolve(h, rights::READ) {
         Ok(slot) => match slot.obj {
-            ObjRef::Chan { id } => id,
+            ObjRef::Chan { id, end } => (id, end),
             _ => return err(f, Status::InvalidArgument),
         },
         Err(s) => return err(f, s),
@@ -981,7 +985,7 @@ fn sys_chan_recv(f: &mut TrapFrame) {
 
     let deadline = thread::ticks() + 200 / thread::TICK_MS; // ~1 s
     loop {
-        match obj::chans().recv(id, &mut buf[..want], &mut descs) {
+        match obj::chans().recv(id, end, &mut buf[..want], &mut descs) {
             Ok((n, nh)) => {
                 if let Err(s) = p.copy_to_user(f.rsi, &buf[..n]) {
                     return err(f, s);

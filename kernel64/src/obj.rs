@@ -214,15 +214,34 @@ fn release_msg(msg: &ChanMsg) {
     }
 }
 
-/// A bounded FIFO of byte messages shared by every handle to it.
+/// One direction of a channel: end 0 writes here, end 1 reads it.
 #[derive(Clone, Copy)]
-pub struct ChanObj {
-    pub used: bool,
-    pub refs: u32,
+struct ChanQueue {
     head: u8,
     tail: u8,
     count: u8,
     msgs: [ChanMsg; CHAN_SLOTS],
+}
+
+impl ChanQueue {
+    const fn new() -> Self {
+        Self {
+            head: 0,
+            tail: 0,
+            count: 0,
+            msgs: [ChanMsg::empty(); CHAN_SLOTS],
+        }
+    }
+}
+
+/// A bidirectional channel: two queues, one per direction.  `chan_create`
+/// returns the two ends, and `send` on end `e` is only ever seen by `recv` on
+/// end `1 - e` — a channel is a pipe, not a shared mailbox.
+#[derive(Clone, Copy)]
+pub struct ChanObj {
+    pub used: bool,
+    pub refs: u32,
+    queues: [ChanQueue; 2],
 }
 
 impl ChanObj {
@@ -230,19 +249,16 @@ impl ChanObj {
         Self {
             used: false,
             refs: 0,
-            head: 0,
-            tail: 0,
-            count: 0,
-            msgs: [ChanMsg::empty(); CHAN_SLOTS],
+            queues: [ChanQueue::new(), ChanQueue::new()],
         }
     }
 
-    pub fn is_full(&self) -> bool {
-        self.count as usize == CHAN_SLOTS
+    pub fn is_full(&self, end: u8) -> bool {
+        self.queues[end as usize].count as usize == CHAN_SLOTS
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
+    pub fn is_empty(&self, end: u8) -> bool {
+        self.queues[end as usize].count == 0
     }
 }
 
@@ -285,9 +301,11 @@ impl ChanTable {
         }
         c.refs -= 1;
         if c.refs == 0 {
-            // Undelivered messages still hold object references.
-            for i in 0..CHAN_SLOTS {
-                release_msg(&c.msgs[i]);
+            // Undelivered messages in either direction still hold references.
+            for q in c.queues.iter() {
+                for i in 0..CHAN_SLOTS {
+                    release_msg(&q.msgs[i]);
+                }
             }
             *c = ChanObj::new();
         }
@@ -301,56 +319,64 @@ impl ChanTable {
     pub fn send(
         &mut self,
         id: u32,
+        end: u8,
         bytes: &[u8],
         handles: &[ObjDesc],
     ) -> Result<usize, Status> {
-        if bytes.len() > CHAN_MSG_BYTES || handles.len() > CHAN_MSG_HANDLES {
+        if bytes.len() > CHAN_MSG_BYTES || handles.len() > CHAN_MSG_HANDLES || end > 1 {
             return Err(Status::InvalidArgument);
         }
         let c = match self.chans.get_mut(id as usize) {
             Some(c) if c.used => c,
             _ => return Err(Status::BadHandle),
         };
-        if c.is_full() {
+        if c.is_full(end) {
             return Err(Status::NotReady);
         }
-        let idx = c.tail as usize;
-        c.msgs[idx].len = bytes.len() as u16;
-        c.msgs[idx].bytes[..bytes.len()].copy_from_slice(bytes);
-        c.msgs[idx].n_handles = handles.len() as u8;
-        c.msgs[idx].handles[..handles.len()].copy_from_slice(handles);
-        c.tail = ((idx + 1) % CHAN_SLOTS) as u8;
-        c.count += 1;
+        let q = &mut c.queues[end as usize];
+        let idx = q.tail as usize;
+        q.msgs[idx].len = bytes.len() as u16;
+        q.msgs[idx].bytes[..bytes.len()].copy_from_slice(bytes);
+        q.msgs[idx].n_handles = handles.len() as u8;
+        q.msgs[idx].handles[..handles.len()].copy_from_slice(handles);
+        q.tail = ((idx + 1) % CHAN_SLOTS) as u8;
+        q.count += 1;
         Ok(bytes.len())
     }
 
     /// Pop one message: `(bytes copied, object references)`.  The references
     /// are handed to the caller, which installs them in the receiver's table.
+    /// Receive from `end`: the messages the *peer* sent (queue `1 - end`).
     pub fn recv(
         &mut self,
         id: u32,
+        end: u8,
         dst: &mut [u8],
         out: &mut [ObjDesc; CHAN_MSG_HANDLES],
     ) -> Result<(usize, usize), Status> {
+        if end > 1 {
+            return Err(Status::InvalidArgument);
+        }
         let c = match self.chans.get_mut(id as usize) {
             Some(c) if c.used => c,
             _ => return Err(Status::BadHandle),
         };
-        if c.is_empty() {
+        let q = &mut c.queues[1 - end as usize];
+        if q.count == 0 {
             return Err(Status::NotReady);
         }
-        let idx = c.head as usize;
-        let n = c.msgs[idx].len as usize;
+        let idx = q.head as usize;
+        let n = q.msgs[idx].len as usize;
         if n > dst.len() {
             return Err(Status::InvalidArgument); // leave the message in place
         }
-        dst[..n].copy_from_slice(&c.msgs[idx].bytes[..n]);
-        let nh = c.msgs[idx].n_handles as usize;
-        out[..nh].copy_from_slice(&c.msgs[idx].handles[..nh]);
-        c.msgs[idx].len = 0;
-        c.msgs[idx].n_handles = 0;
-        c.head = ((idx + 1) % CHAN_SLOTS) as u8;
-        c.count -= 1;
+        dst[..n].copy_from_slice(&q.msgs[idx].bytes[..n]);
+        let nh = q.msgs[idx].n_handles as usize;
+        out[..nh].copy_from_slice(&q.msgs[idx].handles[..nh]);
+        q.msgs[idx].len = 0;
+        q.msgs[idx].n_handles = 0;
+        q.head = ((idx + 1) % CHAN_SLOTS) as u8;
+        q.count -= 1;
         Ok((n, nh))
     }
 }
