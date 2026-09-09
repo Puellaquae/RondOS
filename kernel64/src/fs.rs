@@ -48,6 +48,12 @@ fn octal(field: &[u8]) -> Option<u32> {
     Some(v)
 }
 
+/// ustar magic at offset 257 (`"ustar\0"` or `"ustar "`).  A header without
+/// it is not something we wrote, so the walk stops rather than misparsing.
+fn valid_magic(hdr: &[u8]) -> bool {
+    &hdr[257..262] == b"ustar"
+}
+
 fn name_of(hdr: &'static [u8]) -> &'static [u8] {
     let field = &hdr[0..NAME_MAX];
     let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
@@ -93,6 +99,10 @@ impl TarFs {
                     done = true;
                     return None;
                 }
+                if !valid_magic(hdr) {
+                    done = true;
+                    return None;
+                }
                 let size = octal(&hdr[124..136])? as usize;
                 let typeflag = hdr[156];
                 let data = off + TAR_BLOCK;
@@ -132,6 +142,9 @@ impl TarFs {
         loop {
             let hdr: &'static [u8] = self.tar.get(off..off + TAR_BLOCK)?;
             if hdr.iter().all(|b| *b == 0) {
+                return None;
+            }
+            if !valid_magic(hdr) {
                 return None;
             }
             let size = octal(&hdr[124..136])? as usize;

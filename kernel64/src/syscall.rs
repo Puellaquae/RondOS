@@ -1007,11 +1007,20 @@ fn sys_chan_recv(f: &mut TrapFrame) {
         match obj::chans().recv(id, end, &mut buf[..want], &mut descs) {
             Ok((n, nh)) => {
                 if let Err(s) = p.copy_to_user(f.rsi, &buf[..n]) {
+                    // The payload is lost either way; the references that
+                    // travelled with it must not leak.
+                    for d in descs[..nh].iter() {
+                        match d.kind {
+                            k if k == ObjKind::Memory as u32 => obj::mem().release(d.id),
+                            k if k == ObjKind::Chan as u32 => obj::chans().release(d.id),
+                            _ => {}
+                        }
+                    }
                     return err(f, s);
                 }
                 let mut installed = 0usize;
                 for d in descs[..nh].iter() {
-                    if installed >= capacity {
+                    if out_arr == 0 || installed >= capacity {
                         // No room: drop the reference we just received.
                         match d.kind {
                             k if k == ObjKind::Memory as u32 => obj::mem().release(d.id),
@@ -1178,7 +1187,12 @@ fn sys_readdir(f: &mut TrapFrame) {
     }
     if !found {
         let tar_count = fs::TarFs::root().map(|t| t.count()).unwrap_or(0);
-        if let Some(fe) = fs::tmp().entry(index - tar_count.min(index)) {
+        // `index < tar_count` with no tar entry means a malformed archive:
+        // report end-of-directory rather than aliasing tmpfs[0].
+        let Some(tmp_index) = index.checked_sub(tar_count) else {
+            return err(f, Status::NotFound);
+        };
+        if let Some(fe) = fs::tmp().entry(tmp_index) {
             out.kind = ObjKind::File as u32;
             out.len_bytes = fe.len as u64;
             let name = fe.name();
