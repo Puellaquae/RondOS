@@ -81,6 +81,8 @@ pub fn open_file_flags(dir: Handle, path: &[u8], flags: u64) -> Result<Handle, S
 /// Read one directory entry; `Err(NotFound)` means end of directory.
 pub fn readdir(dir: Handle, index: u32) -> Result<abi::DirEntry, Status> {
     let mut out = abi::DirEntry::default();
+    out.hdr.size = core::mem::size_of::<abi::DirEntry>() as u32;
+    out.hdr.version = abi::STRUCT_VERSION;
     let r = abi::readdir(dir, index, &mut out);
     if r.status.is_ok() {
         Ok(out)
@@ -132,6 +134,8 @@ pub fn wait(handles: &[Handle], timeout_ns: u64) -> Result<WaitResult, Status> {
 
 pub fn proc_status(handle: Handle) -> Result<ExitStatus, Status> {
     let mut out = ExitStatus::default();
+    out.hdr.size = core::mem::size_of::<ExitStatus>() as u32;
+    out.hdr.version = abi::STRUCT_VERSION;
     let r = abi::proc_status(handle, &mut out);
     if r.status.is_ok() {
         Ok(out)
@@ -182,6 +186,9 @@ pub fn mem_map_phys(pa: u64, len_bytes: u64, cache: u64) -> Result<(Handle, u64)
 
 pub fn stat(handle: Handle) -> Result<abi::Stat, Status> {
     let mut out = abi::Stat::default();
+    // The kernel honours the caller's declared size, so fill the header.
+    out.hdr.size = core::mem::size_of::<abi::Stat>() as u32;
+    out.hdr.version = abi::STRUCT_VERSION;
     let r = abi::stat(handle, &mut out);
     if r.status.is_ok() {
         Ok(out)
@@ -332,7 +339,9 @@ pub fn xmm0() -> u64 {
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
-        let _ = write!(::rondos_rt::Logger, $($arg)*);
+        let mut logger = ::rondos_rt::Logger::new();
+        let _ = write!(logger, $($arg)*);
+        logger.finish();
     }};
 }
 
@@ -345,17 +354,48 @@ macro_rules! println {
     }};
 }
 
-/// Minimal `core::fmt::Write` sink that pushes each chunk through `sys_log`.
-pub struct Logger;
+/// `core::fmt::Write` sink that buffers until a newline.
+///
+/// Without buffering every format fragment became its own `sys_log` call, so
+/// `println!("x = {}", n)` produced three separate `user: ...` lines and a
+/// stray empty one.  One line in, one line out (or a 200-byte flush).
+pub struct Logger {
+    buf: [u8; 200],
+    len: usize,
+}
+
+impl Logger {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; 200],
+            len: 0,
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.len > 0 {
+            let _ = log(LogLevel::Info, &self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+
+    /// Flush whatever is left (no trailing newline).
+    pub fn finish(&mut self) {
+        self.flush();
+    }
+}
 
 impl core::fmt::Write for Logger {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let mut off = 0;
-        while off < bytes.len() {
-            let n = (bytes.len() - off).min(256);
-            let _ = log(LogLevel::Info, &bytes[off..off + n]);
-            off += n;
+        for &b in s.as_bytes() {
+            if self.len == self.buf.len() {
+                self.flush();
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+            if b == b'\n' {
+                self.flush();
+            }
         }
         Ok(())
     }
@@ -388,8 +428,9 @@ extern "C" fn exit_trampoline(status: i32) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let mut logger = Logger;
+    let mut logger = Logger::new();
     let _ = core::fmt::write(&mut logger, format_args!("panic: {}\n", info.message()));
+    logger.finish();
     exit(101)
 }
 
@@ -443,10 +484,12 @@ pub mod heap {
         if !r.status.is_ok() {
             return false;
         }
-        let mut stat = abi::Stat::default();
-        if !abi::stat(abi::Handle(r.value), &mut stat).status.is_ok() || stat.va == 0 {
-            return false;
-        }
+        // Use the typed wrapper: it fills hdr.size, which the kernel now
+        // enforces (a zero size is an invalid caller).
+        let stat = match crate::stat(abi::Handle(r.value)) {
+            Ok(s) if s.va != 0 => s,
+            _ => return false,
+        };
         st.handle = r.value;
         st.head = stat.va as *mut FreeBlock;
         (*st.head).size = HEAP_SIZE as usize - HEADER;

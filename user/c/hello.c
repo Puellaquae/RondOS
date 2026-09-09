@@ -7,6 +7,9 @@ static void puts_raw(const char *s, size_t n)
     rondos_log(s, n);
 }
 
+/* Length of a string literal without its NUL: hand-written numbers drifted. */
+#define LIT(s) puts_raw((s), sizeof(s) - 1)
+
 static size_t strlen_(const char *s)
 {
     size_t n = 0;
@@ -20,35 +23,35 @@ extern void free(void *);
 
 int main(const struct rondos_startup_block *block)
 {
-    puts_raw("chello: hello from C on RondOS\n", 31);
+    LIT("chello: hello from C on RondOS\n");
 
     struct rondos_handle root = rondos_root_dir(block);
     if (root.raw == ~0ull) {
-        puts_raw("chello: no root capability\n", 27);
+        LIT("chello: no root capability\n");
         return 1;
     }
 
     const char *path = "/bin/hello.c";
     struct rondos_handle f = rondos_open(root, path, strlen_(path));
     if (f.raw == ~0ull) {
-        puts_raw("chello: cannot open /bin/hello.c\n", 32);
+        LIT("chello: cannot open /bin/hello.c\n");
         return 2;
     }
     char buf[64];
     int n = rondos_read(f, buf, sizeof buf);
     rondos_close(f);
     if (n <= 0) {
-        puts_raw("chello: read failed\n", 20);
+        LIT("chello: read failed\n");
         return 3;
     }
-    puts_raw("chello: read back its own source: ", 33);
+    LIT("chello: read back its own source: ");
     puts_raw(buf, (size_t)(n < 32 ? n : 32));
-    puts_raw("\n", 1);
+    LIT("\n");
 
     /* The heap: allocate, use, free, and allocate again from the freed space. */
     char *heap = malloc(1024);
     if (!heap) {
-        puts_raw("chello: malloc failed\n", 22);
+        LIT("chello: malloc failed\n");
         return 4;
     }
     for (int i = 0; i < 1024; i++)
@@ -56,10 +59,10 @@ int main(const struct rondos_startup_block *block)
     free(heap);
     char *again = malloc(1024);
     if (again != heap) {
-        puts_raw("chello: malloc did not reuse the freed block\n", 44);
+        LIT("chello: malloc did not reuse the freed block\n");
         return 5;
     }
     free(again);
-    puts_raw("chello: malloc/free ok\n", 22);
+    LIT("chello: malloc/free ok\n");
     return 0;
 }

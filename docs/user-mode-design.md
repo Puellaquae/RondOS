@@ -333,15 +333,17 @@ rondos_abi::manifest! {
 内核在新进程栈顶写入，`rdi` 指向它：
 
 ```rust
-#[repr(C)]
+#[repr(C)]                        // 136 字节，`rondos-abi` 里有编译期断言
 pub struct StartupBlock {
-    pub hdr: StructHeader,
-    pub abi_version: u32, pub feature_bits: u64,
+    pub hdr: StructHeader,        // { size, version } = 8
+    pub abi_version: u32, pub _pad0: u32,
+    pub feature_bits: u64,
     pub entry: u64, pub image_base: u64,
-    pub argv: Slice<StrRef>, pub envp: Slice<StrRef>,
-    pub caps: Slice<CapDesc>,        // 实际授予的 handle（可能少于申请）
-    pub window: Option<Handle>,      // Gui 程序：display-server 预创建的窗口
+    pub argv: Slice, pub envp: Slice,   // Slice<StrRef>；v1 为空
+    pub caps: Slice,              // Slice<CapDesc>，实际授予的 handle
+    pub window: Handle,           // 预留；v1 = Handle::INVALID
     pub random_seed: u64,
+    pub _reserved: [u64; 4],
 }
 ```
 
@@ -454,30 +456,31 @@ pub struct Handle(pub u64);       // index: u32 | generation: u32（编码冻结
 | `0x00` | `sys_info` | `(&mut Info) -> ()`：ABI 版本、feature 位、`BootInfo`（fb/输入设备） |
 | `0x10` | `sys_exit` | `(status: u32) -> !` |
 | `0x11` | `sys_thread_exit` | `(status: u32) -> !` |
-| `0x12` | `sys_thread_spawn` | `(entry, stack_top, arg) -> Handle` |
+| `0x12` | `sys_thread_spawn` | `(entry, stack_top, arg) -> Handle`：**v1 未实现**（返回 `Unsupported`） |
 | `0x13` | `sys_yield` | `() -> ()` |
 | `0x14` | `sys_sleep_ns` | `(ns: u64) -> ()` |
 | `0x15` | `sys_clock_gettime` | `(kind: Clock) -> u64 ns` |
 | `0x16` | `sys_log` | `(level, buf, len) -> n`：写串口 + 帧缓冲控制台 |
 | `0x20` | `sys_spawn` | `(image: Handle<File>, argv, envp, caps[], flags) -> Handle<Process>` |
-| `0x21` | `sys_wait` | `(handles[], n, timeout_ns) -> (index, reason)`：**水平触发**就绪等待 |
-| `0x22` | `sys_proc_status` | `(Handle<Process>) -> ExitStatus` |
+| `0x21` | `sys_wait` | `(handles: Slice<Handle>, timeout_ns) -> index \| (reason << 32)`：**水平触发**就绪等待 |
+| `0x22` | `sys_proc_status` | `(Handle<Process>, &mut ExitStatus) -> ()` |
 | `0x23` | `sys_kill` | `(Handle<Process>) -> ()`：置取消位，阻塞中的等待返回 `Cancelled` |
 | `0x30` | `sys_mem_map` | `(len, flags) -> Handle<Memory>` |
 | `0x31` | `sys_mem_unmap` | `(Handle<Memory>) -> ()` |
 | `0x32` | `sys_mem_share` | `(Handle<Memory>, rights) -> Handle<Memory>` |
 | `0x33` | `sys_mem_map_phys` | `(pa, len, cache) -> Handle<Memory>`：**需要 `Cap::DEVICE_MAP`** |
-| `0x40` | `sys_chan_create` | `() -> [Handle<Chan>, Handle<Chan>]` |
+| `0x40` | `sys_chan_create` | `(&mut [Handle; 2]) -> ()`：两个**方向相反**的端 |
 | `0x41` | `sys_chan_send` | `(Handle<Chan>, buf, len, handles[], n) -> n` |
 | `0x42` | `sys_chan_recv` | `(Handle<Chan>, buf, len, out_handles[], n) -> (n, nhandles)` |
-| `0x43` | `sys_chan_close` | `(Handle<Chan>) -> ()` |
+| `0x43` | `sys_chan_close` | `(Handle<Chan>) -> ()`：**v1 未实现**，用 `sys_close` |
 | `0x50` | `sys_open` | `(Handle<Dir>, path, flags) -> Handle<File>` |
 | `0x51` | `sys_read` | `(Handle, buf, len) -> n` |
 | `0x52` | `sys_write` | `(Handle, buf, len) -> n` |
 | `0x53` | `sys_seek` | `(Handle<File>, off: i64, whence) -> u64` |
 | `0x54` | `sys_stat` | `(Handle, &mut Stat) -> ()` |
-| `0x55` | `sys_readdir` | `(Handle<Dir>, index) -> Option<DirEntry>` |
-| `0x56` | `sys_close` | `(Handle) -> ()` |
+| `0x55` | `sys_readdir` | `(Handle<Dir>, index, &mut DirEntry) -> ()`；`NotFound` = 目录结束 |
+| `0x56` | `sys_close` | `(Handle) -> ()`（对 Memory 句柄会先解除映射） |
+| `0x57` | `sys_unlink` | `(Handle<Dir>, path, len) -> ()`：**v1 冻结后追加**，只删 tmpfs 文件 |
 
 图形只占 **2 个** syscall（`sys_info` 取 fb 描述、`sys_mem_map_phys` 映射 LFB），
 其余（窗口、合成、主题、控件、事件）全在用户态。这是「内核小」的直接体现。
@@ -928,7 +931,7 @@ M1~M3 不依赖它，GUI 也不会因为缺它而不可用。
 | **M0 迁移** | x86-64 + UEFI 单路径、4 级分页 + NX、64 位 trap/GDT/TSS、SSE 使能 + 每线程 FXSAVE、UEFI stub + `BootInfo`、帧缓冲控制台；删除 NASM loader | QEMU+OVMF 与**一台真机**都能启动并打印自检；现有调度/内存自检全过 |
 | **P0 内核地基 ✅** | `proc/`（`Process`/VMA/`HandleTable`/`ExitStatus`）、每线程地址空间随调度切换、`rondos-abi` 共享 crate、`int 0x80` v1 分发（`sys_info`/`sys_exit`/`sys_thread_exit`/`sys_yield`/`sys_clock_gettime`/`sys_log`）、`kill_current` + `request_resched` | ✅ 内核构造用户进程，ring3 跑完 `sys_info`→`sys_log`→`sys_exit(0)`；另一个进程非法写只杀自己；帧全部回收（`make test` 16/16） |
 | **P1 装载与进程 API ✅** | `user/` 工作区、`targets/x86_64-rondos.json`、`user.ld`、`rondos-rt`、ELF64 装载器、tarfs（boot.tar）、`StartupBlock` + capability、`sys_open/read/write/close/spawn/wait/proc_status/kill/sleep_ns`、`init` 派生并回收子进程 | ✅ `init` 从 tar 打开 `bin/crash` 并 spawn → `sys_wait` 拿到 `FAULT{14,0xdeadbeef}`；再 spawn `bin/spin` → `sleep` → `sys_kill` → wait 拿到 `KILLED`；全部回收，`make test` 17/17 |
-| **P2a 内存与 IPC ✅** | `sys_mem_map/unmap/share/map_phys`（引用计数的 `MemObj`）、`chan_create/send/recv`（有界消息队列）、`sys_stat`、`sys_spawn` 的 capability 委托 | ✅ `init` 映射共享内存并回读、创建 channel 并把一端委托给 `bin/echo`，`echo` 收到后原样送回；全部回收，`make test` 17/17 |
+| **P2a 内存与 IPC ✅** | `sys_mem_map/unmap/share/map_phys`（引用计数的 `MemObj`）、`chan_create/send/recv`（**双向**有界消息队列）、`sys_stat`、`sys_spawn` 的 capability 委托 | ✅ `init` 映射共享内存并回读、创建 channel 并把一端委托给 `bin/echo`，`echo` 加前缀回送（证明是子进程处理的），`make test` 21/21 |
 | **P2b C 支持 ✅** | `user/c/`：`crt0.S`（对齐栈 → `main` → `sys_exit`）、手写 `rondos.h`（`int $0x80` 包装 + `_Static_assert` 布局检查）、`hello.c`；Makefile 用宿主 gcc `-ffreestanding -nostdlib -no-pie` 直接链出用户态 ELF | ✅ `chello` 在 ring3 打印、打开 `/bin/hello.c` 读回自己的源码、exit 0；`make test` grep 到 |
 | **P2c 文件系统 ✅** | tmpfs 可写层（`open_flags::CREATE`、`sys_write` 落在 tmpfs 文件上）、`sys_readdir`（tar 条目在前、tmpfs 在后）、`DirEntry` | ✅ `init` 建 `/tmp/note.txt` 写入 13 字节、重新打开读回、`readdir` 数到 7 个条目 |
 | **P2d 收尾 ✅** | channel 传递 handle（`ObjDesc` 随消息走，接收方拿到新句柄、Memory 自动重映射）、`sys_seek`、`sys_unlink`（新号 `0x57`，追加而非改 v1）、用户堆（`rondos-rt::heap` 的 `#[global_allocator]` + C 的 `malloc/free`） | ✅ `init` 把 memory handle 过 channel 后在新地址读到同样的内容；`seek` 从 offset 4 读到 `456789`；`unlink` 后打不开；`bin/heap` 的 2000 元素 `Vec` 与 64 次 256B 分配/释放全过；`chello` 的 `malloc/free` 复用同一块 |

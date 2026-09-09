@@ -102,15 +102,23 @@ run: esp
 	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -serial stdio
 
 test: esp
+	@command -v $(CC) >/dev/null || (echo "==> missing C compiler: $(CC)"; exit 1)
+	@command -v python3 >/dev/null || (echo "==> missing python3 (tools/mktar.py)"; exit 1)
 	@rm -f $(SERIAL_LOG)
-	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 30 $(QEMU) $(QEMU_FLAGS) \
+	@# The kernel halts on purpose, so QEMU is always killed by the timeout;
+	@# correctness is judged from the log below, not from the exit status.
+	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 40 $(QEMU) $(QEMU_FLAGS) \
 	  -serial file:$(SERIAL_LOG) >/dev/null 2>&1 || true
 	@grep -v '^\[2J' $(SERIAL_LOG)
+	@! grep -qE "PANIC:|kernel #PF|kernel #GP|DOUBLE FAULT|\[FAIL\]" $(SERIAL_LOG) \
+	  || (echo "==> kernel fault / failed report in the log"; exit 1)
+	@grep -qE "smoke: ALL PASS \([0-9]+/[0-9]+\)" $(SERIAL_LOG) \
+	  || (echo "==> smoke tests FAIL"; exit 1)
+	@total=$$(grep -oE "smoke: ALL PASS \(([0-9]+)/" $(SERIAL_LOG) | grep -oE "[0-9]+" | head -1); \
+	  if [ "$$total" -lt 21 ]; then echo "==> only $$total smoke reports ran"; exit 1; fi
 	@grep -q "bootinfo: adopted UEFI structure" $(SERIAL_LOG) \
 	  || (echo "==> booted, but not through the UEFI stub"; exit 1)
-	@grep -q "smoke: ALL PASS" $(SERIAL_LOG) \
-	  && echo "==> smoke tests PASS (UEFI)" \
-	  || (echo "==> smoke tests FAIL"; exit 1)
+	@echo "==> smoke tests PASS (UEFI)"
 	@grep -q "user: init: hello from ring 3" $(SERIAL_LOG) \
 	  && echo "==> init reached ring 3" \
 	  || (echo "==> init did not run"; exit 1)
@@ -126,6 +134,10 @@ test: esp
 	@grep -q "user: init: tmpfs file round-trips" $(SERIAL_LOG) \
 	  && echo "==> tmpfs round-trip + readdir" \
 	  || (echo "==> tmpfs failed"; exit 1)
+	@grep -q "user: init: device capability enforced" $(SERIAL_LOG) \
+	  && grep -q "user: physcheck: mem_map_phys denied" $(SERIAL_LOG) \
+	  && echo "==> device capability enforced" \
+	  || (echo "==> device capability check failed"; exit 1)
 	@grep -q "user: init: handle passing ok" $(SERIAL_LOG) \
 	  && grep -q "user: init: unlink ok" $(SERIAL_LOG) \
 	  && echo "==> handle passing over a channel + seek/unlink" \

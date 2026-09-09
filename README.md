@@ -49,7 +49,7 @@
 
 ```bash
 # Debian/Ubuntu
-sudo apt install qemu-system-x86 ovmf make
+sudo apt install qemu-system-x86 ovmf make gcc binutils python3
 
 # Rust nightly + rust-src（no_std 内核 + build-std 需要）
 rustup install nightly
@@ -101,8 +101,10 @@ channel IPC（`chan_create/send/recv`）、`sys_spawn` 的 capability 委托、
 | P2c | tmpfs 可写层（`O_CREATE`/`sys_write`）+ `sys_readdir` | ✅ |
 | P2d | channel 传递 handle、`sys_seek`/`sys_unlink`、用户堆（Rust `alloc` + C `malloc`） | ✅ |
 
-`make test` 用 OVMF 走真实 UEFI 固件启动，输出 `smoke: ALL PASS (17/17)`（另有 4 条
-串口断言：init 进 ring3、派生/回收子进程、channel 往返、C 程序跑通）：
+`make test` 用 OVMF 走真实 UEFI 固件启动，要求日志里出现 `smoke: ALL PASS (N/N)`
+（N ≥ 21）且没有 `PANIC:`/`[FAIL]`/内核异常，再逐条断言：init 进 ring3、派生/回收
+子进程、channel 往返（子进程加前缀回送）、C 程序、tmpfs、handle 传递、用户堆、
+device capability 拒绝。
 分页/physmap/大页拆分/地址空间隔离/W^X/设备映射、ring3 系统调用往返、
 用户态缺页隔离、抢占、睡眠唤醒、线程退出，以及 P0 的进程生命周期
 （handle 表、用户进程跑完 `sys_info`/`sys_clock_gettime`/`sys_yield`/`sys_log`/`sys_exit`、

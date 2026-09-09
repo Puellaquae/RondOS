@@ -24,15 +24,15 @@ static int heap_init(void)
 {
     if (free_list)
         return 1;
-    struct rondos_result r = rondos_syscall6(0x30 /* sys_mem_map */, HEAP_SIZE,
+    struct rondos_result r = rondos_syscall6(RONDOS_SYS_MEM_MAP, HEAP_SIZE,
                                             1 | 2 /* READ|WRITE */, 0, 0, 0, 0);
     if (r.status != RONDOS_OK)
         return 0;
     heap_handle.raw = r.value;
     /* sys_stat gives us the mapping address. */
-    struct { uint32_t hdr_size, hdr_version, kind, pad0;
-             uint64_t len_bytes, va, rights, res0, res1; } st = {0};
-    r = rondos_syscall6(0x54 /* sys_stat */, heap_handle.raw, (uint64_t)&st, 0, 0, 0, 0);
+    struct rondos_stat st = {0};
+    st.hdr_size = sizeof st;
+    r = rondos_syscall6(RONDOS_SYS_STAT, heap_handle.raw, (uint64_t)&st, 0, 0, 0, 0);
     if (r.status != RONDOS_OK || st.va == 0)
         return 0;
     heap_base = (char *)st.va;

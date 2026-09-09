@@ -40,6 +40,21 @@ fn as_bytes_mut<T>(v: &mut T) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(v as *mut T as *mut u8, size_of::<T>()) }
 }
 
+/// How many bytes of an ABI struct we may write to `ptr`.
+///
+/// The v1 rule is "the reader consumes `min(size, its own)`": the caller
+/// declares `hdr.size`, and the kernel must neither write more nor trust a
+/// smaller size to mean "old caller".  A size below the header is invalid.
+fn user_struct_len(p: &proc::Process, ptr: u64, own: usize) -> Result<usize, Status> {
+    let mut hdr = [0u8; size_of::<StructHeader>()];
+    p.copy_from_user(&mut hdr, ptr)?;
+    let size = u32::from_ne_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    if size < size_of::<StructHeader>() {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(size.min(own))
+}
+
 static LOGGED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Bytes accepted by `sys_log` so far (smoke-test observable).
@@ -130,9 +145,11 @@ fn sys_info(f: &mut TrapFrame) {
     let boot = crate::bootinfo::get();
     let mut info = Info::default();
     let full = size_of::<Info>();
+    // The kernel is the writer: it stamps its own layout version and only
+    // truncates to the caller's declared size.
     info.hdr = StructHeader {
         size: (user_hdr.size as usize).min(full) as u32,
-        version: user_hdr.version,
+        version: rondos_abi::STRUCT_VERSION,
     };
     info.abi_version = ABI_VERSION;
     info.fb_present = boot.fb_present;
@@ -599,10 +616,12 @@ fn sys_proc_status(f: &mut TrapFrame) {
         },
         Err(s) => return err(f, s),
     };
-    let out = exec::exit_status(pid);
-    let bytes = unsafe {
-        core::slice::from_raw_parts(&out as *const _ as *const u8, size_of_val(&out))
+    let want = match user_struct_len(p, out_ptr, size_of::<rondos_abi::ExitStatus>()) {
+        Ok(n) => n,
+        Err(s) => return err(f, s),
     };
+    let out = exec::exit_status(pid);
+    let bytes = unsafe { core::slice::from_raw_parts(&out as *const _ as *const u8, want) };
     match p.copy_to_user(out_ptr, bytes) {
         Ok(()) => ok(f, bytes.len() as u64),
         Err(s) => err(f, s),
@@ -1090,6 +1109,10 @@ fn sys_stat(f: &mut TrapFrame) {
     let Some(p) = proc::current() else {
         return err(f, Status::BadAddress);
     };
+    let want = match user_struct_len(p, out_ptr, size_of::<Stat>()) {
+        Ok(n) => n,
+        Err(s) => return err(f, s),
+    };
     let mut out = Stat {
         hdr: StructHeader::new(size_of::<Stat>() as u32),
         ..Default::default()
@@ -1110,9 +1133,7 @@ fn sys_stat(f: &mut TrapFrame) {
         }
         Err(s) => return err(f, s),
     }
-    let bytes = unsafe {
-        core::slice::from_raw_parts(&out as *const Stat as *const u8, size_of::<Stat>())
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(&out as *const Stat as *const u8, want) };
     match p.copy_to_user(out_ptr, bytes) {
         Ok(()) => ok(f, bytes.len() as u64),
         Err(s) => err(f, s),
@@ -1136,6 +1157,10 @@ fn sys_readdir(f: &mut TrapFrame) {
         Err(s) => return err(f, s),
     }
 
+    let want = match user_struct_len(p, out_ptr, size_of::<DirEntry>()) {
+        Ok(n) => n,
+        Err(s) => return err(f, s),
+    };
     let mut out = DirEntry {
         hdr: StructHeader::new(size_of::<DirEntry>() as u32),
         ..Default::default()
@@ -1166,9 +1191,8 @@ fn sys_readdir(f: &mut TrapFrame) {
     if !found {
         return err(f, Status::NotFound);
     }
-    let bytes = unsafe {
-        core::slice::from_raw_parts(&out as *const DirEntry as *const u8, size_of::<DirEntry>())
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(&out as *const DirEntry as *const u8, want) };
     match p.copy_to_user(out_ptr, bytes) {
         Ok(()) => ok(f, bytes.len() as u64),
         Err(s) => err(f, s),

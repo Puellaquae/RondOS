@@ -55,21 +55,51 @@ enum rondos_status {
 /* Frozen syscall ids (user/lib/rondos-abi). */
 #define RONDOS_SYS_INFO            0x00
 #define RONDOS_SYS_EXIT            0x10
+#define RONDOS_SYS_THREAD_EXIT     0x11
+#define RONDOS_SYS_THREAD_SPAWN    0x12
 #define RONDOS_SYS_YIELD           0x13
 #define RONDOS_SYS_SLEEP_NS        0x14
 #define RONDOS_SYS_CLOCK_GETTIME   0x15
 #define RONDOS_SYS_LOG             0x16
 #define RONDOS_SYS_SPAWN           0x20
 #define RONDOS_SYS_WAIT            0x21
+#define RONDOS_SYS_PROC_STATUS     0x22
+#define RONDOS_SYS_KILL            0x23
+#define RONDOS_SYS_MEM_MAP         0x30
+#define RONDOS_SYS_MEM_UNMAP       0x31
+#define RONDOS_SYS_MEM_SHARE       0x32
+#define RONDOS_SYS_MEM_MAP_PHYS    0x33
+#define RONDOS_SYS_CHAN_CREATE     0x40
+#define RONDOS_SYS_CHAN_SEND       0x41
+#define RONDOS_SYS_CHAN_RECV       0x42
+#define RONDOS_SYS_CHAN_CLOSE      0x43
 #define RONDOS_SYS_OPEN            0x50
 #define RONDOS_SYS_READ            0x51
 #define RONDOS_SYS_WRITE           0x52
+#define RONDOS_SYS_SEEK            0x53
+#define RONDOS_SYS_STAT            0x54
+#define RONDOS_SYS_READDIR         0x55
 #define RONDOS_SYS_CLOSE           0x56
+#define RONDOS_SYS_UNLINK          0x57
 
 struct rondos_handle { uint64_t raw; };
 struct rondos_strref { const char *ptr; uint64_t len; };
 struct rondos_slice  { const void *ptr; uint64_t count; };
 struct rondos_capdesc { uint32_t kind; uint32_t _pad; uint64_t rights; uint64_t handle; };
+
+/* `sys_stat` output — mirrors rondos_abi::Stat field for field. */
+struct rondos_stat {
+    uint32_t hdr_size, hdr_version;
+    uint32_t kind, _pad0;
+    uint64_t len_bytes;
+    uint64_t va;
+    uint64_t rights;
+    uint64_t _reserved[2];
+};
+
+_Static_assert(sizeof(struct rondos_result) == 16, "rondos_result layout");
+_Static_assert(sizeof(struct rondos_stat) == 56, "rondos_stat layout");
+_Static_assert(offsetof(struct rondos_stat, va) == 24, "rondos_stat.va offset");
 
 struct rondos_startup_block {
     uint32_t hdr_size;
