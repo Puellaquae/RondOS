@@ -52,6 +52,19 @@ pub fn exit(status: u32) -> ! {
     abi::exit(status)
 }
 
+/// Ask the kernel to power the machine off (ACPI S5).
+///
+/// Only returns when the kernel could not shut down; use [`exit`] to leave a
+/// process instead.
+pub fn shutdown() -> Result<(), Status> {
+    let r = abi::shutdown();
+    if r.status.is_ok() {
+        Ok(())
+    } else {
+        Err(r.status)
+    }
+}
+
 /// Write raw bytes to the kernel log (`sys_log`).
 pub fn print_bytes(bytes: &[u8]) {
     let _ = log(LogLevel::Info, bytes);

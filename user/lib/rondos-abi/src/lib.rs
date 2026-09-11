@@ -66,6 +66,9 @@ pub enum SyscallId {
     SleepNs = 0x14,
     ClockGettime = 0x15,
     Log = 0x16,
+    /// Appended after the v1 freeze: ACPI S5 power-off.  On success the kernel
+    /// never returns; the call only comes back with `Status::Unsupported`.
+    Shutdown = 0x17,
 
     // --- 0x20 process lifecycle (P1)
     Spawn = 0x20,
@@ -110,6 +113,7 @@ impl SyscallId {
             0x14 => SyscallId::SleepNs,
             0x15 => SyscallId::ClockGettime,
             0x16 => SyscallId::Log,
+            0x17 => SyscallId::Shutdown,
             0x20 => SyscallId::Spawn,
             0x21 => SyscallId::Wait,
             0x22 => SyscallId::ProcStatus,
@@ -670,6 +674,14 @@ pub fn exit(status: u32) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// `0x17 sys_shutdown()` — ask the kernel to power the machine off (ACPI S5).
+/// Only returns when the kernel could not shut down; use [`exit`] to leave a
+/// process instead.
+#[cfg(feature = "user")]
+pub fn shutdown() -> SyscallResult {
+    unsafe { syscall(SyscallId::Shutdown, 0, 0, 0, 0, 0, 0) }
 }
 
 #[cfg(feature = "user")]

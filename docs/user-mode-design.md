@@ -461,6 +461,7 @@ pub struct Handle(pub u64);       // index: u32 | generation: u32（编码冻结
 | `0x14` | `sys_sleep_ns` | `(ns: u64) -> ()` |
 | `0x15` | `sys_clock_gettime` | `(kind: Clock) -> u64 ns` |
 | `0x16` | `sys_log` | `(level, buf, len) -> n`：写串口 + 帧缓冲控制台 |
+| `0x17` | `sys_shutdown` | `() -> ()`：ACPI S5 关机（FADT `PM1a_CNT` + DSDT `_S5_`）；成功就不再返回 |
 | `0x20` | `sys_spawn` | `(image: Handle<File>, argv, envp, caps[], flags) -> Handle<Process>` |
 | `0x21` | `sys_wait` | `(handles: Slice<Handle>, timeout_ns) -> index \| (reason << 32)`：**水平触发**就绪等待 |
 | `0x22` | `sys_proc_status` | `(Handle<Process>, &mut ExitStatus) -> ()` |
@@ -640,7 +641,7 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 | `user/lib/rondos-abi/`（新 ✅ P0） | 内核+用户共享的 ABI 定义（唯一真相源）：`SyscallId`/`Status`/`Handle`/`Rights`/`Info` + 布局断言 |
 | `tests/`（新 ✅） | 内核态测试程序：`tests/mod.rs` 是 harness（`Case { name, run }` + `Verdict` + `report`），`mm.rs`/`elf.rs`/`ring3.rs`/`sched.rs`/`user.rs` 各是一组程序；`main.rs` 只剩引导与 trap 入口。**只在 `kernel-tests` feature 下编译**，`make test` 打开、`make run` 关闭 |
 | `boot.rs`（新 ✅） | `self_check()`（physmap/内核窗口/分配器往返，失败即 panic）、`bring_up_scheduler()`、`normal_boot()`（拉起 `/bin/init` 后 idle） |
-| `syscall.rs`（新 ✅ P0/P1/P2a） | `int 0x80` 分发；已实现 `0x00/0x10/0x11/0x13/0x14/0x15/0x16`、`0x20/0x21/0x22/0x23`、`0x30/0x31/0x32/0x33`、`0x40/0x41/0x42`、`0x50/0x51/0x52/0x54/0x56`，其余返回 `Status::Unsupported` |
+| `syscall.rs`（新 ✅ P0/P1/P2a） | `int 0x80` 分发；已实现 `0x00/0x10/0x11/0x13/0x14/0x15/0x16/0x17`、`0x20/0x21/0x22/0x23`、`0x30/0x31/0x32/0x33`、`0x40/0x41/0x42`、`0x50/0x51/0x52/0x54/0x56`，其余返回 `Status::Unsupported` |
 | `bootinfo.rs`（新） | `BootInfo` 版本化结构与校验 |
 | `boot/uefi/`（新） | `x86_64-unknown-uefi` stub，用 **`uefi-rs`**（已定：依赖不多、体积可控，省掉手写协议表） |
 
@@ -686,10 +687,10 @@ QEMU 的 multiboot 只收 32 位镜像，而内核是 64 位高半区 ELF，这�
 
 | 步骤 | 说明 |
 | --- | --- |
-| 1 | `OpenProtocol<GraphicsOutput>` → `QueryMode` 挑最接近 640×480 且 32bpp 的模式 → `SetMode` |
+| 1 | `OpenProtocol<GraphicsOutput>` → 列出 32bpp 模式，默认取最接近 1280×720 的（10 s 超时菜单）→ `SetMode` |
 | 2 | `OpenProtocol<SimpleFileSystem>` → 读 `\rondos\kernel.elf` 与 `\rondos\boot.tar` |
 | 3 | `GetMemoryMap` → 拷出内存描述符 |
-| 4 | 从 UEFI 配置表取 ACPI RSDP |
+| 4 | 从 UEFI 配置表取 ACPI RSDP（优先 ACPI 2.0+，回退 1.0）✅ |
 | 5 | 填 `BootInfo`（静态 `.bss` 里，天然在 stub 的恒等映射内）：fb / 内存图 / initrd / RSDP / cmdline |
 | 6 | `ExitBootServices` |
 | 7 | 建临时 4 级页表：恒等映射 0..4 GiB（保住 stub 自己）+ physmap（1 GiB 页，NX）+ 内核窗口（2 MiB 页）；`EFER.NXE=1`；载入 CR3 |

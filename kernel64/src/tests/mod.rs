@@ -24,6 +24,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod acpi;
 pub mod console;
 pub mod elf;
 pub mod mm;
@@ -79,6 +80,7 @@ pub fn run_cases(cases: &[Case]) {
 
 /// Programs that must run before interrupts are enabled.
 pub fn run_early() {
+    run_cases(acpi::CASES);
     run_cases(mm::CASES);
     run_cases(elf::CASES);
     run_cases(console::CASES);

@@ -130,7 +130,7 @@ fn builtin(t: &Term, root: Handle, cmd: &[u8], arg: &[u8]) -> bool {
     match cmd {
         b"" => {}
         b"help" => {
-            t.puts("commands: help echo ls cat run clear uptime exit\n");
+            t.puts("commands: help echo ls cat run clear uptime exit/shutdown\n");
         }
         b"echo" => {
             t.put_bytes(arg);
@@ -188,9 +188,14 @@ fn builtin(t: &Term, root: Handle, cmd: &[u8], arg: &[u8]) -> bool {
         b"uptime" => {
             t.line(format_args!("shell: {} ms since boot", rondos_rt::now_ns() / 1_000_000));
         }
-        b"exit" => {
-            t.puts("shell: bye\n");
-            return false;
+        b"exit" | b"shutdown" | b"poweroff" => {
+            // `exit` powers the machine off (ACPI S5) rather than just leaving
+            // the shell; PID 1 would restart it anyway.  The call only returns
+            // when the kernel has no working shutdown path.
+            t.puts("shell: shutting down...\n");
+            if let Err(e) = rondos_rt::shutdown() {
+                t.line(format_args!("shell: shutdown unavailable: {:?}", e));
+            }
         }
         other => {
             t.line(format_args!(

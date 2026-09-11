@@ -74,7 +74,7 @@ pub const PROGRESS_VERSION: u32 = 1;
 /// Must match the loader's `BUILD_ID` (the two are built together).  This exact
 /// string also lands in `.rodata`, where the loader looks for it to prove that
 /// the `kernel.elf` it just loaded is the one it was built with.
-pub const BUILD_TAG: &str = "fix-2026-09-11g";
+pub const BUILD_TAG: &str = "fix-2026-09-11h";
 pub const BUILD_ID: u32 = 0x4449_3043; // "DI0C"
 
 #[repr(C)]

@@ -114,6 +114,7 @@ pub fn dispatch(f: &mut TrapFrame) {
         SyscallId::Readdir => sys_readdir(f),
         SyscallId::Seek => sys_seek(f),
         SyscallId::Unlink => sys_unlink(f),
+        SyscallId::Shutdown => sys_shutdown(f),
         // Everything else is declared in the frozen v1 table but lands in P1+.
         _ => f.set_result(Status::Unsupported as u64, 0),
     }
@@ -235,6 +236,24 @@ fn sys_exit(f: &mut TrapFrame) {
     let status = f.rdi as u32;
     proc::exit_current(ExitStatus::Exited(status));
     // The frame is dead; the scheduler is about to replace it.
+}
+
+/// `0x17 sys_shutdown()` — power the machine off (ACPI S5).
+///
+/// ACPI only in the sense the design allows (`docs/user-mode-design.md` §15):
+/// FADT `PM1a_CNT` plus the DSDT `_S5_` values, with the usual emulator ports
+/// as a fallback.  v1 has no power capability yet, so any process may ask; a
+/// real capability is the natural follow-up.  On success the machine is going
+/// away and this never returns to the caller.
+fn sys_shutdown(f: &mut TrapFrame) {
+    crate::serial_println!("shutdown: requested by pid {:?}", thread::current_pid());
+    if crate::acpi::power_off() {
+        // The firmware was told to cut power; keep the CPU halted rather than
+        // resuming a shell that asked to shut down.
+        crate::arch::x86_64::halt_loop();
+    }
+    // No ACPI `_S5_`: the emulator ports were poked, but do not promise success.
+    err(f, Status::Unsupported);
 }
 
 /// `0x11 sys_thread_exit(status) -> !` — P0: one thread per process.

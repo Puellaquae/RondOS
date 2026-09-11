@@ -158,7 +158,7 @@ const BOOT_KIND_UEFI: u32 = 2;
 /// The *kernel* embeds the same string (`kernel64/src/boot.rs::BUILD_TAG`) and
 /// the loader greps the loaded image for it, so a mismatched or truncated
 /// `kernel.elf` is caught before it can be blamed for a hang.
-const BUILD_ID: &str = "fix-2026-09-11g";
+const BUILD_ID: &str = "fix-2026-09-11h";
 
 const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
@@ -462,6 +462,14 @@ fn main() -> Status {
         bi.initrd_phys = pa;
         bi.initrd_len = len;
         log!("  initrd: {} bytes @ 0x{:08x}", len, pa);
+    }
+    // The ACPI RSDP, so the kernel can find the FADT and power the machine off
+    // (design §8.2 step 4).  Prefer the ACPI 2.0+ entry: it carries the XSDT.
+    bi.acpi_rsdp = find_acpi_rsdp();
+    if bi.acpi_rsdp != 0 {
+        log!("  acpi: RSDP @ 0x{:08x}", bi.acpi_rsdp);
+    } else {
+        log!("  acpi: no RSDP in the UEFI configuration table");
     }
     bi.set_cmdline(b"rondos.uefi=1");
 
@@ -778,6 +786,32 @@ fn choose_mode(count: usize, default_idx: usize) -> usize {
         }
     });
     picked.unwrap_or(default_idx)
+}
+
+/// Physical address of the ACPI RSDP, from the UEFI configuration table.
+///
+/// The ACPI 2.0+ entry is preferred (it points at an XSDT with 64-bit table
+/// addresses); the 1.0 entry is only a fallback for ancient firmware.  Returns
+/// 0 when the firmware publishes neither.
+fn find_acpi_rsdp() -> u64 {
+    use uefi::table::cfg::ConfigTableEntry;
+
+    let mut acpi1 = 0u64;
+    let mut acpi2 = 0u64;
+    uefi::system::with_config_table(|entries| {
+        for e in entries {
+            if e.guid == ConfigTableEntry::ACPI2_GUID {
+                acpi2 = e.address as u64;
+            } else if e.guid == ConfigTableEntry::ACPI_GUID {
+                acpi1 = e.address as u64;
+            }
+        }
+    });
+    if acpi2 != 0 {
+        acpi2
+    } else {
+        acpi1
+    }
 }
 
 /// Read a whole file from the ESP.  Returns `(physical address, length)`.

@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+mod acpi;
 mod arch;
 mod boot;
 mod bootinfo;
@@ -259,6 +260,11 @@ extern "C" fn kmain(boot: u64) -> ! {
     // kernel unusable, so fail loudly here in every boot mode.
     boot::stage(boot::STAGE_SELFCHECK);
     boot::self_check();
+
+    // The UEFI stub handed over the ACPI RSDP; parse just what `sys_shutdown`
+    // needs (RSDT/XSDT -> FADT -> DSDT `_S5_`).  Reading is best-effort: a
+    // machine without ACPI still boots, it just cannot power itself off.
+    acpi::init();
 
     // The test programs must not be preempted while they hold kernel tables,
     // so the mm/elf group runs with interrupts still off (only `sti` in

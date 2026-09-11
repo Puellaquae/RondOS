@@ -16,13 +16,14 @@
   - `src/thread/`       内核线程 + 用户线程、抢占式轮转调度、`sleep`/`exit`、`WaitQueue`；
     每个线程带自己的页表根，切换线程即切换地址空间
   - `src/proc/`         `Process`/VMA/`HandleTable`/`ExitStatus`、用户指针校验
-  - `src/syscall.rs`    `int 0x80` v1 分发（info/exit/yield/clock/log/sleep + 文件与进程组）
+  - `src/syscall.rs`    `int 0x80` v1 分发（info/exit/yield/clock/log/sleep/shutdown + 文件与进程组）
+  - `src/acpi.rs`       RSDP→RSDT/XSDT→FADT→DSDT `_S5_` 解析 + `sys_shutdown` 的 S5 关机
   - `src/fs.rs`         boot tar 只读文件系统（ustar）+ tmpfs 可写层（固定槽位，
     存储是 `.bss` 数组，不占页框）
   - `src/obj.rs`        共享内存对象 + channel（引用计数、全局表）
   - `src/exec.rs`       ELF64 装载、`StartupBlock` + capability、`spawn_path`/`spawn_entry`
   - `src/bootinfo.rs`   版本化引导交接结构（magic/size/version），内核唯一的引导契约
-  - `src/tests/`        内核态测试程序（harness + mm/elf/ring3/sched/user 五组），
+  - `src/tests/`        内核态测试程序（harness + mm/elf/acpi/ring3/sched/user 六组），
     `main.rs` 只保留引导流程与 trap 入口
 - `boot/uefi/`  UEFI 引导 stub，目标 `x86_64-unknown-uefi`，基于 `uefi-rs`
   - 列出 32bpp GOP 模式让用户选（`timeout` 菜单：10 s 无按键则用默认 1280x720）
@@ -109,7 +110,9 @@ sudo make usb USB_DEV=/dev/sdX
 
 `make run-gui` 里能直接看到 P3 的界面：内核把日志同时写到串口和帧缓冲控制台，
 `init`（PID 1）把 console/keyboard 能力委托给 `bin/shell`，于是可以敲 `help`、`ls`、
-`cat`、`run /bin/chello`、`clear`、`uptime`。无窗口环境用 `QEMU_DISPLAY=vnc=:0`。
+`cat`、`run /bin/chello`、`clear`、`uptime`；`exit`（别名 `shutdown`/`poweroff`）走
+`sys_shutdown`，由 ACPI S5（FADT `PM1a_CNT` + DSDT `_S5_`）真正关机。无窗口环境用
+`QEMU_DISPLAY=vnc=:0`。
 
 `make test` 会以 `--features kernel-tests` 重新编译内核（`kernel64/Cargo.toml`），
 把 `src/tests/` 里的内核态测试程序编进去；`make run` 用不带该 feature 的内核，
