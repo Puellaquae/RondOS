@@ -239,6 +239,42 @@ pub fn clear() {
     unsafe { draw_cursor(c) };
 }
 
+/// Give the console the whole screen once the boot-progress strip is hidden.
+///
+/// The console starts below the strip (`y0 = STRIP_HEIGHT`); the text already
+/// on screen is kept — it is redrawn from the shadow buffer at the new offset —
+/// so the boot log moves up instead of being erased.
+pub fn reclaim_full_screen() {
+    let c = con();
+    if !c.ready || c.y0 == 0 {
+        return;
+    }
+    let full = c.height + c.y0;
+    c.y0 = 0;
+    c.height = full;
+    c.rows = (full / FONT_HEIGHT as u32).min(MAX_ROWS as u32);
+    unsafe {
+        fill_rect(c, 0, 0, c.width, c.height, c.bg);
+        redraw(c);
+    }
+    crate::serial_println!("fb: console reclaimed the full screen ({} rows)", c.rows);
+}
+
+/// Repaint every cell from the shadow buffer at the current `y0`.
+unsafe fn redraw(c: &Console) {
+    let mut row = 0;
+    while row < c.rows {
+        let mut col = 0;
+        while col < c.cols {
+            let ch = c.text[row as usize][col as usize];
+            draw_cell(c, col, row, ch, c.fg, c.bg);
+            col += 1;
+        }
+        row += 1;
+    }
+    draw_cursor(c);
+}
+
 pub fn set_color(fg: u32, bg: u32) {
     let c = con();
     c.fg = fg;

@@ -549,6 +549,12 @@ pub fn normal_boot() -> ! {
         Err(e) => crate::serial_println!("boot: cannot start /bin/init: {:?}", e),
     }
     stage_done();
+    // Boot is no longer in question: drop the diagnostic progress strip and let
+    // the framebuffer console own the whole screen, so the shell (spawned by
+    // /bin/init) does not run under a row of coloured stage blocks.  A failed
+    // boot never reaches here, so the evidence survives exactly when it matters.
+    crate::bootscreen::hide();
+    crate::io::fb::reclaim_full_screen();
     loop {
         crate::arch::x86_64::hlt();
     }

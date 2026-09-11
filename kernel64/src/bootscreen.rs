@@ -76,6 +76,10 @@ struct Screen {
     /// Highest stage seen, for the big readout.
     last: u8,
     painted: bool,
+    /// Set once the system is up and [`hide`] has erased the strip: the display
+    /// is diagnostic evidence for a boot in question, not something the shell
+    /// should live under, so nothing may paint it again.
+    hidden: bool,
 }
 
 impl Screen {
@@ -91,6 +95,7 @@ impl Screen {
             mask: 0,
             last: 0,
             painted: false,
+            hidden: false,
         }
     }
 }
@@ -190,7 +195,7 @@ unsafe fn rect(s: &Screen, x: u32, y: u32, w: u32, h: u32, rgb: u32) {
 /// Redraw the whole strip from the current state.
 fn paint() {
     let s = scr();
-    if !s.ready {
+    if !s.ready || s.hidden {
         return;
     }
     unsafe {
@@ -246,7 +251,7 @@ unsafe fn draw_glyph(s: &Screen, x: u32, y: u32, d: u8, scale: u32, rgb: u32) {
 /// Record that stage `n` was reached and repaint.
 pub fn mark(n: u8) {
     let s = scr();
-    if n == 0 || n > 31 {
+    if s.hidden || n == 0 || n > 31 {
         return;
     }
     s.mask |= 1u32 << n;
@@ -273,6 +278,22 @@ pub fn repaint() {
     if scr().ready {
         paint();
     }
+}
+
+/// Erase the progress strip and stop painting it.
+///
+/// Called when the system is up and the shell is about to run: a screen of
+/// coloured stage blocks is evidence for a boot in question, not something the
+/// user should have to look at forever.  After this `mark`/`repaint` are
+/// no-ops, so a late `stage()` cannot draw the blocks back over the console.
+pub fn hide() {
+    let s = scr();
+    s.hidden = true;
+    if !s.ready {
+        return;
+    }
+    unsafe { rect(s, 0, 0, s.width, STRIP_HEIGHT, COLOR_BG) };
+    s.painted = false;
 }
 
 /// A distinct, always-painted marker used only around the scheduler bring-up,

@@ -164,6 +164,13 @@ loader 的横幅里也会打印可用内存：`RAM top: 0x01000000  (usable 15 M
 - 左上角两行共 16 个方块，对应阶段 1..16，亮绿色 = 已到达，黄色 = 最后一个；
 - 方块下面是最后阶段的两位十六进制大数字。
 
+系统真正起来之后（`normal_boot` 拉起 `/bin/init`、shell 即将运行时），内核会调用
+`bootscreen::hide()` 擦掉进度条，并让控制台拿回整屏（串口/日志里是
+`fb: console reclaimed the full screen (N rows)`）；已经打印的日志会从影子缓冲在新
+位置重绘，整体上移，不会被清掉。所以**只有启动失败或卡住时才会在屏幕上看到色块**，
+正常进 shell 之后是干净的整屏控制台。测试构建（`make test`）不走 `normal_boot`，
+进度条保留，方便看最后一个阶段。
+
 ## U 盘上的记录文件
 
 loader 每次启动都会在 ESP 上维护 `\rondos\bootlog.bin`：一条 40 字节的定长记录，
