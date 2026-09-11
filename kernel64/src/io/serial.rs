@@ -7,13 +7,15 @@ use crate::{
     utils::singleton::Singleton,
 };
 
-macro_rules! wait_for {
-    ($cond:expr) => {
-        while !$cond {
-            core::hint::spin_loop()
-        }
-    };
-}
+/// How many polls to wait for the UART before giving up.
+///
+/// The target machine has **no serial port**.  A floating bus returns all-ones
+/// for the line-status register, which reads as "transmitter empty", so the
+/// UART looks alive and then never drains — and the old unbounded `wait_for!`
+/// spun there forever.  The machine then looked like it "reset at stage 3"
+/// (the stage ends with a log line) when it had really just hung.  Every wait
+/// is now bounded, and a port that times out is switched off for good.
+const WAIT_LIMIT: u32 = 200_000;
 
 const RECEIVED: u8 = 1;
 const SENT: u8 = 1 << 1;
@@ -30,12 +32,17 @@ const OUTPUT_EMPTY: u8 = 1 << 5;
 // 6 and 7 unknown
 
 #[derive(Debug)]
-pub struct SerialPort(u16 /* base port */);
+pub struct SerialPort {
+    base: u16,
+    /// Set once a wait timed out: the port is absent or wedged, so stop using
+    /// it.  Logging keeps working on the framebuffer console.
+    dead: bool,
+}
 
 impl SerialPort {
     /// Base port.
     fn port_base(&self) -> u16 {
-        self.0
+        self.base
     }
 
     /// Data port.
@@ -86,7 +93,22 @@ impl SerialPort {
     /// really points to a serial port device and that the caller has the necessary rights
     /// to perform the I/O operation.
     pub const unsafe fn new(base: u16) -> Self {
-        Self(base)
+        Self { base, dead: false }
+    }
+
+    /// Poll `cond`, giving up after [`WAIT_LIMIT`] iterations.  `false` means
+    /// the port is not answering and should be retired.
+    fn wait(&mut self, cond: impl Fn(&mut Self) -> bool) -> bool {
+        let mut spins = 0u32;
+        while !cond(self) {
+            if spins >= WAIT_LIMIT {
+                self.dead = true;
+                return false;
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        true
     }
 
     /// Initializes the serial port.
@@ -122,19 +144,30 @@ impl SerialPort {
         LineStsFlags(inb(self.port_line_sts()))
     }
 
-    /// Sends a byte on the serial port.
+    /// Sends a byte on the serial port.  Bounded: a dead port drops the byte.
     pub fn send(&mut self, data: u8) {
+        if self.dead {
+            return;
+        }
         match data {
             8 | 0x7F => {
-                wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
+                if !self.wait(|s| s.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY) {
+                    return;
+                }
                 outb(self.port_data(), 8);
-                wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
+                if !self.wait(|s| s.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY) {
+                    return;
+                }
                 outb(self.port_data(), b' ');
-                wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
+                if !self.wait(|s| s.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY) {
+                    return;
+                }
                 outb(self.port_data(), 8);
             }
             _ => {
-                wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
+                if !self.wait(|s| s.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY) {
+                    return;
+                }
                 outb(self.port_data(), data);
             }
         }
@@ -142,13 +175,22 @@ impl SerialPort {
 
     /// Sends a raw byte on the serial port, intended for binary data.
     pub fn send_raw(&mut self, data: u8) {
-        wait_for!(self.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY);
+        if self.dead || !self.wait(|s| s.line_sts().0 & OUTPUT_EMPTY == OUTPUT_EMPTY) {
+            return;
+        }
         outb(self.port_data(), data);
     }
 
-    /// Receives a byte on the serial port.
+    /// True when the port has been retired after a timeout.
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    /// Receives a byte on the serial port.  Returns 0 when the port is silent.
     pub fn receive(&mut self) -> u8 {
-        wait_for!(self.line_sts().0 & INPUT_FULL == INPUT_FULL);
+        if self.dead || !self.wait(|s| s.line_sts().0 & INPUT_FULL == INPUT_FULL) {
+            return 0;
+        }
         inb(self.port_data())
     }
 }
