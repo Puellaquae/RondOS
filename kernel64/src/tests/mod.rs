@@ -98,6 +98,8 @@ pub fn boot_ready() -> ! {
 }
 
 fn summary() -> ! {
+    // Mark the test run as complete, so the loader does not report a reset.
+    boot::stage_done();
     crate::serial_println!("----------------------------------------------");
     let total = REPORTS.load(Ordering::Relaxed);
     let failed = FAILS.load(Ordering::Relaxed);

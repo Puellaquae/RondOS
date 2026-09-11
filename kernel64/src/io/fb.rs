@@ -34,6 +34,8 @@ const CURSOR_H: u32 = 2;
 
 struct Console {
     ready: bool,
+    /// First scanline this console owns (the boot-progress strip lives above).
+    y0: u32,
     base: *mut u8,
     width: u32,
     height: u32,
@@ -56,6 +58,7 @@ impl Console {
     const fn new() -> Self {
         Self {
             ready: false,
+            y0: 0,
             base: core::ptr::null_mut(),
             width: 0,
             height: 0,
@@ -106,34 +109,43 @@ pub fn init(info: &FramebufferInfo) {
 
     let len = (info.pitch as usize) * (info.height as usize);
     let root = X86_64Paging::active_root();
-    if X86_64Paging::map_device(
-        root,
-        DEVICE_BASE,
-        info.phys as usize,
-        len,
-        CachePolicy::WriteCombining,
-    )
-    .is_err()
-    {
-        crate::serial_println!("fb: cannot map {} bytes at {:#x}", len, DEVICE_BASE);
-        return;
+    // The boot-progress display maps the same window first; a second identical
+    // mapping is harmless, but skip it so the strip it painted is not disturbed.
+    if !crate::bootscreen::is_mapped() {
+        if X86_64Paging::map_device(
+            root,
+            DEVICE_BASE,
+            info.phys as usize,
+            len,
+            CachePolicy::WriteCombining,
+        )
+        .is_err()
+        {
+            crate::serial_println!("fb: cannot map {} bytes at {:#x}", len, DEVICE_BASE);
+            return;
+        }
     }
 
     let c = con();
     *c = Console::new();
+    // Leave the top strip to the boot-progress display: the console owns
+    // everything below it and can never paint over it.
+    c.y0 = crate::bootscreen::STRIP_HEIGHT;
     c.base = DEVICE_BASE as *mut u8;
     c.width = info.width;
-    c.height = info.height;
+    c.height = info.height.saturating_sub(c.y0);
     c.pitch = info.pitch;
     c.bpp = info.bpp;
     c.format = info.format;
     c.cols = (info.width / FONT_WIDTH as u32).min(MAX_COLS as u32);
-    c.rows = (info.height / FONT_HEIGHT as u32).min(MAX_ROWS as u32);
+    c.rows = (c.height / FONT_HEIGHT as u32).min(MAX_ROWS as u32);
     c.ready = c.cols > 0 && c.rows > 0;
     if !c.ready {
         return;
     }
     clear();
+    // `clear` wipes the whole screen, including the progress strip: put it back.
+    crate::bootscreen::repaint();
     crate::serial_println!(
         "fb: console {}x{} cells ({}x{} {}bpp, pitch {}, {:#x})",
         c.cols,
@@ -160,6 +172,7 @@ unsafe fn put_pixel(c: &Console, x: u32, y: u32, rgb: u32) {
     if x >= c.width || y >= c.height {
         return;
     }
+    let y = y + c.y0;
     let p = c.base.add((y * c.pitch + x * (c.bpp as u32 / 8)) as usize);
     match c.bpp {
         32 => core::ptr::write_volatile(p as *mut u32, pack(c, rgb)),
@@ -243,8 +256,8 @@ fn scroll() {
         // write-combined memory makes bulk reads expensive.)
         let total_rows = c.rows * FONT_HEIGHT as u32;
         for y in FONT_HEIGHT as u32..total_rows {
-            let src = c.base.add(y as usize * c.pitch as usize);
-            let dst = c.base.add((y - FONT_HEIGHT as u32) as usize * c.pitch as usize);
+            let src = c.base.add((y + c.y0) as usize * c.pitch as usize);
+            let dst = c.base.add((y - FONT_HEIGHT as u32 + c.y0) as usize * c.pitch as usize);
             core::ptr::copy_nonoverlapping(src, dst, c.pitch as usize);
         }
         // Blank the freed last line.
@@ -401,7 +414,7 @@ pub fn read_pixel(x: u32, y: u32) -> u32 {
         return 0;
     }
     unsafe {
-        let p = c.base.add((y * c.pitch + x * (c.bpp as u32 / 8)) as usize);
+        let p = c.base.add(((y + c.y0) * c.pitch + x * (c.bpp as u32 / 8)) as usize);
         match c.bpp {
             32 => core::ptr::read_volatile(p as *const u32),
             24 => {

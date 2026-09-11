@@ -60,7 +60,7 @@ fn fb_console() -> Verdict {
     // bottom row and `lines - (rows - 1)` lines have scrolled off.
     let (first, first_len) = fb::row_copy(0);
     let (last, last_len) = fb::row_copy(fb::rows() as usize - 2);
-    let (bottom, bottom_len) = fb::row_copy(fb::rows() as usize - 1);
+    let (_bottom, bottom_len) = fb::row_copy(fb::rows() as usize - 1);
     let expect_first = {
         let f = lines - (fb::rows() - 1);
         [b'L', b'0' + ((f / 10) % 10) as u8, b'0' + (f % 10) as u8]

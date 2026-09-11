@@ -24,11 +24,51 @@
 //!   high address
 //! ```
 
+use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::gdt::{KERNEL_CODE, KERNEL_DATA};
 use super::DescriptorTablePointer;
+
+// --------------------------------------------------------- fault breadcrumb
+//
+// CMOS NVRAM bytes the UEFI loader reads and prints on the *next* boot (see
+// `boot/uefi/src/main.rs::report_previous_stage`).  They are written with port
+// I/O only: when the fault is a bad page walk, every memory access — including
+// the physmap the normal `boot::stage` path uses — is suspect, and this is the
+// one channel that still works while the machine is falling over.
+
+const CMOS_FAULT_VEC: u8 = 0x3b;
+const CMOS_FAULT_ERR: u8 = 0x3c;
+
+fn cmos_read(reg: u8) -> u8 {
+    let v: u8;
+    unsafe {
+        asm!("out dx, al", in("dx") 0x70u16, in("al") 0x80 | reg, options(nomem, nostack));
+        asm!("in al, dx", in("dx") 0x71u16, out("al") v, options(nomem, nostack));
+        asm!("out dx, al", in("dx") 0x70u16, in("al") 0u8, options(nomem, nostack));
+    }
+    v
+}
+
+fn cmos_write(reg: u8, value: u8) {
+    unsafe {
+        asm!("out dx, al", in("dx") 0x70u16, in("al") 0x80 | reg, options(nomem, nostack));
+        asm!("out dx, al", in("dx") 0x71u16, in("al") value, options(nomem, nostack));
+        asm!("out dx, al", in("dx") 0x70u16, in("al") 0u8, options(nomem, nostack));
+    }
+}
+
+/// Record a CPU exception.  The *first* one wins: a handler that faults again
+/// (or a #DF after a #PF) must not overwrite the root cause.
+fn fault_record(vector: u8, error: u8) {
+    if cmos_read(CMOS_FAULT_VEC) != 0 {
+        return;
+    }
+    cmos_write(CMOS_FAULT_VEC, vector);
+    cmos_write(CMOS_FAULT_ERR, error);
+}
 
 /// `int 0x80` — the stable syscall gate (DPL=3).
 pub const VECTOR_SYSCALL: usize = 0x80;
@@ -193,13 +233,8 @@ unsafe impl Sync for Idt {}
 
 static IDT: Idt = Idt(UnsafeCell::new([IdtEntry::missing(); 256]));
 
-/// Dedicated stack for `#DF`, so a broken kernel stack still gets a report.
-#[repr(align(16))]
-struct DfStack(UnsafeCell<[u8; 8192]>);
-
-unsafe impl Sync for DfStack {}
-
-static DF_STACK: DfStack = DfStack(UnsafeCell::new([0; 8192]));
+// The `#DF` stack itself lives in `tss::df_stack_top()`; the gate below selects
+// IST index 1 (TSS.ist[0]) so a double fault is always reported.
 
 // --------------------------------------------------------------- stubs
 
@@ -439,9 +474,9 @@ pub fn init() {
     install(idt, 5, isr_5, 0, 0);
     install(idt, 6, isr_6, 0, 0);
     install(idt, 7, isr_7, 0, 0);
-    // #DF runs on its own IST stack so a broken kernel stack still reports.
-    let df_top = DF_STACK.0.get() as usize + 8192;
-    super::tss::set_ist(0, df_top as u64);
+    // #DF runs on its own IST stack (TSS.ist[0]) so a broken kernel stack still
+    // reports instead of triple-faulting into a silent reset.
+    super::tss::set_ist(0, super::tss::df_stack_top());
     install(idt, 8, isr_8, 0, 1);
     install(idt, 10, isr_10, 0, 0);
     install(idt, 11, isr_11, 0, 0);
@@ -477,6 +512,19 @@ pub fn init() {
 extern "C" fn isr_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     let vector = unsafe { (*frame).vector as usize };
 
+    // CPU exception: breadcrumb it before anything that could depend on the
+    // page tables (all of `serial_println!` and `f.dump` below does).
+    if vector < 32 {
+        fault_record(vector as u8, unsafe { (*frame).error } as u8);
+        // A kernel-context exception is fatal (the handlers below halt), so make
+        // it visible on a serial-less machine without waiting for a reset.  A
+        // user fault is normal control flow (the process is killed) and must not
+        // paint over the console.
+        if !unsafe { (*frame).from_user() } {
+            crate::boot::fault_signal();
+        }
+    }
+
     // Acknowledge the PIC before doing anything that may reschedule.
     if (IRQ_BASE..IRQ_BASE + 16).contains(&vector) {
         super::pic::end_of_interrupt((vector - IRQ_BASE) as u8);
@@ -503,10 +551,23 @@ extern "C" fn isr_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     frame
 }
 
+/// A vector nobody claimed.  Halting here used to take the whole machine down
+/// for what is usually a stray firmware/legacy vector, so: log it, mask the
+/// corresponding PIC line if it is one, and carry on.  If it keeps firing, the
+/// log says which vector and nothing else breaks.
 fn unhandled(f: &mut TrapFrame) {
-    crate::serial_println!("unhandled interrupt");
-    f.dump("frame");
-    loop {
-        super::hlt();
+    let vector = f.vector as usize;
+    crate::serial_println!(
+        "unhandled vector {:#04x} from {} rip {:#x} — ignoring",
+        vector,
+        if f.from_user() { "user" } else { "kernel" },
+        f.rip
+    );
+    if (IRQ_BASE..IRQ_BASE + 16).contains(&vector) {
+        super::pic::mask((vector - IRQ_BASE) as u8);
+        crate::serial_println!("intr: masked IRQ{}", vector - IRQ_BASE);
+        return;
     }
+    // A vector outside the PIC range is not ours to handle; report it once and
+    // return, so the interrupted code continues.
 }

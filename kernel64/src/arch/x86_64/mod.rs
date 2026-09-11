@@ -176,6 +176,17 @@ pub fn has_nx() -> bool {
     (cpuid(0x8000_0001, 0).edx & (1 << 20)) != 0
 }
 
+/// CPUID leaf 0x8000_0001 EDX bit 26 — 1 GiB pages (`PDPE1GB`).
+///
+/// Optional: Intel 64 CPUs before ~2010 do not have it, and a PS=1 PDPT entry
+/// is a reserved-bit violation there, so nothing may *create* a 1 GiB page.
+/// The loader builds the physmap with 2 MiB pages on such machines; this is for
+/// the kernel's own huge-page test and any future 1 GiB mapper.
+#[inline]
+pub fn has_1g_pages() -> bool {
+    (cpuid(0x8000_0001, 0).edx & (1 << 26)) != 0
+}
+
 // ------------------------------------------------------ interrupt flags
 
 #[inline]

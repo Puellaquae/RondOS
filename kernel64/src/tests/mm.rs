@@ -68,6 +68,16 @@ fn test_huge_split() -> Verdict {
     // half, then force the 1 GiB -> 2 MiB -> 4 KiB split.  Relying on the
     // bootloader's identity map (as this test used to) is exactly what the
     // kernel-owned address space removed.
+    //
+    // A CPU without `PDPE1GB` has no 1 GiB page to split -- and *creating* a
+    // PS=1 PDPT entry would be a reserved-bit violation the moment it is used,
+    // so on such a machine the only correct thing is to skip.  The loader uses
+    // 2 MiB pages for the physmap there, and the framebuffer/device mappings
+    // already exercise the 2 MiB -> 4 KiB split.
+    if !crate::arch::x86_64::has_1g_pages() {
+        crate::serial_println!("huge-split: no 1 GiB pages on this CPU, skipped");
+        return Verdict::Pass;
+    }
     let root = match create_kernel_address_space() {
         Some(r) => r,
         None => return Verdict::Fail,
