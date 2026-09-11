@@ -9,7 +9,8 @@
 
 #![allow(dead_code)]
 
-use crate::arch::x86_64::paging::{phys_to_virt, PHYS_MAP_LIMIT};
+use crate::arch::x86_64::paging::phys_to_virt;
+use crate::bootinfo::{self, MEM_KIND_USABLE};
 use crate::utils::singleton::Singleton;
 
 pub static PAGE_ALLOC: Singleton<PageAllocator> = Singleton::UNINIT;
@@ -23,35 +24,128 @@ fn kernel_end_phys() -> usize {
     (sym + 0xfff) & !0xfff
 }
 
+/// Lowest physical address the allocator may hand out: everything below is
+/// firmware/legacy territory (IVT, BDA, EBDA, the loader's scratch).
+const ALLOC_BASE: usize = 0x10_0000;
+
+/// Ceiling of the physmap window: one PDPT holds 512 × 1 GiB.
+const ALLOC_LIMIT: usize = 512 << 30;
+
 pub struct PageAllocator {
     bitmap: BitMap,
+    /// physmap VA of the page whose bit is 0.
     base_addr: usize,
 }
 
 impl Default for PageAllocator {
+    /// Build the free map from the firmware's memory map.
+    ///
+    /// This used to assume "everything from the end of the kernel image to the
+    /// top of RAM is free", which is **wrong on real hardware**: the loader's
+    /// page tables, its `BootInfo`, the boot archive and firmware reservations
+    /// can sit right after the image, and the first allocation would silently
+    /// overwrite them (the kernel then dies the moment it switches CR3).
     fn default() -> Self {
-        let kernel_end = kernel_end_phys().max(0x100000);
-        let avail_end = super::usable_end().min(PHYS_MAP_LIMIT);
+        let boot = bootinfo::get();
+        let kernel_end = kernel_end_phys().max(ALLOC_BASE);
+        let limit = (bootinfo::usable_end()).min(ALLOC_LIMIT);
         assert!(
-            kernel_end < avail_end,
-            "kernel image (end {kernel_end:#x}) exceeds the physmap window {avail_end:#x}"
+            kernel_end < limit,
+            "kernel image (end {kernel_end:#x}) does not fit below the RAM top {limit:#x}"
         );
 
-        let pagecnt = (avail_end - kernel_end) / 4096;
-        let bitmap_size = (pagecnt + 7) / 8;
-        let bitmap_pages = (bitmap_size + 4095) / 4096;
-        let win_pages = pagecnt - bitmap_pages.min(pagecnt);
+        let pages = (limit - ALLOC_BASE) / 4096;
+        let bitmap_bytes = (pages + 7) / 8;
+        let bitmap_pages = (bitmap_bytes + 4095) / 4096;
 
-        let data_ptr = phys_to_virt(kernel_end) as *mut u8;
-        let base_addr = phys_to_virt(kernel_end + bitmap_pages * 4096);
-        Self {
-            bitmap: BitMap::new(data_ptr, win_pages),
-            base_addr,
+        // The bitmap itself has to live in RAM the firmware says is free.
+        let mut bitmap_pa = 0usize;
+        for m in boot.mem_entries() {
+            if m.kind != MEM_KIND_USABLE {
+                continue;
+            }
+            let start = (m.addr as usize).max(kernel_end);
+            let end = ((m.addr + m.len) as usize).min(limit);
+            if end > start && end - start >= bitmap_pages * 4096 {
+                bitmap_pa = start;
+                break;
+            }
         }
+        assert!(
+            bitmap_pa != 0,
+            "no usable RAM region large enough for the frame bitmap ({} KiB)",
+            bitmap_pages * 4
+        );
+
+        let mut alloc = Self {
+            bitmap: BitMap::new(phys_to_virt(bitmap_pa) as *mut u8, pages),
+            base_addr: phys_to_virt(ALLOC_BASE),
+        };
+
+        // Start from "everything reserved", then free exactly the usable
+        // regions, then take back the kernel image and the bitmap.
+        alloc.bitmap.set_all();
+        for m in boot.mem_entries() {
+            if m.kind == MEM_KIND_USABLE {
+                alloc.free_range(m.addr as usize, m.len as usize);
+            }
+        }
+        alloc.reserve_range(ALLOC_BASE, kernel_end - ALLOC_BASE);
+        alloc.reserve_range(bitmap_pa, bitmap_pages * 4096);
+        // Firmware reservations (EfiLoaderCode/Data, page tables, `BootInfo`,
+        // the boot archive) are simply never freed above, because they are not
+        // `MEM_KIND_USABLE`.
+
+        crate::serial_println!(
+            "alloc: {} pages tracked, bitmap at {:#x} ({} KiB), kernel ends {:#x}, RAM top {:#x}",
+            pages,
+            bitmap_pa,
+            bitmap_pages * 4,
+            kernel_end,
+            limit
+        );
+        alloc
     }
 }
 
 impl PageAllocator {
+    fn bit_of(&self, pa: usize) -> Option<usize> {
+        if pa < ALLOC_BASE || pa % 4096 != 0 {
+            return None;
+        }
+        let idx = (pa - ALLOC_BASE) / 4096;
+        (idx < self.bitmap.size()).then_some(idx)
+    }
+
+    fn free_range(&mut self, pa: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let start = pa.max(ALLOC_BASE);
+        let end = (pa + len).min(self.bitmap.size() * 4096 + ALLOC_BASE);
+        if end <= start {
+            return;
+        }
+        let first = (start - ALLOC_BASE) / 4096;
+        let last = (end - ALLOC_BASE).div_ceil(4096);
+        for i in first..last.min(self.bitmap.size()) {
+            self.bitmap.clear(i);
+        }
+    }
+
+    fn reserve_range(&mut self, pa: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let Some(first) = self.bit_of(pa & !0xfff) else {
+            return;
+        };
+        let last = ((pa + len - 1 - ALLOC_BASE) / 4096 + 1).min(self.bitmap.size());
+        for i in first..last {
+            self.bitmap.set(i);
+        }
+    }
+
     pub fn get_page(&mut self, cnt: usize) -> Option<*mut u8> {
         let avl_page = self.bitmap.find(0, cnt, false)?;
         self.bitmap.flips(avl_page, cnt);
@@ -89,6 +183,31 @@ impl BitMap {
         assert!(idx < self.size);
         let elem = unsafe { self.data_ptr.add(idx / 8).read_volatile() };
         (elem & (1 << (idx % 8))) != 0
+    }
+
+    fn set(&mut self, idx: usize) {
+        if idx >= self.size || self.test(idx) {
+            return;
+        }
+        self.flip(idx);
+    }
+
+    fn clear(&mut self, idx: usize) {
+        if idx >= self.size || !self.test(idx) {
+            return;
+        }
+        self.flip(idx);
+    }
+
+    fn set_all(&mut self) {
+        let len = (self.size + 7) / 8;
+        unsafe {
+            self.data_ptr.write_bytes(0xff, len);
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.size
     }
 
     fn flip(&mut self, idx: usize) {
