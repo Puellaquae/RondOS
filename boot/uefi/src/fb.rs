@@ -125,7 +125,7 @@ const MAX_COLS: usize = 120;
 const MAX_ROWS: usize = 60;
 
 const COLOR_FG: u32 = 0x00C0_C0C0; // light grey on ...
-const COLOR_BG: u32 = 0x0080_8080; // ... mid-grey
+const COLOR_BG: u32 = 0x0000_0000; // ... black (no grey screen)
 
 struct Console {
     ready: bool,

@@ -39,8 +39,13 @@ fn shell() -> Verdict {
     let mut ok = crate::io::fb::contains("rondos> ");
 
     // `echo`: proves keys reach the shell and its output reaches the console.
-    crate::io::input::inject(b"echo hello-from-shell\r");
+    // Two characters are typed by mistake and then erased: this also proves the
+    // echo is in-place (no `user: ` prefix, no forced newline) and that
+    // backspace actually blanks the cell it stepped over.
+    crate::io::input::inject(b"echo hello-from-shellZZ\x08\x08\r");
+    ok &= wait_for_fb("rondos> echo hello-from-shell", 200);
     ok &= wait_for_fb("hello-from-shell", 200);
+    ok &= !crate::io::fb::contains("hello-from-shellZZ");
 
     // `ls`: proves the built-in reaches the file system.
     crate::io::input::inject(b"ls\r");

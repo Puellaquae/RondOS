@@ -31,6 +31,25 @@ impl Term {
         let _ = write_file(self.con, b);
     }
 
+    /// Write one formatted line straight to the console.
+    ///
+    /// The shell is a terminal, so its own messages must not go through
+    /// `println!`/`sys_log`: that path mirrors them with a kernel `user: `
+    /// prefix and a forced newline, which is exactly the "log line" look a
+    /// shell should not have.
+    fn line(&self, args: core::fmt::Arguments) {
+        struct Sink(Handle);
+        impl core::fmt::Write for Sink {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let _ = write_file(self.0, s.as_bytes());
+                Ok(())
+            }
+        }
+        let mut sink = Sink(self.con);
+        let _ = core::fmt::write(&mut sink, args);
+        self.puts("\n");
+    }
+
     /// Read one key, echoing it.  Returns `None` on error.
     fn key(&self) -> Option<u8> {
         let mut b = [0u8; 1];
@@ -143,7 +162,7 @@ fn builtin(t: &Term, root: Handle, cmd: &[u8], arg: &[u8]) -> bool {
                         }
                         let _ = close(h);
                     }
-                    Err(e) => println!("cat: {:?}", e),
+                    Err(e) => t.line(format_args!("cat: {:?}", e)),
                 }
             }
         }
@@ -154,12 +173,12 @@ fn builtin(t: &Term, root: Handle, cmd: &[u8], arg: &[u8]) -> bool {
                 match open_file(root, arg).and_then(spawn) {
                     Ok(child) => {
                         match wait(&[child], 10_000_000_000) {
-                            Ok(w) => println!("shell: child finished (reason {})", w.reason),
-                            Err(e) => println!("shell: wait failed: {:?}", e),
+                            Ok(w) => t.line(format_args!("shell: child finished (reason {})", w.reason)),
+                            Err(e) => t.line(format_args!("shell: wait failed: {:?}", e)),
                         }
                         let _ = close(child);
                     }
-                    Err(e) => println!("run: {:?}", e),
+                    Err(e) => t.line(format_args!("run: {:?}", e)),
                 }
             }
         }
@@ -167,14 +186,17 @@ fn builtin(t: &Term, root: Handle, cmd: &[u8], arg: &[u8]) -> bool {
             t.put_bytes(b"\x0c");
         }
         b"uptime" => {
-            println!("shell: {} ms since boot", rondos_rt::now_ns() / 1_000_000);
+            t.line(format_args!("shell: {} ms since boot", rondos_rt::now_ns() / 1_000_000));
         }
         b"exit" => {
             t.puts("shell: bye\n");
             return false;
         }
         other => {
-            println!("shell: unknown command {:?}", core::str::from_utf8(other).unwrap_or("?"));
+            t.line(format_args!(
+                "shell: unknown command {:?}",
+                core::str::from_utf8(other).unwrap_or("?")
+            ));
         }
     }
     true
@@ -201,11 +223,13 @@ pub extern "C" fn app_main(block: &StartupBlock) -> i32 {
         line: [0; MAX_LINE],
         len: 0,
     };
-    t.puts("\nRondOS shell — type 'help' for commands\n");
+    // ASCII only: the framebuffer font is 8x16 VGA and renders every non-ASCII
+    // byte as '?', so an em-dash here showed up as "???" on a real screen.
+    t.puts("\nRondOS shell - type 'help' for commands\n");
     t.prompt();
     loop {
         let Some(n) = t.read_line() else {
-            println!("shell: input device gone");
+            t.puts("shell: input device gone\n");
             return 4;
         };
         let (cmd, arg) = parse(&t.line[..n]);

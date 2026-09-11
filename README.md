@@ -25,9 +25,10 @@
   - `src/tests/`        内核态测试程序（harness + mm/elf/ring3/sched/user 五组），
     `main.rs` 只保留引导流程与 trap 入口
 - `boot/uefi/`  UEFI 引导 stub，目标 `x86_64-unknown-uefi`，基于 `uefi-rs`
-  - GOP 选 32bpp 模式 → 读 ESP 上的 `\rondos\kernel.elf` → 按 `p_paddr` 装载
+  - 列出 32bpp GOP 模式让用户选（`timeout` 菜单：10 s 无按键则用默认 1280x720）
+    → 读 ESP 上的 `\rondos\kernel.elf` → 按 `p_paddr` 装载
     → 填 `BootInfo`（内存图 + framebuffer + initrd）→ 建页表 →
-    `ExitBootServices` → 跳内核（`rdi` = `BootInfo` 物理地址）
+    `ExitBootServices` → 跳内核（`rdi` = `BootInfo` 物理地址）；进内核前不再等按键
 - `user/`  用户程序工作区（`cargo +nightly`，自定义 target spec）
   - `targets/x86_64-rondos.json`  用户态 target：`os = "rondos"`、开 SSE2、关红区
   - `user.ld`  固定地址（0x400000）ELF64 链接脚本，段页对齐、`.text` R+X、数据 RW+NX

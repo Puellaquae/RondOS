@@ -214,6 +214,22 @@ impl Default for SerialPort {
 
 static SERIAL_IO: Singleton<SerialPort> = Singleton::UNINIT;
 
+/// Mirror raw terminal bytes (console-device writes) to COM1 only.
+///
+/// Unlike [`_serial_print`], this does **not** touch the framebuffer: the
+/// caller already wrote the same bytes there, and going through the log path
+/// would prefix them and append a newline.  `send` already turns a backspace
+/// into `BS space BS`, so a serial terminal erases the same cell.
+pub fn write_raw(bytes: &[u8]) {
+    let port = SERIAL_IO.get_mut();
+    for &b in bytes {
+        if b == b'\n' {
+            port.send(b'\r');
+        }
+        port.send(b);
+    }
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => ($crate::io::serial::_serial_print(format_args!($($arg)*)));

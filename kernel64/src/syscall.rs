@@ -197,12 +197,37 @@ fn sys_log(f: &mut TrapFrame) {
     ok(f, len as u64)
 }
 
-/// The single sink behind `sys_log` and `sys_write` on the console handle.
+/// The sink behind `sys_log`: a program's *log line*.
+///
+/// This is deliberately not what a character device wants: it trims the
+/// trailing newline, prefixes `user: ` and mirrors the whole thing to the
+/// framebuffer as one line.  Console writes go through [`console_bytes`]
+/// instead.
 fn log_bytes(bytes: &[u8]) {
     let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
     crate::serial_println!("user: {}", text.trim_end_matches('\n'));
     remember_log(bytes);
     LOGGED_BYTES.fetch_add(bytes.len(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The sink behind `sys_write` on the console device: raw terminal bytes.
+///
+/// A console is a character device, so the bytes a program writes must land on
+/// the framebuffer (and the serial mirror) verbatim.  Routing them through
+/// [`log_bytes`] turned every single echoed keypress into its own `user: x`
+/// line and appended a newline, so the shell had no visible echo and backspace
+/// moved across lines instead of erasing one cell.  `\n`, `\r`, `\x08` and
+/// `\x0c` are all understood by the framebuffer console.
+fn console_bytes(bytes: &[u8]) {
+    // Interrupts off for the same reason as `_serial_print`: a preempted writer
+    // would interleave its bytes with the next kernel log line on either sink.
+    let if_set = crate::arch::x86_64::interrupts_enabled();
+    crate::arch::x86_64::cli();
+    crate::io::fb::write(bytes);
+    crate::io::serial::write_raw(bytes);
+    if if_set {
+        crate::arch::x86_64::sti();
+    }
 }
 
 /// `0x10 sys_exit(status) -> !`
@@ -424,8 +449,10 @@ fn sys_read(f: &mut TrapFrame) {
 
 /// `0x52 sys_write(handle, buf, len) -> n`
 ///
-/// The only writable object in v1 is the console device (`Device { node: 0 }`),
-/// which is `sys_log` under a handle; the tar file system is immutable.
+/// The only writable object in v1 is the console device (`Device { node: 0 }`).
+/// It is a terminal, not a log: the bytes are written to the framebuffer
+/// console (and COM1) verbatim, so a shell's echo and line editing work.
+/// Program logs (`sys_log`) still get the `user: ` prefix.
 fn sys_write(f: &mut TrapFrame) {
     let h = Handle(f.rdi);
     let len = f.rdx as usize;
@@ -465,7 +492,7 @@ fn sys_write(f: &mut TrapFrame) {
             Err(s) => err(f, s),
         };
     }
-    log_bytes(&buf[..len]);
+    console_bytes(&buf[..len]);
     ok(f, len as u64)
 }
 

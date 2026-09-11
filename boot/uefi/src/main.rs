@@ -2,7 +2,8 @@
 //!
 //! Runs as an `x86_64-unknown-uefi` application on the firmware's ESP:
 //!
-//! 1. pick a 32bpp GOP mode close to 640x480 and set it;
+//! 1. list the 32bpp GOP modes and let the user pick one (a `timeout` prompt:
+//!    no key for 10 s selects the default, 1280x720);
 //! 2. initialise a framebuffer text console (the firmware's SimpleTextOutput
 //!    is no longer visible once a graphics mode is active) and print boot
 //!    progress;
@@ -10,10 +11,8 @@
 //! 4. copy the kernel's `PT_LOAD` segments to their `p_paddr`;
 //! 5. collect the UEFI memory map into the versioned `BootInfo`;
 //! 6. build 4-level page tables (identity + physmap + kernel window);
-//! 7. wait for a keypress (10 s timeout, then auto-boot) so the user may
-//!    review the boot messages;
-//! 8. `ExitBootServices` and jump to the kernel with `rdi = &BootInfo`
-//!    (physmap view).
+//! 7. `ExitBootServices` and jump to the kernel with `rdi = &BootInfo`
+//!    (physmap view) — there is no second "press a key" pause.
 //!
 //! Everything it hands over is described by `BootInfo`, whose layout mirrors
 //! `kernel64/src/bootinfo.rs` field for field.
@@ -27,8 +26,8 @@ use core::fmt::Write;
 use uefi::boot;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::prelude::*;
-use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
-use uefi::proto::console::text::Input;
+use uefi::proto::console::gop::{GraphicsOutput, Mode, PixelFormat};
+use uefi::proto::console::text::{Input, Key};
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 
 mod fb;
@@ -159,7 +158,7 @@ const BOOT_KIND_UEFI: u32 = 2;
 /// The *kernel* embeds the same string (`kernel64/src/boot.rs::BUILD_TAG`) and
 /// the loader greps the loaded image for it, so a mismatched or truncated
 /// `kernel.elf` is caught before it can be blamed for a hang.
-const BUILD_ID: &str = "fix-2026-09-11f";
+const BUILD_ID: &str = "fix-2026-09-11g";
 
 const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
@@ -310,7 +309,9 @@ fn main() -> Status {
     // Take the interrupt state over from the firmware from the very first line:
     // from here on nothing but our own code runs until the kernel owns the CPU.
     quiesce_interrupts();
-    // 1. GOP: pick a 32bpp mode close to 640x480.
+    // 1. GOP: list the 32bpp modes, then let the user pick one.  The prompt is
+    //    a *timeout* one: 1280x720 (or the closest mode the firmware offers)
+    //    wins when no key arrives.
     let handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(h) => h,
         Err(_) => return Status::UNSUPPORTED,
@@ -319,37 +320,79 @@ fn main() -> Status {
         Ok(g) => g,
         Err(_) => return Status::UNSUPPORTED,
     };
-    if pick_mode(&mut gop).is_err() {
+    let (modes, mode_count) = collect_modes(&gop);
+    if mode_count == 0 {
         log!("  error: no suitable GOP mode found");
         return Status::UNSUPPORTED;
     }
-    let (fb_base, fb_w, fb_h, fb_pitch, fb_format) = {
-        let info = gop.current_mode_info();
-        let (w, h) = info.resolution();
-        let mut fb = gop.frame_buffer();
-        (
-            fb.as_mut_ptr() as u64,
-            w as u32,
-            h as u32,
-            (info.stride() * 4) as u32,
-            match info.pixel_format() {
-                PixelFormat::Rgb => 2u8,
-                _ => 1u8, // Bgr — GOP's usual BGRA
-            },
-        )
-    };
-    drop(gop);
+    let default_idx = closest_mode(&modes[..mode_count], DEFAULT_W, DEFAULT_H);
+    let chosen = default_idx;
+    // Set the default first so the menu below has a framebuffer to draw on.
+    let (mut fb_base, mut fb_w, mut fb_h, mut fb_pitch, mut fb_format) =
+        match apply_mode(&mut gop, modes[chosen].unwrap().mode) {
+            Some(p) => p,
+            None => {
+                log!("  error: cannot set GOP mode");
+                return Status::UNSUPPORTED;
+            }
+        };
 
     // Initialise the framebuffer text console.  After setting a GOP graphics
     // mode the firmware's SimpleTextOutput is no longer visible, so we render
     // text directly to the linear framebuffer.
     fb::init(fb_base, fb_w, fb_h, fb_pitch, fb_format);
-    log!("RondOS UEFI Loader  [{}]", BUILD_ID);
+    banner(fb_base, fb_w, fb_h);
+
+    // Resolution prompt.  Drawn on our own console so the choice is visible on
+    // a machine with no serial port; the bytes also go to COM1.
+    log!("  resolutions (32bpp):");
+    for i in 0..mode_count {
+        let m = modes[i].unwrap();
+        log!(
+            "    [{}] {}x{}{}",
+            i + 1,
+            m.w,
+            m.h,
+            if i == default_idx { "  (default)" } else { "" }
+        );
+    }
     log!();
-    log!("  framebuffer: {}x{} @ 0x{:08x} (32bpp)", fb_w, fb_h, fb_base);
-    // Which page-table shape this CPU needs; on a screen-only machine this is
-    // the only record of the feature bits the hand-off depends on.
-    log_cpu();
+    let def = modes[default_idx].unwrap();
+    if def.w != DEFAULT_W || def.h != DEFAULT_H {
+        log!(
+            "  note: {}x{} is not offered, using the closest mode above",
+            DEFAULT_W,
+            DEFAULT_H
+        );
+    }
+    log!(
+        "  choose 1-{} then Enter; no key for {} s takes the default",
+        mode_count,
+        RES_TIMEOUT_MS / 1000
+    );
+    let picked = choose_mode(mode_count, default_idx);
+    if picked != chosen {
+        match apply_mode(&mut gop, modes[picked].unwrap().mode) {
+            Some(p) => {
+                (fb_base, fb_w, fb_h, fb_pitch, fb_format) = p;
+                fb::init(fb_base, fb_w, fb_h, fb_pitch, fb_format);
+                banner(fb_base, fb_w, fb_h);
+                log!("  resolution: {}x{} (user choice)", fb_w, fb_h);
+            }
+            None => {
+                let m = modes[picked].unwrap();
+                log!(
+                    "  warning: {}x{} could not be set, staying at {}x{}",
+                    m.w,
+                    m.h,
+                    fb_w,
+                    fb_h
+                );
+            }
+        }
+    }
+    drop(gop);
+    log!();
 
     // 2. Kernel image and boot archive from the ESP.
     let kernel = match read_file(cstr16!("\\rondos\\kernel.elf")) {
@@ -533,9 +576,6 @@ fn main() -> Status {
     log!("  page tables: CR3=0x{:08x}", cr3);
 
     log!();
-    log!("Press any key to boot RondOS...");
-    wait_for_key();
-    log!();
     log!("  booting...");
 
     // 6. Hand over.
@@ -602,45 +642,142 @@ fn paint_screen(
     }
 }
 
-fn wait_for_key() {
-    uefi::system::with_stdin(|input: &mut Input| {
-        let timeout = core::time::Duration::from_secs(10);
-        let poll = core::time::Duration::from_millis(100);
-        let mut remaining = timeout;
-        loop {
-            if input.read_key().ok().flatten().is_some() {
-                break;
-            }
-            if remaining <= poll {
-                log!("  (timeout - continuing)");
-                break;
-            }
-            boot::stall(poll);
-            remaining -= poll;
-        }
-    });
+// ------------------------------------------------------- resolution picker
+//
+// The firmware's GOP exposes a list of modes; we keep the 32bpp ones and let
+// the user pick.  The prompt is a `timeout` one: it never blocks the boot, and
+// a machine with no keyboard (or `make test`) simply takes the default.
+
+/// Preferred resolution when the user does not choose one.
+const DEFAULT_W: u32 = 1280;
+const DEFAULT_H: u32 = 720;
+/// How long the resolution prompt waits for a key before taking the default.
+const RES_TIMEOUT_MS: u64 = 10_000;
+/// Upper bound on the modes we list; firmware offers far fewer.
+const MAX_MODES: usize = 64;
+
+/// One 32bpp GOP mode, remembered so a mode can be set after the menu is drawn
+/// (`GraphicsOutput::modes` borrows the protocol).
+#[derive(Clone, Copy)]
+struct ModeEntry {
+    mode: Mode,
+    w: u32,
+    h: u32,
 }
 
-/// Prefer a 32bpp mode close to 640x480; fall back to any 32bpp mode.
-fn pick_mode(gop: &mut GraphicsOutput) -> Result<(), ()> {
-    let mut best = None;
-    let mut best_score = i64::MAX;
+type ModeTable = [Option<ModeEntry>; MAX_MODES];
+
+/// Framebuffer parameters: `(base, width, height, pitch, format)`.
+type FbParams = (u64, u32, u32, u32, u8);
+
+/// Print the loader banner and the CPU feature line for the active mode.
+fn banner(base: u64, w: u32, h: u32) {
+    log!("RondOS UEFI Loader  [{}]", BUILD_ID);
+    log!();
+    log!("  framebuffer: {}x{} @ 0x{:08x} (32bpp)", w, h, base);
+    // Which page-table shape this CPU needs; on a screen-only machine this is
+    // the only record of the feature bits the hand-off depends on.
+    log_cpu();
+}
+
+/// Collect the 32bpp modes the firmware offers, in its own order.
+fn collect_modes(gop: &GraphicsOutput) -> (ModeTable, usize) {
+    let mut out: ModeTable = [None; MAX_MODES];
+    let mut n = 0usize;
     for mode in gop.modes() {
+        if n == MAX_MODES {
+            log!("  warning: more than {} GOP modes, ignoring the rest", MAX_MODES);
+            break;
+        }
         let info = mode.info();
         if info.pixel_format() != PixelFormat::Bgr && info.pixel_format() != PixelFormat::Rgb {
-            continue;
+            continue; // indexed/Bitmask modes cannot be drawn directly
         }
         let (w, h) = info.resolution();
-        let score = (w as i64 - 640).abs() + (h as i64 - 480).abs();
+        out[n] = Some(ModeEntry {
+            mode,
+            w: w as u32,
+            h: h as u32,
+        });
+        n += 1;
+    }
+    (out, n)
+}
+
+/// Index of the mode closest to `want_w` x `want_h` (exact match wins).
+fn closest_mode(modes: &[Option<ModeEntry>], want_w: u32, want_h: u32) -> usize {
+    let mut best = 0usize;
+    let mut best_score = i64::MAX;
+    for (i, m) in modes.iter().enumerate() {
+        let m = m.unwrap();
+        let score = (m.w as i64 - want_w as i64).abs() + (m.h as i64 - want_h as i64).abs();
         if score < best_score {
             best_score = score;
-            best = Some(mode);
+            best = i;
         }
     }
-    match best {
-        Some(m) => gop.set_mode(&m).map_err(|_| ()),
-        None => Err(()),
-    }
+    best
+}
+
+/// Set `mode` and return the framebuffer parameters it produced.
+fn apply_mode(gop: &mut GraphicsOutput, mode: Mode) -> Option<FbParams> {
+    gop.set_mode(&mode).ok()?;
+    let info = gop.current_mode_info();
+    let (w, h) = info.resolution();
+    let base = {
+        let mut fb = gop.frame_buffer();
+        fb.as_mut_ptr() as u64
+    };
+    let format = match info.pixel_format() {
+        PixelFormat::Rgb => 2u8,
+        _ => 1u8, // Bgr — GOP's usual BGRA
+    };
+    Some((base, w as u32, h as u32, (info.stride() * 4) as u32, format))
+}
+
+/// Wait up to [`RES_TIMEOUT_MS`] for a mode number plus Enter.  Returns
+/// `default_idx` on timeout, on Esc, or on an empty/invalid entry.
+fn choose_mode(count: usize, default_idx: usize) -> usize {
+    let mut acc: u32 = 0;
+    let mut have = false;
+    let mut picked: Option<usize> = None;
+    uefi::system::with_stdin(|input: &mut Input| {
+        let _ = input.reset(false); // drop anything the firmware buffered
+        let poll = core::time::Duration::from_millis(100);
+        let mut remaining = RES_TIMEOUT_MS;
+        while remaining > 0 {
+            if let Ok(Some(key)) = input.read_key() {
+                match key {
+                    Key::Printable(c) => {
+                        match char::from(c) {
+                            '\r' | '\n' => {
+                                picked = Some(if have && acc >= 1 && acc as usize <= count {
+                                    acc as usize - 1
+                                } else {
+                                    default_idx
+                                });
+                                return;
+                            }
+                            '0'..='9' => {
+                                acc = acc.saturating_mul(10) + (char::from(c) as u32 - '0' as u32);
+                                have = true;
+                                if acc as usize > count {
+                                    acc = 0;
+                                    have = false;
+                                }
+                            }
+                            '\x1b' => return, // cancel: take the default
+                            _ => {}
+                        }
+                    }
+                    Key::Special(_) => {}
+                }
+            }
+            boot::stall(poll);
+            remaining = remaining.saturating_sub(100);
+        }
+    });
+    picked.unwrap_or(default_idx)
 }
 
 /// Read a whole file from the ESP.  Returns `(physical address, length)`.
