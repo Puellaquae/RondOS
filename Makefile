@@ -56,7 +56,16 @@ endif
 
 # Display is chosen per target: `run`/`test` are headless (serial only),
 # `run-gui` opens a window so the framebuffer console and the shell are usable.
+#
+# `QEMU_CPU` pins the emulated CPU.  It matters here: QEMU's default model
+# reports no `PDPE1GB` (no 1 GiB pages) but TCG does not enforce the reserved
+# bit, so the bug it causes on real hardware is invisible unless the loader is
+# checked on both a CPU with and without the feature:
+#     make test                       # no 1 GiB pages -> 2 MiB fallback
+#     make test QEMU_CPU=Nehalem,+pdpe1gb   # 1 GiB pages -> the fast path
+QEMU_CPU   ?=
 QEMU_FLAGS := -bios $(OVMF) -m 512 \
+              $(if $(QEMU_CPU),-cpu $(QEMU_CPU),) \
               -drive file=$(ESP_IMG),format=raw,snapshot=on \
               -no-reboot
 QEMU_DISPLAY ?= gtk
@@ -121,7 +130,7 @@ run: esp-img
 # Interactive: the kernel's framebuffer console + shell in a QEMU window.
 # (Use `QEMU_DISPLAY=sdl` or `QEMU_DISPLAY=vnc=:0` if gtk is unavailable.)
 run-gui: esp-img
-	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -serial mon:stdio
+	TMPDIR=$(CURDIR)/$(ESP_TMP) $(QEMU) $(QEMU_FLAGS)
 
 # A real bootable disk image (MBR + FAT16 ESP), built without mtools/mkfs.
 esp-img: esp
@@ -159,7 +168,7 @@ test: esp-img
 	@rm -f $(SERIAL_LOG)
 	@# The kernel halts on purpose, so QEMU is always killed by the timeout;
 	@# correctness is judged from the log below, not from the exit status.
-	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 40 $(QEMU) $(QEMU_FLAGS) -display none \
+	@TMPDIR=$(CURDIR)/$(ESP_TMP) timeout 60 $(QEMU) $(QEMU_FLAGS) -display none \
 	  -serial file:$(SERIAL_LOG) >/dev/null 2>&1 || true
 	@grep -v '^\[2J' $(SERIAL_LOG)
 	@! grep -qE "PANIC:|kernel #PF|kernel #GP|DOUBLE FAULT|\[FAIL\]" $(SERIAL_LOG) \

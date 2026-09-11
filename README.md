@@ -45,7 +45,21 @@
 - `files/`      启动 tar 镜像内容（将来的用户程序与资源）
 - `docs/user-mode-design.md`  用户态完整设计（迁移、ring 3、编译支持、可执行文件格式、
   冻结的 syscall ABI、Win3.1 复古桌面）
+- `docs/boot-debugging.md`  引导/实机调试手册（CMOS 阶段与位掩码、进度条、
+  bootlog、CPU fault 捕获、1 GiB 大页回退）
 - `Makefile`    构建脚本
+
+## 实机调试
+
+没有串口的目标机上如何定位引导问题，完整手册见
+[`docs/boot-debugging.md`](docs/boot-debugging.md)：CMOS stage + 位掩码、屏幕进度条、
+ESP 上的 `\rondos\bootlog.bin`、满屏自证刷色、CPU fault 捕获（trap 前移 + 亮红屏 +
+CMOS 0x3B/0x3C）、1 GiB 大页回退、内存映射与最低内存要求。
+
+一句话版：loader 下一次启动会把上次的阶段 / 位掩码 / CPU fault 打印在屏幕上；内核态
+CPU 异常现在会被自己的 IDT trap 住（不再三重故障复位），vector/error 记进 CMOS
+`0x3B/0x3C`，并把屏幕刷成亮红。两条页表路径用 `make test`（2 MiB 回退）与
+`make test QEMU_CPU=Nehalem,+pdpe1gb`（1 GiB）分别验证。
 
 ## 依赖
 
