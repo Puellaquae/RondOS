@@ -40,6 +40,22 @@ impl TaskStateSegment {
     }
 }
 
+/// Dedicated stack for `#DF` (and NMI), so a fault that happens while the normal
+/// kernel stack is broken still produces a readable report instead of a triple
+/// fault and a silent reset.  Lives in `.bss`, i.e. in the kernel image the
+/// loader maps read/write.
+#[repr(align(16))]
+struct IstStack(UnsafeCell<[u8; 8192]>);
+
+unsafe impl Sync for IstStack {}
+
+static DF_STACK: IstStack = IstStack(UnsafeCell::new([0; 8192]));
+
+/// Top of the `#DF` stack (stacks grow down).
+pub fn df_stack_top() -> u64 {
+    DF_STACK.0.get() as u64 + 8192
+}
+
 #[repr(align(16))]
 struct TssCell(UnsafeCell<TaskStateSegment>);
 
@@ -60,6 +76,8 @@ pub fn base() -> usize {
 pub fn init() {
     unsafe {
         (*tss()).iomap_base = size_of::<TaskStateSegment>() as u16;
+        // #DF runs on its own stack: by definition the normal one is suspect.
+        (*tss()).ist[0] = df_stack_top();
     }
 }
 

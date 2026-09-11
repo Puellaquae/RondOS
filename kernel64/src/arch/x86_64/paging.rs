@@ -48,8 +48,12 @@ pub const USER_VA_LIMIT: usize = 0x0000_8000_0000_0000;
 pub fn valid_user_range(va: usize, len: usize) -> bool {
     len != 0 && va < USER_VA_LIMIT && va.checked_add(len).is_some_and(|end| end <= USER_VA_LIMIT)
 }
-/// How much RAM the boot trampoline mapped in the physmap (4 x 1 GiB pages).
-pub const PHYS_MAP_LIMIT: usize = 0x1_0000_0000;
+/// How much RAM the physmap window can describe: one PDPT of 1 GiB pages.
+///
+/// The UEFI stub maps every usable RAM region the firmware reports (it used to
+/// map a fixed 4 GiB, which made a `BootInfo`, initrd or framebuffer above that
+/// unreachable), so this is only a sanity ceiling, not the real extent.
+pub const PHYS_MAP_LIMIT: usize = 512 << 30;
 
 pub const HUGE_1G: usize = 1 << 30;
 pub const HUGE_2M: usize = 1 << 21;

@@ -21,9 +21,11 @@ use core::cell::UnsafeCell;
 
 /// `"RND1"` — lets the kernel recognise a `BootInfo` handed over by a loader.
 pub const BOOTINFO_MAGIC: u32 = 0x524E_4431;
-pub const BOOTINFO_VERSION: u32 = 1;
+pub const BOOTINFO_VERSION: u32 = 2;
 
-pub const MAX_MEM_ENTRIES: usize = 64;
+/// Entries kept from the firmware memory map.  Was 64, which truncated the map
+/// on some boards and silently threw away most of the RAM.
+pub const MAX_MEM_ENTRIES: usize = 256;
 pub const MAX_CMDLINE: usize = 128;
 
 /// Historical value of the deleted 32-bit multiboot trampoline.
@@ -89,7 +91,19 @@ pub struct BootInfo {
     pub _pad: u32,
     pub fb: FramebufferInfo,
     pub cmdline_len: u32,
-    pub _reserved: [u32; 4],
+    /// Address of the loader's cross-reset log (version 2).
+    pub bootlog_phys: u32,
+    /// Which boot wrote that log (0xff = loader, 1 = kernel).
+    pub bootlog_stage: u32,
+    /// Physical address of the durable progress record the kernel updates, and
+    /// what the loader read there at the start of this boot.
+    pub progress_phys: u32,
+    pub progress_prev: u32,
+    pub progress_mask: u32,
+    pub progress_mask2: u32,
+    pub progress_stage: u32,
+    pub progress_count: u32,
+    _reserved: [u32; 2],
     pub cmdline: [u8; MAX_CMDLINE],
     pub mem: [MemDesc; MAX_MEM_ENTRIES],
 }
@@ -116,7 +130,15 @@ impl BootInfo {
                 _pad: [0; 2],
             },
             cmdline_len: 0,
-            _reserved: [0; 4],
+            bootlog_phys: 0,
+            bootlog_stage: 0,
+            progress_phys: 0,
+            progress_prev: 0,
+            progress_mask: 0,
+            progress_mask2: 0,
+            progress_stage: 0,
+            progress_count: 0,
+            _reserved: [0; 2],
             cmdline: [0; MAX_CMDLINE],
             mem: [MemDesc {
                 addr: 0,
@@ -209,6 +231,15 @@ pub fn adopt_external(addr: u64) -> bool {
     dst.fb_present = src.fb_present;
     dst.fb = src.fb;
     dst.cmdline_len = src.cmdline_len;
+    let v2 = src.hdr.size as usize >= core::mem::size_of::<BootInfo>();
+    dst.bootlog_phys = if v2 { src.bootlog_phys } else { 0 };
+    dst.bootlog_stage = if v2 { src.bootlog_stage } else { 0 };
+    dst.progress_phys = if v2 { src.progress_phys } else { 0 };
+    dst.progress_prev = if v2 { src.progress_prev } else { 0 };
+    dst.progress_mask = if v2 { src.progress_mask } else { 0 };
+    dst.progress_mask2 = if v2 { src.progress_mask2 } else { 0 };
+    dst.progress_stage = if v2 { src.progress_stage } else { 0 };
+    dst.progress_count = if v2 { src.progress_count } else { 0 };
     dst.cmdline.copy_from_slice(&src.cmdline);
     dst.mem.copy_from_slice(&src.mem);
     true

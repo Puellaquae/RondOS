@@ -44,6 +44,17 @@ pub fn init() {
     outb(PIC2_DATA, 0b1111_1111);
 }
 
+/// Mask one IRQ line (bit set = masked).
+pub fn mask(irq: u8) {
+    let (port, bit) = if irq < 8 {
+        (PIC1_DATA, irq)
+    } else {
+        (PIC2_DATA, irq - 8)
+    };
+    let cur = inb(port);
+    outb(port, cur | (1 << bit));
+}
+
 pub fn end_of_interrupt(irq: u8) {
     if irq >= 8 {
     outb(PIC2_CMD, 0x20);

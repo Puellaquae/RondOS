@@ -1,5 +1,10 @@
 [build]
 target = "x86_64-unknown-none"
+# The kernel is linked with `--gc-sections` against a custom script; incremental
+# objects have repeatedly produced `undefined hidden symbol` link failures when
+# switching between the `kernel-tests` and normal builds.  A full rebuild of
+# just this crate is cheap.
+incremental = false
 rustflags = [
     "-C", "link-arg=--script=kernel.ld",
     "-C", "relocation-model=static",
